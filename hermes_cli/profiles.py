@@ -81,6 +81,13 @@ _CLONE_ALL_STRIP: list[str] = [
     "processes.json",
 ]
 
+# Skill usage belongs to the profile that produced it.  Clone skill bytes but
+# start the new profile's counters and lifecycle attribution empty.
+_SKILL_USAGE_SIDECARS: frozenset[str] = frozenset({
+    ".usage.json",
+    ".usage.json.lock",
+})
+
 # Infrastructure artifacts excluded from --clone-all when the source is the
 # default profile (``~/.hermes``).  Named profiles never contain these
 # directories at root, so the exclusion is gated to avoid silently dropping
@@ -175,7 +182,8 @@ def _clone_all_copytree_ignore(source_dir: Path):
         for entry in names:
             # Universal exclusions at any depth.
             if (
-                entry == "__pycache__"
+                entry in _SKILL_USAGE_SIDECARS
+                or entry == "__pycache__"
                 or entry.endswith((".pyc", ".pyo", ".sock", ".tmp"))
             ):
                 ignored.append(entry)
@@ -1137,7 +1145,13 @@ def create_profile(
             # same agent capabilities as the source profile.
             source_skills = source_dir / "skills"
             if source_skills.is_dir():
-                shutil.copytree(source_skills, profile_dir / "skills", symlinks=True, dirs_exist_ok=True)
+                shutil.copytree(
+                    source_skills,
+                    profile_dir / "skills",
+                    symlinks=True,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(*_SKILL_USAGE_SIDECARS),
+                )
 
             # Clone memory and other subdirectory files
             for relpath in _CLONE_SUBDIR_FILES:

@@ -151,6 +151,35 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_config_copies_skills_without_usage_provenance(self, profile_env):
+        default_home = profile_env / ".hermes"
+        skill_dir = default_home / "skills" / "source-authored"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Source skill\n")
+        usage = default_home / "skills" / ".usage.json"
+        usage.write_text(json.dumps({"source-authored": {"use_count": 41}}))
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert (profile_dir / "skills" / "source-authored" / "SKILL.md").is_file()
+        assert not (profile_dir / "skills" / ".usage.json").exists()
+
+    def test_clone_all_copies_skills_without_usage_provenance(self, profile_env):
+        default_home = profile_env / ".hermes"
+        skill_dir = default_home / "skills" / "source-authored"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Source skill\n")
+        (default_home / "skills" / ".usage.json").write_text(
+            json.dumps({"source-authored": {"use_count": 41}})
+        )
+        (default_home / "skills" / ".usage.json.lock").write_text("")
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert (profile_dir / "skills" / "source-authored" / "SKILL.md").is_file()
+        assert not (profile_dir / "skills" / ".usage.json").exists()
+        assert not (profile_dir / "skills" / ".usage.json.lock").exists()
+
 
 
 
