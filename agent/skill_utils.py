@@ -30,6 +30,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".github",
         ".hub",
         ".archive",
+        ".restore-backups",
         ".venv",
         "venv",
         "node_modules",

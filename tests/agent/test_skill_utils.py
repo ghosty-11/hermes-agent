@@ -103,6 +103,19 @@ def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
     assert is_excluded_skill_path(package / "SKILL.md") is True
 
 
+def test_iter_skill_index_files_prunes_restore_backups(tmp_path):
+    """Comparison and rollback copies are data, never loadable skills."""
+    live = tmp_path / "creative" / "creative-ideation" / "SKILL.md"
+    live.parent.mkdir(parents=True)
+    live.write_text("---\nname: creative-ideation\n---\n", encoding="utf-8")
+    backup = tmp_path / ".restore-backups" / "old" / "ideation" / "SKILL.md"
+    backup.parent.mkdir(parents=True)
+    backup.write_text("---\nname: ideation\n---\n", encoding="utf-8")
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [live]
+    assert is_excluded_skill_path(backup) is True
+
+
 def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
     """A category named scripts/templates/assets/references is still valid."""
     scripts_skill = tmp_path / "scripts" / "bash-helper"
