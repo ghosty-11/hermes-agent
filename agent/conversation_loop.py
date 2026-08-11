@@ -45,7 +45,11 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
-from agent.runtime_cwd import resolve_agent_cwd
+from agent.runtime_cwd import (
+    is_context_file_cwd_scoped,
+    resolve_agent_cwd,
+    resolve_context_cwd,
+)
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -697,10 +701,11 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         """Last matching line wins.
 
         Safe ONLY for fields emitted in the volatile tier at the very END of
-        the prompt (Model / Provider / Platform). User-supplied project
-        context (AGENTS.md / CLAUDE.md / .cursorrules) is embedded in the
-        middle context tier, so a last-match scan lets project prose shadow
-        any field emitted EARLIER — see ``host_info_value``.
+        the prompt (Model / Provider / Platform / Context files directory).
+        User-supplied project context (AGENTS.md / CLAUDE.md / .cursorrules)
+        is embedded in the middle context tier, so a last-match scan lets
+        project prose shadow any field emitted EARLIER — see
+        ``host_info_value``.
         """
         prefix = f"{label}:"
         value = ""
@@ -753,6 +758,18 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
         if stored_cwd != str(resolve_agent_cwd()):
+            return False
+
+    # Context-file discovery is independently scoped in multiplex mode. An old
+    # prompt without this marker, or a prompt from another profile, must rebuild
+    # once rather than retaining stale or cross-profile instructions.
+    if is_context_file_cwd_scoped():
+        stored_context_cwd = line_value("Context files directory")
+        current_context_cwd = ""
+        if getattr(agent, "skip_context_files", False) is not True:
+            resolved_context_cwd = resolve_context_cwd()
+            current_context_cwd = str(resolved_context_cwd or "")
+        if stored_context_cwd != current_context_cwd:
             return False
 
     # Detect runtime-surface drift: the stored prompt records which platform it

@@ -113,6 +113,49 @@ class TestStoredPromptReuse:
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
 
+    @pytest.mark.parametrize("stored_context_line", [None, "Context files directory: /old/profile"])
+    def test_profile_context_change_rebuilds_stored_prompt(
+        self, stored_context_line, tmp_path, monkeypatch
+    ):
+        from gateway.run import _profile_runtime_scope
+
+        execution_cwd = tmp_path / "shared-workdir"
+        execution_cwd.mkdir()
+        active_profile = tmp_path / "profiles" / "active"
+        active_profile.mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(execution_cwd))
+
+        lines = [
+            "Host: Linux",
+            f"User home directory: {tmp_path}",
+            f"Current working directory: {execution_cwd}",
+        ]
+        if stored_context_line:
+            lines.append(stored_context_line)
+        lines.extend(
+            [
+                "Conversation started: Tuesday, June 16, 2026",
+                "Model: test-model",
+                "Provider: openrouter",
+                "Platform: cli",
+            ]
+        )
+        stored = "\n".join(lines)
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="PROFILE_PROMPT_REBUILT")
+
+        with _profile_runtime_scope(active_profile):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == "PROFILE_PROMPT_REBUILT"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "PROFILE_PROMPT_REBUILT"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Legitimate fresh-build paths (no history, no DB)
