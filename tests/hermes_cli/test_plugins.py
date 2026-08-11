@@ -1325,6 +1325,14 @@ class TestPreLlmCallTargetRouting:
         assert "plain text C" in _plugin_user_context
 
 
+class TestPluginHookContextContract:
+    def test_pre_llm_context_documents_session_persistence(self):
+        contract = PluginManager.invoke_hook.__doc__ or ""
+        assert "api_content" in contract
+        assert "session-lifetime data" in contract
+        assert "turn-ephemeral data" in contract
+
+
 # ── TestPluginCommands ────────────────────────────────────────────────────
 
 

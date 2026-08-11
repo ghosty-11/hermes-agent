@@ -2114,11 +2114,12 @@ class PluginManager:
             {"context": "recalled text..."}
             "recalled text..."          # plain string, equivalent
 
-        Context is ALWAYS injected into the user message, never the
-        system prompt.  This preserves the prompt cache prefix — the
-        system prompt stays identical across turns so cached tokens
-        are reused.  All injected context is ephemeral — never
-        persisted to session DB.
+        Context is ALWAYS injected into the API-bound user message, never the
+        system prompt or clean transcript content. This preserves the prompt
+        cache prefix. The exact composed user-message bytes are persisted in
+        the session's ``api_content`` sidecar and replayed on later turns.
+        Plugins must therefore treat injected context as session-lifetime data,
+        not turn-ephemeral data.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
