@@ -61,6 +61,22 @@ class TestContextFileCwd:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
+    def test_profile_context_directory_is_recorded_in_prompt_tail(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.run import _profile_runtime_scope
+
+        execution_cwd = tmp_path / "shared-workdir"
+        execution_cwd.mkdir()
+        profile_home = tmp_path / "profiles" / "beta"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("TERMINAL_CWD", str(execution_cwd))
+
+        with _profile_runtime_scope(profile_home):
+            parts = _prompt_parts(_make_agent(platform="discord"))
+
+        assert f"Context files directory: {profile_home}" in parts["volatile"]
+
 
 def _stable_prompt(agent):
     with (
