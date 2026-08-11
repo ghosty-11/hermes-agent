@@ -62,6 +62,16 @@ return {
 Hermes stores those trace entries in later observer hook payloads as
 `middleware_trace`.
 
+When multiple plugins register the same request middleware kind, Hermes invokes
+them sequentially in registration order. Each callback receives the latest
+effective payload and its own best-effort safe copy of the original payload.
+Valid replacement results feed the next callback and append trace entries in
+the same order. `None`, malformed results, and callback exceptions leave the
+current effective payload unchanged; exceptions are logged and the chain
+continues.
+For tool requests, `original_args` is the pre-Relay argument snapshot even when
+managed Relay interception has already produced the effective `args`.
+
 Execution middleware receives a `next_call` callback. Call it to continue the
 chain:
 
@@ -242,6 +252,10 @@ For NeMo Relay adaptive execution middleware, see
   routing to a dynamic external system.
 - Request middleware should return complete replacement payloads, not partial
   patches.
+- Request middleware may mutate its effective payload in place for backward
+  compatibility, but complete replacement payloads are recommended. In-place
+  changes from callbacks returning `None`, malformed results, or raising an
+  exception remain effective without adding a trace entry.
 - Execution middleware should call `next_call(...)` exactly once unless it is
   intentionally short-circuiting execution.
 - If execution middleware raises before calling `next_call(...)`, Hermes treats

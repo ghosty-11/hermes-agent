@@ -295,6 +295,219 @@ class TestPluginDiscovery:
         assert run_tool_execution_middleware("terminal", args, lambda payload: payload) is args
         assert has_middleware("tool_request") is False
 
+    @pytest.mark.parametrize("kind", ["llm_request", "tool_request"])
+    def test_request_middleware_composes_in_registration_order(
+        self, kind, monkeypatch
+    ):
+        manager = PluginManager()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager", lambda: manager
+        )
+        payload_key = "request" if kind == "llm_request" else "args"
+        seen = []
+
+        def first(**kwargs):
+            seen.append(("first", dict(kwargs[payload_key])))
+            return {
+                payload_key: {**kwargs[payload_key], "a": 1},
+                "source": "first",
+            }
+
+        def second(**kwargs):
+            seen.append(("second", dict(kwargs[payload_key])))
+            return {
+                payload_key: {**kwargs[payload_key], "b": 2},
+                "source": "second",
+            }
+
+        manager._middleware[kind] = [first, second]
+        if kind == "llm_request":
+            result = apply_llm_request_middleware({"seed": 0})
+        else:
+            result = apply_tool_request_middleware("fixture", {"seed": 0})
+
+        assert seen == [
+            ("first", {"seed": 0}),
+            ("second", {"seed": 0, "a": 1}),
+        ]
+        assert result.payload == {"seed": 0, "a": 1, "b": 2}
+        assert result.original_payload == {"seed": 0}
+        assert result.changed is True
+        assert result.trace == [
+            {"source": "first"},
+            {"source": "second"},
+        ]
+
+    @pytest.mark.parametrize("kind", ["llm_request", "tool_request"])
+    def test_request_middleware_keeps_original_stable_per_callback(
+        self, kind, monkeypatch
+    ):
+        manager = PluginManager()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager", lambda: manager
+        )
+        payload_key = "request" if kind == "llm_request" else "args"
+        original_key = (
+            "original_request" if kind == "llm_request" else "original_args"
+        )
+        seen_originals = []
+
+        def first(**kwargs):
+            kwargs[original_key]["tampered"] = True
+            return {payload_key: {**kwargs[payload_key], "a": 1}}
+
+        def second(**kwargs):
+            seen_originals.append(dict(kwargs[original_key]))
+            assert kwargs[payload_key] == {"seed": 0, "a": 1}
+            return None
+
+        manager._middleware[kind] = [first, second]
+        if kind == "llm_request":
+            result = apply_llm_request_middleware({"seed": 0})
+        else:
+            result = apply_tool_request_middleware("fixture", {"seed": 0})
+
+        assert seen_originals == [{"seed": 0}]
+        assert result.original_payload == {"seed": 0}
+        assert result.payload == {"seed": 0, "a": 1}
+
+    @pytest.mark.parametrize("kind", ["llm_request", "tool_request"])
+    def test_request_middleware_fail_open_preserves_effective_payload(
+        self, kind, monkeypatch, caplog
+    ):
+        manager = PluginManager()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager", lambda: manager
+        )
+        payload_key = "request" if kind == "llm_request" else "args"
+        seen = []
+
+        def first(**kwargs):
+            return {
+                payload_key: {**kwargs[payload_key], "a": 1},
+                "source": "first",
+            }
+
+        def returns_none(**kwargs):
+            seen.append(("none", dict(kwargs[payload_key])))
+            return None
+
+        def returns_invalid(**kwargs):
+            seen.append(("invalid", dict(kwargs[payload_key])))
+            return {payload_key: "not-a-dict"}
+
+        def raises(**kwargs):
+            seen.append(("raises", dict(kwargs[payload_key])))
+            raise RuntimeError("fixture boom")
+
+        def last(**kwargs):
+            seen.append(("last", dict(kwargs[payload_key])))
+            return {
+                payload_key: {**kwargs[payload_key], "b": 2},
+                "source": "last",
+            }
+
+        manager._middleware[kind] = [
+            first,
+            returns_none,
+            returns_invalid,
+            raises,
+            last,
+        ]
+        with caplog.at_level(logging.WARNING):
+            if kind == "llm_request":
+                result = apply_llm_request_middleware({"seed": 0})
+            else:
+                result = apply_tool_request_middleware("fixture", {"seed": 0})
+
+        expected_seen = {"seed": 0, "a": 1}
+        assert seen == [
+            ("none", expected_seen),
+            ("invalid", expected_seen),
+            ("raises", expected_seen),
+            ("last", expected_seen),
+        ]
+        assert result.payload == {"seed": 0, "a": 1, "b": 2}
+        assert result.trace == [
+            {"source": "first"},
+            {"source": "last"},
+        ]
+        assert "fixture boom" in caplog.text
+
+    @pytest.mark.parametrize("kind", ["llm_request", "tool_request"])
+    def test_request_middleware_preserves_in_place_mutation_compatibility(
+        self, kind, monkeypatch
+    ):
+        manager = PluginManager()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager", lambda: manager
+        )
+        payload_key = "request" if kind == "llm_request" else "args"
+        seen = []
+
+        def mutate_none(**kwargs):
+            kwargs[payload_key]["none_mutation"] = 1
+            return None
+
+        def mutate_invalid(**kwargs):
+            kwargs[payload_key]["invalid_mutation"] = 2
+            return {payload_key: "not-a-dict"}
+
+        def mutate_raise(**kwargs):
+            kwargs[payload_key]["raised_mutation"] = 3
+            raise RuntimeError("fixture boom")
+
+        def observe(**kwargs):
+            seen.append(dict(kwargs[payload_key]))
+            return None
+
+        manager._middleware[kind] = [
+            mutate_none,
+            mutate_invalid,
+            mutate_raise,
+            observe,
+        ]
+        if kind == "llm_request":
+            result = apply_llm_request_middleware({"seed": 0})
+        else:
+            result = apply_tool_request_middleware("fixture", {"seed": 0})
+
+        expected = {
+            "seed": 0,
+            "none_mutation": 1,
+            "invalid_mutation": 2,
+            "raised_mutation": 3,
+        }
+        assert seen == [expected]
+        assert result.payload == expected
+        assert result.changed is False
+        assert result.trace == []
+
+    def test_plugin_manager_invoke_middleware_keeps_generic_broadcast_contract(
+        self,
+    ):
+        manager = PluginManager()
+        seen = []
+
+        def first(**kwargs):
+            seen.append(("first", dict(kwargs["request"])))
+            return {"request": {**kwargs["request"], "a": 1}}
+
+        def second(**kwargs):
+            seen.append(("second", dict(kwargs["request"])))
+            return {"request": {**kwargs["request"], "b": 2}}
+
+        manager._middleware["llm_request"] = [first, second]
+
+        assert manager.invoke_middleware("llm_request", request={"seed": 0}) == [
+            {"request": {"seed": 0, "a": 1}},
+            {"request": {"seed": 0, "b": 2}},
+        ]
+        assert seen == [
+            ("first", {"seed": 0}),
+            ("second", {"seed": 0}),
+        ]
+
 
 
 

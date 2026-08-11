@@ -13,6 +13,7 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import json
 from pathlib import Path
 import logging
@@ -499,6 +500,7 @@ def _run_agent_tool_execution_middleware(
         apply_tool_request_middleware,
         run_tool_execution_middleware,
     )
+    pre_relay_args = copy.deepcopy(function_args)
 
     trace = middleware_trace if middleware_trace is not None else []
     state = {
@@ -613,6 +615,7 @@ def _run_agent_tool_execution_middleware(
         request_result = apply_tool_request_middleware(
             function_name,
             relay_args,
+            original_args=pre_relay_args,
             skip_relay=True,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
