@@ -47,6 +47,19 @@ class TestHostHeaderValidator:
         # Loopback — reject (we bound to a specific non-loopback name)
         assert not _is_accepted_host("localhost", "my-server.corp.net")
 
+    def test_loopback_bind_accepts_only_explicit_public_host(self):
+        """A declared reverse-proxy hostname is accepted without weakening
+        rejection of every other hostname."""
+        from hermes_cli.web_server import _is_accepted_host
+
+        allowed = ("hermes.example-tailnet.ts.net",)
+        assert _is_accepted_host(
+            "hermes.example-tailnet.ts.net:8443",
+            "127.0.0.1",
+            allowed,
+        )
+        assert not _is_accepted_host("evil.example", "127.0.0.1", allowed)
+
 
 
 class TestHostHeaderMiddleware:
