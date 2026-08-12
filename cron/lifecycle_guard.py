@@ -425,8 +425,21 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+def _read_referenced_script(
+    path: Path, *, directory_is_data: bool = False
+) -> tuple[Optional[str], bool]:
+    """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
+
+    ``directory_is_data=True`` is passed by the referenced-token WALK, where a
+    path was merely inferred from command text: a directory cannot be executed
+    or sourced by any shell, so an inferred directory token is data (the common
+    false positive is a path literal inside inline python -- observed live on a kanban
+    worker, 2026-08-12; upstream #78980 class / open PR #83633) and
+    means "nothing to scan". The default (False) keeps the fail-closed sentinel
+    for DECLARED script paths (cron create), where a directory is invalid input
+    the caller explicitly asked to execute. FIFOs/devices always fail closed:
+    ``bash myfifo`` genuinely executes whatever the FIFO feeds it.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -439,6 +452,8 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if directory_is_data and stat.S_ISDIR(metadata.st_mode):
+            return None, False        # inferred directory token: data, not a script
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
         # Sniff a small prefix first: files that are clearly compiled
@@ -535,7 +550,9 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        script_text, unsafe = _read_referenced_script(
+            script_path, directory_is_data=True
+        )
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:

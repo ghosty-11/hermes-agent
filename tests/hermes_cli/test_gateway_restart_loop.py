@@ -1204,11 +1204,37 @@ class TestLifecycleGuardNeverRaises:
         weird.write_bytes(b"\xff\xfe\x00\x01 not really a script")
         assert self._scan(f"bash {weird}") is False
 
-    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
-        # Non-regular files are suspicious (fail closed = blocked), but the
-        # important contract is: verdict, not exception.
-        assert self._scan(f"bash {tmp_path}") is True
+    def test_directory_reference_is_data_dev_null_still_fails_closed(self, tmp_path):
+        # A directory cannot be executed or sourced by any shell, so a
+        # directory-shaped token is data, never a referenced script; blocking
+        # it produced false positives on innocent inline python (#78980 class,
+        # terminal path). /dev/null (a character device) can still be an
+        # unscannable stdin/script source, so non-directory non-regular files
+        # keep failing closed. Contract unchanged: verdict, not exception.
+        assert self._scan(f"bash {tmp_path}") is False
         assert self._scan("bash /dev/null") is True
+
+    def test_inline_python_with_directory_path_literal_not_blocked(self, tmp_path):
+        # Regression: a kanban worker, observed live (2026-08-12). A size
+        # -computing heredoc naming an existing directory as DATA was blocked
+        # with the gateway-restart error and burned two iteration budgets.
+        webp = tmp_path / "assets" / "gallery" / "webp"
+        webp.mkdir(parents=True)
+        command = (
+            "python3 - <<'PY'\n"
+            "import os\n"
+            f"webp = sum(os.path.getsize('{webp}/'+f) for f in os.listdir('{webp}'))\n"
+            "print(webp)\n"
+            "PY"
+        )
+        assert self._scan(command) is False
+
+    def test_script_inside_directory_still_scanned_and_blocked(self, tmp_path):
+        # The directory exemption must not leak to files UNDER the directory:
+        # a real referenced script containing a lifecycle command still blocks.
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n")
+        assert self._scan(f"bash {script}") is True
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
         """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
