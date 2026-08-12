@@ -3085,17 +3085,45 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _live_delivery_platform(platform_name: str, live_adapters) -> bool:
+    """True when a live in-process transport can deliver to ``platform_name``.
+
+    Mirrors ``gateway.delivery.resolve_delivery_transport`` eligibility:
+    a native adapter for the platform, or a Relay adapter that advertises
+    fronting it. Used by preflight so a multiplexed secondary-profile job —
+    whose OWN config never carries platform credentials — is not blocked
+    while the gateway that will actually deliver holds a connected adapter
+    (found live 2026-08-12: every secondary-profile discord job went ``blocked_config``
+    under the profile secret scope; same defect family as #83197 part 2).
+    """
+    if not live_adapters:
+        return False
+    try:
+        from gateway.config import Platform
+
+        platform = Platform(platform_name.lower())
+        if live_adapters.get(platform) is not None:
+            return True
+        relay = live_adapters.get(Platform.RELAY)
+        fronts = getattr(relay, "fronts_platform", None)
+        return relay is not None and callable(fronts) and bool(fronts(platform))
+    except Exception:
+        return False
+
+
+def _preflight_check_delivery(job: dict, live_adapters=None) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
     ``local``/``origin`` (and the ``all`` routing token) need no gateway
     credentials and are never checked — a deliver=local job must not pay a
     gateway-config load. For concrete platform targets, an unknown platform
-    always blocks; a known platform additionally blocks when the gateway
-    config is loadable and reports it unconnected (enabled + credentials —
-    the same source `cron_delivery_targets` uses). Gateway-config load
-    failures fail OPEN so a transient config hiccup never wedges delivery
-    that would have worked.
+    always blocks; a known platform with a LIVE in-process transport (see
+    ``_live_delivery_platform``) is accepted without a config load, because
+    delivery will use that adapter regardless of this profile's credentials.
+    Otherwise a known platform blocks when the gateway config is loadable and
+    reports it unconnected (enabled + credentials — the same source
+    `cron_delivery_targets` uses). Gateway-config load failures fail OPEN so a
+    transient config hiccup never wedges delivery that would have worked.
     """
     deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
     platform_parts: list[str] = []
@@ -3115,6 +3143,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        if _live_delivery_platform(platform_name, live_adapters):
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config
@@ -3194,7 +3224,7 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(job: dict, cfg: dict, live_adapters=None) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -3213,7 +3243,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        ("delivery", lambda: _preflight_check_delivery(job, live_adapters)),
     ):
         try:
             reason = check()
@@ -3229,7 +3259,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
-    extra_prompt: Optional[str] = None,
+    extra_prompt: Optional[str] = None, live_adapters=None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3895,7 +3925,7 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(job, _cfg, live_adapters)
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -4670,7 +4700,7 @@ def run_one_job(
         try:
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents,
-                extra_prompt=extra_prompt,
+                extra_prompt=extra_prompt, live_adapters=adapters,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear

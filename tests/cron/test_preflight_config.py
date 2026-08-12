@@ -62,7 +62,8 @@ class _AuthErrorFactory:
         raise AuthError("No API key configured for provider 'openrouter'")
 
 
-def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
+def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None,
+                     run_job_kwargs=None):
     """Drive run_job with the standard cron-test seams patched.
 
     Returns (success, output, final_response, error, agent_constructed).
@@ -102,7 +103,9 @@ def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
-            success, output, final_response, error = run_job(job)
+            success, output, final_response, error = run_job(
+                job, **(run_job_kwargs or {})
+            )
         agent_constructed = mock_agent_cls.called
     return success, output, final_response, error, agent_constructed
 
@@ -340,3 +343,70 @@ class TestDeliveryPlatform:
 
         assert success is True
         assert agent_constructed is True
+
+    def test_live_adapter_counts_as_connected_for_profile_scoped_config(self, tmp_path):
+        """A multiplexed secondary-profile job (config has no platform
+        credentials of its own) must NOT be blocked when the gateway passes a
+        live adapter for the target platform — delivery uses exactly that
+        adapter, so per-profile credentials are not a precondition. Found live
+        2026-08-12: every secondary-profile discord job was blocked_config under the
+        profile secret scope while the shared gateway adapter was connected.
+        """
+        from gateway.config import Platform
+
+        job = _job(deliver="discord:1234")
+        empty_connected = MagicMock()
+        empty_connected.get_connected_platforms.return_value = set()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config",
+                       return_value=empty_connected):
+                success, output, final_response, error, agent_constructed = \
+                    _run_job_patched(
+                        job, tmp_path,
+                        run_job_kwargs={
+                            "live_adapters": {Platform.DISCORD: object()},
+                        },
+                    )
+
+        assert agent_constructed is True, (error, output)
+        assert success is True
+
+    def test_relay_fronted_live_adapter_counts_as_connected(self, tmp_path):
+        from gateway.config import Platform
+
+        job = _job(deliver="discord:1234")
+        relay = MagicMock()
+        relay.fronts_platform = lambda p: p is Platform.DISCORD
+        empty_connected = MagicMock()
+        empty_connected.get_connected_platforms.return_value = set()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config",
+                       return_value=empty_connected):
+                success, output, final_response, error, agent_constructed = \
+                    _run_job_patched(
+                        job, tmp_path,
+                        run_job_kwargs={
+                            "live_adapters": {Platform.RELAY: relay},
+                        },
+                    )
+
+        assert agent_constructed is True, (error, output)
+        assert success is True
+
+    def test_without_live_adapters_unconnected_platform_still_blocks(self, tmp_path):
+        """Standalone ticks (no gateway in-process) keep the credential gate."""
+        job = _job(deliver="discord:1234")
+        empty_connected = MagicMock()
+        empty_connected.get_connected_platforms.return_value = set()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("gateway.config.load_gateway_config",
+                       return_value=empty_connected):
+                success, output, final_response, error, agent_constructed = \
+                    _run_job_patched(job, tmp_path)
+
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None and "[blocked_config]" in error
