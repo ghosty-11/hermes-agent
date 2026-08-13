@@ -45,8 +45,10 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     _expand_env_vars,
+    cron_model_drift_axes,
     cron_model_drift_guard_enabled,
     load_config,
+    resolve_cron_model_drift_defaults,
 )
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
@@ -1363,28 +1365,22 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()
 
-        from tools.send_message_tool import _parse_target_ref
+        from tools.send_message_tool import (
+            prepare_send_message_platforms,
+            resolve_send_target,
+        )
 
-        parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(platform_key, rest)
-        if is_explicit:
-            chat_id, thread_id = parsed_chat_id, parsed_thread_id
-        else:
-            chat_id, thread_id = rest, None
-
-        # Resolve human-friendly labels like "Alice (dm)" to real IDs.
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_key, chat_id)
-            if resolved:
-                parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
-                if resolved_is_explicit:
-                    chat_id = parsed_chat_id
-                    if parsed_thread_id is not None:
-                        thread_id = parsed_thread_id
-                else:
-                    chat_id = resolved
-        except Exception:
-            pass
+        prepare_send_message_platforms()
+        chat_id, thread_id, resolution_error = resolve_send_target(
+            platform_key, rest
+        )
+        if resolution_error:
+            logger.warning(
+                "Invalid cron delivery target '%s': %s",
+                deliver_value,
+                resolution_error,
+            )
+            return None
 
         if (
             thread_id is None
@@ -3826,14 +3822,12 @@ def run_job(
                         # Cron-fleet default beats the global chat model: it is
                         # the user's explicit "cron runs on this" setting.
                         model = _cron_default_model
-                    elif isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        # Mirror the CLI/oneshot resolution: prefer ``default``,
-                        # accept a ``model`` alias, overwrite only when truthy.
-                        _default = _model_cfg.get("default") or _model_cfg.get("model")
-                        if _default:
-                            model = _default
+                    else:
+                        # Shared with Desktop's post-save impact summary so both
+                        # paths compare snapshots against the same global model.
+                        _, _global_model = resolve_cron_model_drift_defaults(_cfg)
+                        if _global_model:
+                            model = _global_model
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -4087,30 +4081,19 @@ def run_job(
         # unpinned cron jobs there, so the guard is skipped for that axis.
         if cron_model_drift_guard_enabled(_cfg):
             _drift: list[str] = []
-            _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
-            if (
-                _provider_snapshot
-                and not (job.get("provider") or "").strip()
-                and not _cron_default_provider
+            _current_provider = str(
+                primary_provider_for_drift or runtime.get("provider") or ""
+            ).strip().lower()
+            _current_model = str(primary_model_for_drift or "").strip().lower()
+            for _axis in cron_model_drift_axes(
+                job,
+                current_provider=_current_provider,
+                current_model=_current_model,
+                config=_cfg,
             ):
-                _current_provider = str(
-                    primary_provider_for_drift or runtime.get("provider") or ""
-                ).strip().lower()
-                if _current_provider and _current_provider != _provider_snapshot:
-                    _drift.append(
-                        f"provider '{_provider_snapshot}' -> '{_current_provider}'"
-                    )
-            _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
-            if (
-                _model_snapshot
-                and not (job.get("model") or "").strip()
-                and not _cron_default_model
-            ):
-                _current_model = str(primary_model_for_drift or "").strip().lower()
-                if _current_model and _current_model != _model_snapshot:
-                    _drift.append(
-                        f"model '{_model_snapshot}' -> '{_current_model}'"
-                    )
+                _snapshot = str(job.get(f"{_axis}_snapshot") or "").strip().lower()
+                _current = _current_provider if _axis == "provider" else _current_model
+                _drift.append(f"{_axis} '{_snapshot}' -> '{_current}'")
             if _drift:
                 _changes = "; ".join(_drift)
                 logger.warning(
