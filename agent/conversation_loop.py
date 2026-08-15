@@ -946,14 +946,22 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # Context-file discovery is independently scoped in multiplex mode. An old
     # prompt without this marker, or a prompt from another profile, must rebuild
     # once rather than retaining stale or cross-profile instructions.
-    if is_context_file_cwd_scoped():
-        stored_context_cwd = line_value("Context files directory")
-        current_context_cwd = ""
-        if getattr(agent, "skip_context_files", False) is not True:
-            resolved_context_cwd = resolve_context_cwd()
-            current_context_cwd = str(resolved_context_cwd or "")
-        if stored_context_cwd != current_context_cwd:
-            return False
+    #
+    # Compare in BOTH directions, mirroring the builder rather than the current
+    # scope. Gating this on is_context_file_cwd_scoped() checked only the safe
+    # half: a prompt built inside a profile scope and later resumed WITHOUT one
+    # kept its foreign marker and instructions, because the comparison never
+    # ran. An absent marker on either side is "", so an unscoped session with an
+    # unscoped prompt still matches and stays cache gold.
+    stored_context_cwd = line_value("Context files directory")
+    current_context_cwd = ""
+    if (
+        is_context_file_cwd_scoped()
+        and getattr(agent, "skip_context_files", False) is not True
+    ):
+        current_context_cwd = str(resolve_context_cwd() or "")
+    if stored_context_cwd != current_context_cwd:
+        return False
 
     # Detect runtime-surface drift: the stored prompt records which platform it
     # was built for (e.g. "desktop" vs "cli"). Reusing a desktop-built prompt on

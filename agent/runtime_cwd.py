@@ -110,13 +110,22 @@ def resolve_context_cwd() -> Path | None:
     if context_override:
         p = Path(context_override).expanduser()
         if not p.is_dir():
-            logger.warning(
-                "configured context-file directory does not exist: %s",
+            # Stay authoritative anyway. None here does NOT mean "no context
+            # files" — build_context_files_prompt reads it as "fall back to
+            # os.getcwd()", which under multiplex is the shared gateway launch
+            # directory, silently restoring the cross-profile leak this scope
+            # exists to prevent. Honouring the missing path instead makes
+            # discovery find nothing, which is the correct outcome, and the
+            # prompt still records the scope. Logged at error level because the
+            # same directory is simultaneously the HERMES_HOME override, so a
+            # misconfigured route must be visible rather than merely degraded.
+            logger.error(
+                "configured context-file directory does not exist: %s — "
+                "instruction discovery will find nothing (not falling back to "
+                "the execution cwd)",
                 context_override,
             )
-        else:
-            return p
-        return None
+        return p
     override = _session_cwd_override()
     if override:
         p = Path(override).expanduser()
