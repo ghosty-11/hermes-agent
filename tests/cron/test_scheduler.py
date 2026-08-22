@@ -627,15 +627,10 @@ class TestRunJobSessionPersistence:
             yield fake_db, mock_agent_cls
 
 
-    def test_run_job_memory_enabled_in_cron(self, tmp_path):
-        """Cron agents get memory like any other agent run.
-
-        skip_memory=False and the memory toolset is not policy-denied, so
-        MEMORY.md/USER.md load and the memory tool follows normal toolset
-        resolution.
-        """
+    def test_run_job_memory_disabled_in_cron(self, tmp_path):
+        """Cron agents cannot read or update the profile's persistent memory."""
         job = {
-            "id": "memory-enabled-job",
+            "id": "memory-disabled-job",
             "name": "test",
             "prompt": "hello",
         }
@@ -643,13 +638,13 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
-        assert "memory" not in (kwargs["disabled_toolsets"] or []), (
-            "memory toolset must not be policy-denied in cron"
+        assert kwargs["skip_memory"] is True
+        assert "memory" in (kwargs["disabled_toolsets"] or []), (
+            "memory toolset must remain policy-denied in cron"
         )
 
-    def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
-        """A per-job enabled_toolsets naming memory keeps it."""
+    def test_run_job_per_job_memory_toolset_stays_denied(self, tmp_path):
+        """A per-job request cannot bypass the cron memory denial."""
         job = {
             "id": "memory-toolset-job",
             "name": "test",
@@ -660,10 +655,10 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
+        assert kwargs["skip_memory"] is True
         assert "memory" in (kwargs["enabled_toolsets"] or [])
         assert "file" in (kwargs["enabled_toolsets"] or [])
-        assert "memory" not in kwargs["disabled_toolsets"]
+        assert "memory" in kwargs["disabled_toolsets"]
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
