@@ -384,6 +384,16 @@ _current_runtime_session_record: contextvars.ContextVar[dict | None] = (
     contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
 )
 
+# JSON-RPC method being dispatched on this thread/task. Purely diagnostic: the
+# 4001 "session not found" warning below is the only signal a stale-runtime
+# retry loop leaves behind, and without the method name it cannot say WHICH
+# client poll is looping (a 5s `process.list` poll produced 18,614 rejections
+# against one id before the caller could be identified). Never used for
+# authorization — the method string is client-supplied.
+_current_rpc_method: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_gateway_rpc_method", default=""
+)
+
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
 # of corrupting the JSON protocol.
@@ -1999,12 +2009,24 @@ def write_json(obj: dict) -> bool:
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
        behaviour and keeping tests that monkey-patch ``_real_stdout`` green.
+
+    Every routed event frame is stamped with a per-session monotonic
+    ``seq`` and recorded in the bounded replay ring (tui_gateway.event_replay)
+    so a WS client can resume losslessly after a reconnect via
+    ``session.events.since``.
     """
     if obj.get("method") == "event":
-        sid = ((obj.get("params") or {}).get("session_id")) or ""
+        params = obj.get("params")
+        sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+            from tui_gateway.event_replay import _stamp_event
+
+            _stamp_event(obj)
             return t.write(obj)
 
+    from tui_gateway.event_replay import _stamp_event
+
+    _stamp_event(obj)
     return (current_transport() or _stdio_transport).write(obj)
 
 
@@ -2432,7 +2454,11 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    return fn(rid, params)
+    token = _current_rpc_method.set(method)
+    try:
+        return fn(rid, params)
+    finally:
+        _current_rpc_method.reset(token)
 
 
 def _current_session_steer_authority(
@@ -2882,8 +2908,9 @@ def _sess_nowait(params, rid):
     # report is diagnosable as "request arrived and was rejected" instead of
     # "request never arrived" (see #90428).
     logger.warning(
-        "session-scoped RPC rejected: session_id=%r not in memory "
+        "session-scoped RPC rejected: method=%s session_id=%r not in memory "
         "(detached/reaped runtime; client should resume the stored session), rid=%r",
+        _current_rpc_method.get() or "?",
         sid,
         rid,
     )
@@ -4914,6 +4941,16 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     home_token = (
         set_hermes_home_override(profile_home) if profile_home else None
     )
+    # Bind the session context too. This function runs on the RPC dispatcher
+    # thread (model.switch, config.set model). On that thread the _SESSION_CWD
+    # contextvar is not set, so resolve_agent_cwd() falls back to the process
+    # TERMINAL_CWD, which the desktop pins to the home directory. The rebuilt
+    # prompt then records the wrong working directory and persists it. Later
+    # turns restore the stored bytes without change, because the turn
+    # prologue rebuilds only when _cached_system_prompt is None.
+    session_tokens = _set_session_context(
+        session_key, cwd=_session_cwd(session)
+    )
     try:
         prompt = agent._build_system_prompt(None)
         agent._cached_system_prompt = prompt
@@ -4925,6 +4962,7 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
             exc_info=True,
         )
     finally:
+        _clear_session_context(session_tokens)
         if home_token is not None:
             reset_hermes_home_override(home_token)
 
