@@ -29,6 +29,7 @@ import {
   noteActiveTreeGroup,
   revealTreePane
 } from '@/components/pane-shell/tree/store'
+import { $workspaceMode } from '@/components/pane-shell/workspace-scope'
 import type { WorkspaceMode } from '@/contrib/types'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
@@ -47,6 +48,7 @@ import {
   knownSessionOwner,
   lineageAliases,
   markSessionRead,
+  ownerLookupSessionRows,
   sessionMatchesStoredId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
@@ -957,6 +959,10 @@ export function openTileGatewayScopes(): Set<string> {
  * exact unique owner hint (stamped when a routed create returns / at open
  * time; persisted), then the session row's owner (an exact route when the row
  * is connection-tagged, else its bare profile, else the hint's profile). The
+ * row rung searches every source-scoped slice (recents, cron, messaging), not
+ * just recents — a cron session's approval.respond used to find no owner here
+ * and fail closed on registry-topology installs even though its row (with its
+ * `profile` stamp) was already loaded for the sidebar's cron section. The
  * hint outranks the row for the same reason as contrib/wiring's ladder: a
  * row can be stamped from the ambient profile and carries no connection.
  * Returns undefined when no owner is known — the caller fails closed
@@ -972,7 +978,7 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
   return (
     sessionTileOwnerRoute(storedSessionId) ??
     getSessionOwnerHint(storedSessionId) ??
-    knownSessionOwner($sessions.get(), storedSessionId)
+    knownSessionOwner(ownerLookupSessionRows(), storedSessionId)
   )
 }
 
@@ -1511,6 +1517,27 @@ export function closeSessionTile(storedSessionId: string) {
   }
 }
 
+/** Persist-close every session tile whose pane lives in `paneId`'s group.
+ *
+ * Close All used to only dismiss layout-tree panes. Bot Mode tiles are
+ * stored in the shared `__bots_workspace__` bucket, so a later roster
+ * click or profile swap rehydrated `$sessionTiles` and the closed tabs
+ * came back (#94137). Routing through {@link closeSessionTile} writes that
+ * bucket, so the closed set survives those rehydrations and a restart.
+ */
+export function closeAllOpenSessionTiles(paneId: string): void {
+  const tree = $layoutTree.get()
+  // Copy the live group list. closeSessionTile can rewrite the layout
+  // tree; iterating the original array would skip every other pane.
+  const panes = [...((tree ? findGroupOfPane(tree, paneId) : null)?.panes ?? [])]
+
+  for (const id of panes) {
+    if (id.startsWith(TILE_PANE_PREFIX)) {
+      closeSessionTile(id.slice(TILE_PANE_PREFIX.length))
+    }
+  }
+}
+
 /** Drop a DEAD tile — a persisted tile whose session no longer exists on the
  *  backend (resume 404s). Unlike close, it leaves no ⌘⇧T undo (resurrecting it
  *  would just 404 again) and evicts any cached state. This is what clears the
@@ -1564,11 +1591,36 @@ export function reopenLastClosedTile(): void {
 /** Stored id of the focused session (the interacted zone's tile, else the
  *  primary's selection). Null on a fresh draft. */
 export const $focusedStoredSessionId = computed(
-  [$activeTreeGroup, $layoutTree, $selectedStoredSessionId],
-  (groupId, tree, selected) => {
+  [$activeTreeGroup, $layoutTree, $selectedStoredSessionId, $workspaceMode],
+  (groupId, tree, selected, workspaceMode) => {
     const active = groupId && tree ? findGroup(tree, groupId)?.active : undefined
 
-    return active?.startsWith(TILE_PANE_PREFIX) ? active.slice(TILE_PANE_PREFIX.length) : selected
+    if (active?.startsWith(TILE_PANE_PREFIX)) {
+      return active.slice(TILE_PANE_PREFIX.length)
+    }
+
+    // The interaction tracker can point at sidebar CHROME while a chat still
+    // holds the main zone's active tab — clicking a Bots-pane roster row moves
+    // it to the sidebar group, whose active pane ('hermes-bots:pane') is not a
+    // session tile. In sessions mode the primary selection answers, exactly as
+    // always. In Bot Mode that fallback alone publishes a NULL "focused"
+    // edge: bot chats open as TILES and never set $selectedStoredSessionId,
+    // so the selection is null while the chat is plainly on screen. The Bots
+    // plugin reads that null edge as "the chat lost the center", releases its
+    // open claim, and re-asserts the Bots home over the still-visible chat —
+    // the reported "clicking a bot chat jumps to the list" (#96062). Bot
+    // Mode's on-screen truth is the main zone's active TILE; only when the
+    // main zone holds no tile (chat closed) does the selection answer, so a
+    // genuine close still lets the home return.
+    if (workspaceMode === 'bots' && tree) {
+      const mainActive = findGroupOfPane(tree, 'workspace')?.active
+
+      if (mainActive?.startsWith(TILE_PANE_PREFIX)) {
+        return mainActive.slice(TILE_PANE_PREFIX.length)
+      }
+    }
+
+    return selected
   }
 )
 
