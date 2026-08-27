@@ -9872,6 +9872,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reached messaging sessions even though the same process's cron jobs
         fell back correctly. Fixes #60955.
 
+        Reads the PROFILE's config when a per-profile HERMES_HOME override
+        is active (``_gateway_config_home()``), matching
+        ``_load_gateway_config()``. Reading ``_hermes_home`` directly here
+        handed root's chain to every multiplexed profile session, so a
+        profile whose config lacks root's rung providers skipped them
+        "provider not configured" and landed on root's next resolvable
+        rung -- a metered one on this deployment.
+
         A TRANSIENT read/parse failure (user mid-edit of config.yaml with a
         non-atomic write) keeps the last known-good chain instead of wiping a
         cached agent's working fallback for that turn.  Only a successful read
@@ -9879,7 +9887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from hermes_cli.config import read_user_config_raw
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = _gateway_config_home() / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
                 return self._fallback_model
