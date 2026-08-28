@@ -5378,7 +5378,20 @@ class AIAgent:
         # Lazy init — tests build agents via AIAgent.__new__ without __init__.
         cache = getattr(self, "_request_client_cache", None)
         if cache is None:
-            cache = {"client": None, "kwargs": None, "poisoned": False, "in_use": False}
+            cache = {
+                "client": None,
+                "kwargs": None,
+                "poisoned": False,
+                "in_use": False,
+                # Provenance for the stream record. The request-wire pool is
+                # reused across sequential successful calls and the owning
+                # AIAgent is itself cached by the gateway (LRU 128, idle
+                # 3600s), so a pool can outlive many turns. Recording when it
+                # was built is what makes "did a stalled request inherit a
+                # warm pool?" answerable at all.
+                "created_at": None,
+                "serial": 0,
+            }
             self._request_client_cache = cache
         return cache
 
@@ -5426,6 +5439,11 @@ class AIAgent:
                     and not self._is_openai_client_closed(cached)
                 ):
                     cache["in_use"] = True
+                    # Exact: this attempt got an already-built pool. Recorded
+                    # as a fact rather than inferred from the client's age,
+                    # because a pool reused 0.4s after construction is still
+                    # a reused pool.
+                    cache["last_call_reused"] = True
                     return cached
                 # kwargs changed (credential rotation, provider failover),
                 # poisoned by a cross-thread abort (#29507), or externally
@@ -5453,10 +5471,57 @@ class AIAgent:
                 }
                 cache["poisoned"] = False
                 cache["in_use"] = True
+                cache["created_at"] = time.time()
+                cache["serial"] = int(cache.get("serial") or 0) + 1
+                cache["last_call_reused"] = False
             # else: a concurrent call holds the slot — hand this client
             # out untracked; _close_request_openai_client fully closes
             # untracked clients, preserving the per-request lifecycle.
         return client
+
+    def request_client_provenance(self, client: Any) -> Dict[str, Any]:
+        """Describe the request-wire client backing this attempt.
+
+        ``reused`` means the cached openai/httpx CLIENT was handed back
+        without reconstruction. It is deliberately NOT called ``tcp_reused``:
+        httpx exposes no supported way to ask whether a request rode an
+        existing TCP connection, and a reused Client still opens a fresh
+        socket once the pool's ``keepalive_expiry`` (20s) has passed or the
+        pool is empty. Treat it as the necessary-but-not-sufficient proxy it
+        is; logging it as TCP reuse would manufacture a fact.
+        """
+        info: Dict[str, Any] = {
+            "client_id": None,
+            "transport_id": None,
+            "client_serial": None,
+            "client_age": None,
+            "reused": None,
+        }
+        try:
+            with self._openai_client_lock():
+                cache = self._request_client_cache_ref()
+                tracked = cache.get("client")
+                created_at = cache.get("created_at")
+                serial = cache.get("serial")
+                reused = cache.get("last_call_reused")
+            if client is None:
+                return info
+            info["client_id"] = id(client)
+            info["transport_id"] = id(getattr(client, "_client", None) or 0) or None
+            if tracked is client:
+                info["client_serial"] = serial
+                info["reused"] = reused
+                if created_at:
+                    info["client_age"] = round(
+                        max(0.0, time.time() - float(created_at)), 3
+                    )
+            else:
+                # Untracked client: a concurrent call held the slot, so this
+                # pool was built fresh for this attempt and is never reused.
+                info["reused"] = False
+        except Exception:
+            pass
+        return info
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         with self._openai_client_lock():
@@ -6913,7 +6978,21 @@ class AIAgent:
         except Exception:
             logger.debug("on_stream_start plugin hook enqueue failed", exc_info=True)
 
-    def _emit_stream_end(self, *, final_text: str, finished: bool, error: str | None) -> None:
+    def _emit_stream_end(
+        self,
+        *,
+        final_text: str,
+        finished: bool,
+        error: str | None,
+        stream_diag: Dict[str, Any] | None = None,
+    ) -> None:
+        """Announce the end of one provider streaming attempt.
+
+        ``stream_diag`` carries the per-attempt raw-chunk record (chunk
+        count, TTFB, largest inter-chunk gap, bytes, usage, request shape).
+        It defaults to ``None`` so callers that only report lifecycle -- and
+        the non-streaming providers -- stay source-compatible.
+        """
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -6923,6 +7002,7 @@ class AIAgent:
                 final_text=final_text,
                 finished=finished,
                 error=error,
+                stream_diag=stream_diag,
             )
         except Exception:
             logger.debug("on_stream_end plugin hook enqueue failed", exc_info=True)

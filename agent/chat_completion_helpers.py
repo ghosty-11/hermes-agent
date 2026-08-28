@@ -45,6 +45,11 @@ from agent.message_sanitization import (
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.stream_diag import (
+    stream_diag_note_chunk as _stream_diag_note_chunk,
+    stream_diag_snapshot as _stream_diag_snapshot,
+    usage_summary as _usage_summary,
+)
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -3357,15 +3362,81 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             pass
         return ""
 
+    # Per-attempt raw-chunk diagnostics, published on the ``on_stream_end``
+    # observer payload so a telemetry plugin can persist one row per
+    # streaming attempt.  Declared here rather than on
+    # ``request_client_holder`` because the codex and bedrock branches below
+    # return before that holder is created.
+    _diag_holder: Dict[str, Any] = {
+        "diag": None,
+        "est_context_tokens": None,
+        "tools": None,
+        "stale_threshold": None,
+        # Name of the thread that ISSUED the request, captured on the caller
+        # before the stream worker is spawned. The multiplexed gateway runs
+        # several of these concurrently, and on 2026-08-27 the distinction
+        # between hermes-gateway_0 and _1 separated two incidents that
+        # timestamp spacing alone had conflated into one.
+        "thread": None,
+        # 1-based retry counter, matching the "attempt N/M" stream-drop logs.
+        "attempt": None,
+        "max_attempts": None,
+        # Request-wire client identity/age/reuse, filled at stream open.
+        "client": None,
+    }
+    _REQUEST_SHAPE_FIELDS = (
+        "est_context_tokens",
+        "tools",
+        "stale_threshold",
+        "thread",
+        "attempt",
+        "max_attempts",
+    )
+
     def _emit_stream_start() -> None:
         emit = getattr(agent, "_emit_stream_start", None)
         if emit is not None:
             emit()
 
-    def _emit_stream_end(*, final_text: str, finished: bool, error: str | None) -> None:
+    def _emit_stream_end(
+        *,
+        final_text: str,
+        finished: bool,
+        error: str | None,
+        error_type: str | None = None,
+    ) -> None:
         emit = getattr(agent, "_emit_stream_end", None)
-        if emit is not None:
-            emit(final_text=final_text, finished=finished, error=error)
+        if emit is None:
+            return
+        snapshot = _stream_diag_snapshot(_diag_holder.get("diag"))
+        if snapshot is not None:
+            # Request-shape fields are resolved once per request, outside the
+            # per-attempt diag, so they are merged here rather than copied
+            # into every attempt's dict.
+            for _field in _REQUEST_SHAPE_FIELDS:
+                snapshot[_field] = _diag_holder.get(_field)
+            # Read at emit time, not at request start: activating a fallback
+            # rung reassigns base_url/model/provider on the agent in place, so
+            # these describe the rung that actually served THIS attempt.
+            snapshot["base_url"] = agent.base_url or ""
+            # ``_fallback_index`` is the NEXT rung to try, so the rung in use
+            # is one behind it; 0 means the primary is still serving and no
+            # fallback has been activated this turn.
+            try:
+                _next_rung = int(getattr(agent, "_fallback_index", 0) or 0)
+                snapshot["fallback_rung"] = max(0, _next_rung - 1) if _next_rung else 0
+                snapshot["fallback_active"] = _next_rung > 0
+            except Exception:
+                snapshot["fallback_rung"] = None
+                snapshot["fallback_active"] = None
+            snapshot["client"] = _diag_holder.get("client")
+            snapshot["error_type"] = error_type
+        emit(
+            final_text=final_text,
+            finished=finished,
+            error=error,
+            stream_diag=snapshot,
+        )
 
     # Cron and other non-interactive, nested-pool contexts deadlock on the
     # spawned worker thread (#62151). They also have no stream consumer, so the
@@ -3388,7 +3459,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _emit_stream_end(final_text=_stream_final_text(response), finished=True, error=None)
             return response
         except Exception as exc:
-            _emit_stream_end(final_text="", finished=False, error=str(exc))
+            _emit_stream_end(
+                final_text="",
+                finished=False,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             raise
         finally:
             agent._codex_on_first_delta = None
@@ -3653,7 +3729,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _emit_stream_end(final_text=_stream_final_text(result["response"]), finished=True, error=None)
             return result["response"]
         except Exception as exc:
-            _emit_stream_end(final_text="", finished=False, error=str(exc))
+            _emit_stream_end(
+                final_text="",
+                finished=False,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             raise
 
     result = {"response": None, "error": None, "partial_tool_names": []}
@@ -3940,6 +4021,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         _diag = agent._stream_diag_init()
+        _diag_holder["diag"] = _diag
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
@@ -3966,6 +4048,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
             )
             attempt_request_client["value"] = request_client
+            # Which request-wire pool served this attempt, and how old it was.
+            # The request client is cached per agent and the agent is cached by
+            # the gateway, so a stalled attempt may have inherited a pool built
+            # many turns earlier — that is the stale-pooled-connection
+            # hypothesis, and this is the field that tests it.
+            try:
+                _provenance = getattr(agent, "request_client_provenance", None)
+                if _provenance is not None:
+                    _diag_holder["client"] = _provenance(request_client)
+            except Exception:
+                pass
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
             return request_client.chat.completions.create(**stream_kwargs)
@@ -4091,9 +4184,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # failures are swallowed so the streaming hot path is never
             # interrupted by diagnostic accounting.
             try:
-                _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
-                if _diag.get("first_chunk_at") is None:
-                    _diag["first_chunk_at"] = last_chunk_time["t"]
+                _stream_diag_note_chunk(_diag, last_chunk_time["t"])
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -4139,6 +4230,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Usage comes in the final chunk with empty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
+                    _diag["usage"] = _usage_summary(usage_obj)
                 # Some OpenAI-compatible providers (DeepInfra, etc.)
                 # return validation errors as in-stream error chunks:
                 # choices=None with error_type/error_message in
@@ -4308,6 +4400,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
+                _diag["usage"] = _usage_summary(usage_obj)
 
         _close_managed_stream()
 
@@ -4534,6 +4627,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         last_chunk_time["t"] = time.time()
         _diag = agent._stream_diag_init()
+        _diag_holder["diag"] = _diag
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
         _stream_context = {"manager": None, "stream": None}
@@ -4611,9 +4705,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
                 try:
-                    _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
-                    if _diag.get("first_chunk_at") is None:
-                        _diag["first_chunk_at"] = last_chunk_time["t"]
+                    _stream_diag_note_chunk(_diag, last_chunk_time["t"])
                     _diag["bytes"] = int(_diag.get("bytes", 0)) + _estimate_chunk_bytes(event)
                 except Exception:
                     pass
@@ -4736,6 +4828,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
                 stream_attempt_id = _start_stream_attempt()
+                # 1-based, matching the "attempt N/M" wording in stream-drop
+                # logs so a record and a log line about the same attempt agree.
+                _diag_holder["attempt"] = _stream_attempt + 1
+                _diag_holder["max_attempts"] = _max_stream_retries + 1
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
                 # but the retry loop opens a FRESH connection — negating the
@@ -4767,7 +4863,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     return  # success
                 except Exception as e:
-                    _emit_stream_end(final_text="", finished=False, error=str(e))
+                    _emit_stream_end(
+                        final_text="",
+                        finished=False,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
                     _close_managed_stream()
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the
@@ -5073,6 +5174,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _stream_stale_timeout_base = _cfg_stale
     else:
         _stream_stale_timeout_base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
+    # Request shape for the stream record, captured for EVERY endpoint.
+    # Hoisted above the local/cloud split deliberately: the local branch does
+    # not need the token estimate for its own timeout, and leaving it unset
+    # there made the record blind to exactly the rungs the capacity question
+    # is about: a local fallback rung can declare a ctx-size smaller than the
+    # request that actually gets dispatched to it. Lane compaction runs
+    # earlier, in conversation_loop, so this is the DISPATCHED size.
+    _est_tokens = estimate_request_context_tokens(api_kwargs)
+    _diag_holder["est_context_tokens"] = _est_tokens
+    try:
+        _tools = api_kwargs.get("tools")
+        _diag_holder["tools"] = len(_tools) if _tools else 0
+    except Exception:
+        pass
+
     # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
     # for prefill on large contexts, so tolerate far longer silence than
     # the cloud default — but a wedged local server must EVENTUALLY trip the
@@ -5108,7 +5224,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # when the context is large.  Without this, the stale detector kills
         # healthy connections during the model's thinking phase, producing
         # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = estimate_request_context_tokens(api_kwargs)
+        # ``_est_tokens`` is captured above, for every endpoint.
         if _est_tokens > 100_000:
             _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
         elif _est_tokens > 50_000:
@@ -5126,6 +5242,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
+
+    # The threshold this attempt was actually judged against. Recording it
+    # beside the measured gaps is what turns a record into evidence about
+    # whether the threshold is the right control.
+    _diag_holder["stale_threshold"] = _stream_stale_timeout
+    _diag_holder["thread"] = threading.current_thread().name
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
