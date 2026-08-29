@@ -2759,7 +2759,14 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
                     discover_plugins()
                     invalid = [t for t in invalid if not validate_toolset(t)]
                 except Exception:
-                    pass
+                    # A plugin that raises during import must not masquerade
+                    # as a config error, but keep the two failure modes
+                    # distinguishable in the logs (same level as the
+                    # background-discovery failure handler in plugins.py).
+                    logger.warning(
+                        "plugin discovery failed while re-validating toolsets",
+                        exc_info=True,
+                    )
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
 
