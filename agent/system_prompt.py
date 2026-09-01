@@ -897,7 +897,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _context_cwd = resolve_context_cwd()
         if is_context_file_cwd_scoped():
             _context_marker_cwd = str(_context_cwd or "")
-        if getattr(agent, "_context_cwd_is_launch_artifact", False):
+        elif getattr(agent, "_context_cwd_is_launch_artifact", False):
             # Desktop session creation pins the backend launch directory so
             # tools have a deterministic cwd even when the user picked no
             # workspace. Preserve that tool routing, but let context discovery
