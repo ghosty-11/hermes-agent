@@ -44,15 +44,114 @@ def stream_diag_init() -> Dict[str, Any]:
     Mutated in-place by the streaming functions and read from the retry
     block when a stream dies.  Lives on ``request_client_holder`` so it
     survives across the closure boundary.
+
+    ``last_chunk_at`` / ``max_gap`` track the largest pause *between* two
+    provider chunks, which ``first_chunk_at`` alone cannot express.  The
+    stale detector keys on one threshold for both "nothing ever arrived"
+    and "the stream went quiet mid-flight", so a record that cannot
+    separate them leaves the failure undiagnosable, which is exactly how a
+    run of ``Stream stale for <N>s`` WARNINGs resists diagnosis.
     """
     return {
         "started_at": time.time(),
         "first_chunk_at": None,
+        "last_chunk_at": None,
+        "max_gap": 0.0,
         "chunks": 0,
         "bytes": 0,
         "headers": {},
         "http_status": None,
+        "usage": None,
     }
+
+
+def usage_summary(usage: Any) -> Optional[Dict[str, Any]]:
+    """Flatten a provider usage object to plain ints, or ``None``.
+
+    Providers disagree on whether usage is a pydantic model, a dataclass or
+    a bare dict, and several omit fields entirely, so every field is read
+    defensively and absent ones stay ``None`` rather than becoming zero --
+    "the provider did not say" and "the provider said nothing was used" are
+    different facts on a stalled stream.
+    """
+    if usage is None:
+        return None
+
+    def _field(name: str) -> Optional[int]:
+        value = (
+            usage.get(name)
+            if isinstance(usage, dict)
+            else getattr(usage, name, None)
+        )
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "prompt_tokens": _field("prompt_tokens"),
+        "completion_tokens": _field("completion_tokens"),
+        "total_tokens": _field("total_tokens"),
+    }
+
+
+def stream_diag_note_chunk(diag: Dict[str, Any], now: float) -> None:
+    """Record one provider chunk's arrival on *diag*.
+
+    Counts EVERY provider chunk, including empty-``choices`` usage and
+    keep-alive chunks and tool-call chunks.  That is deliberate: it is the
+    same population the stale detector's ``last_chunk_time`` tracks, so the
+    record explains the detector rather than measuring something adjacent.
+    The text-delta observer hook cannot substitute -- it never fires while a
+    tool call is accumulating, so a tool-call-only stream would read as a
+    first-token stall.
+
+    Best-effort and allocation-free on the hot path: two dict reads, a
+    subtract and a compare per chunk.
+    """
+    try:
+        previous = diag.get("last_chunk_at")
+        if previous is None:
+            diag["first_chunk_at"] = now
+        else:
+            gap = now - previous
+            if gap > diag.get("max_gap", 0.0):
+                diag["max_gap"] = gap
+        diag["last_chunk_at"] = now
+        diag["chunks"] = int(diag.get("chunks", 0)) + 1
+    except Exception:
+        pass
+
+
+def stream_diag_snapshot(diag: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a flat, JSON-safe completion record for *diag*, or ``None``.
+
+    Shipped on the ``on_stream_end`` observer payload so a telemetry plugin
+    can persist one row per streaming attempt without reaching into agent
+    internals.  ``ttfb`` is ``None`` when no chunk ever arrived -- that is
+    precisely the first-token-stall signal, and it is why the field is
+    nullable rather than zero.
+    """
+    if not isinstance(diag, dict):
+        return None
+    try:
+        started = float(diag.get("started_at") or 0.0)
+        first = diag.get("first_chunk_at")
+        last = diag.get("last_chunk_at")
+        now = time.time()
+        return {
+            "started_at": started or None,
+            "elapsed": max(0.0, now - started) if started else None,
+            "ttfb": max(0.0, float(first) - started) if first and started else None,
+            "max_gap": float(diag.get("max_gap") or 0.0),
+            "idle_at_end": max(0.0, now - float(last)) if last else None,
+            "chunks": int(diag.get("chunks") or 0),
+            "bytes": int(diag.get("bytes") or 0),
+            "http_status": diag.get("http_status"),
+            "usage": diag.get("usage"),
+        }
+    except Exception:
+        return None
 
 
 def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response: Any) -> None:
@@ -273,6 +372,9 @@ def emit_stream_drop(
 __all__ = [
     "STREAM_DIAG_HEADERS",
     "stream_diag_init",
+    "stream_diag_note_chunk",
+    "usage_summary",
+    "stream_diag_snapshot",
     "stream_diag_capture_response",
     "flatten_exception_chain",
     "log_stream_retry",
