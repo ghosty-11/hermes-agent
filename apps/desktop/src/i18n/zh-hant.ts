@@ -156,7 +156,8 @@ export const zhHant = defineLocale({
       microphonePermission: '麥克風權限已被拒絕。',
       openaiRejectedApiKey: 'OpenAI 拒絕了該 API 金鑰。',
       openaiRejectedApiKeyWithStatus: status => `OpenAI 拒絕了該 API 金鑰 (${status} invalid_api_key)。`,
-      openaiTtsNeedsKey: 'OpenAI TTS 需要 VOICE_TOOLS_OPENAI_KEY 或 OPENAI_API_KEY。'
+      openaiTtsNeedsKey: 'OpenAI TTS 需要 VOICE_TOOLS_OPENAI_KEY 或 OPENAI_API_KEY。',
+      codeSkewRestartRequired: '更新後此後端仍在執行舊程式碼。請重新啟動以載入新程式碼。'
     },
     voice: {
       configureSpeechToText: '設定語音轉文字後即可使用語音模式。',
@@ -962,6 +963,11 @@ export const zhHant = defineLocale({
       provider: '提供方',
       model: '模型',
       applying: '套用中...',
+      loadFailed: '無法載入模型',
+      restartRequired: '更新後此後端仍在執行舊程式碼。請重新啟動以載入新程式碼。',
+      restartBackend: '重新啟動後端',
+      restartingBackend: '正在重新啟動後端...',
+      restartFailed: '無法重新啟動後端',
       auxiliaryTitle: '輔助模型',
       resetAllToMain: '全部重設為主要模型',
       auxiliaryDesc: '輔助任務預設使用主要模型。您可以為任何任務指定專用模型。',
@@ -1099,6 +1105,26 @@ export const zhHant = defineLocale({
         selectedMessage: backend => `終端命令現在透過 ${backend} 執行。將套用於新工作階段。`,
         failedSelect: backend => `選擇 ${backend} 失敗`,
         needsSetupHint: '現在即可選擇此後端——但在完成設定前命令將會失敗。'
+      },
+      browserRealProfile: {
+        label: '使用我的真實瀏覽器設定檔',
+        description:
+          '將預設瀏覽器的登入資訊與 Cookie 複製到受管理的快照中，代理使用該快照進行瀏覽。絕不會直接開啟你的真實設定檔。將套用於新工作階段。',
+        enabledTitle: '真實設定檔瀏覽：已開啟',
+        enabledMessage: '新工作階段將使用預設瀏覽器設定檔的快照進行瀏覽。',
+        disabledTitle: '真實設定檔瀏覽：已關閉',
+        disabledMessage: '設定檔快照將被刪除；新工作階段使用乾淨的瀏覽器。',
+        failedSave: '無法儲存真實設定檔設定',
+        prompt: {
+          title: '讓網站保持登入狀態',
+          body: '讓 Hermes 使用預設瀏覽器設定檔的快照進行瀏覽，網站開啟時即已登入。',
+          bulletSnapshot: 'Cookie 與登入資訊會複製到受管理的快照中。',
+          bulletLiveProfile: '絕不會直接開啟你的真實瀏覽器設定檔。',
+          bulletLocal: '所有資料都不會離開這台電腦。',
+          dontShowAgain: '不再顯示',
+          notNow: '暫不',
+          enable: '使用我的設定檔'
+        }
       }
     }
   },
@@ -1156,7 +1182,9 @@ export const zhHant = defineLocale({
     edit: '編輯',
     archive: '封存',
     skillArchivedTitle: '技能已封存',
-    skillArchivedMessage: '可透過 hermes curator restore 還原。'
+    skillArchivedMessage: '可透過 hermes curator restore 還原。',
+    officialCatalog: '可安裝',
+    officialPill: '官方'
   },
 
   starmap: {
@@ -1530,6 +1558,7 @@ export const zhHant = defineLocale({
     defaultBadge: '預設',
     rename: '重新命名',
     renameMenu: '重新命名…',
+    exportMenu: '匯出…',
     editSoul: '編輯 SOUL.md…',
     copySetup: '複製安裝指令',
     copying: '複製中…',
@@ -1831,7 +1860,7 @@ export const zhHant = defineLocale({
       removeFolder: '移除',
       create: '建立',
       menu: '動作',
-      menuRename: '重新命名',
+      menuRename: '重新命名…',
       menuAppearance: '外觀',
       noColor: '無顏色',
       menuAddFolder: '新增資料夾',
@@ -1890,7 +1919,7 @@ export const zhHant = defineLocale({
       copyId: '複製 ID',
       export: '匯出',
       branchFrom: '分支',
-      rename: '重新命名',
+      rename: '重新命名…',
       archive: '封存',
       newWindow: '新視窗',
       openInTerminal: '在終端機中開啟',

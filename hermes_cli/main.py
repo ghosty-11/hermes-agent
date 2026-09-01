@@ -102,6 +102,34 @@ try:
 except Exception:
     pass
 
+# Startup-liveness watchdog (OOF-298): for gateway runs, arm BEFORE the heavy
+# module-level import graph below — an import-time deadlock (native-extension
+# init, contended import lock) is exactly the "wedged before the event loop,
+# no logs, live PID" class this watchdog exists for. ``hermes_startup_watchdog``
+# is stdlib-only, so importing it here cannot itself wedge on application
+# code. The match requires the ADJACENT token pair ``gateway run`` (the
+# subcommand shape, wherever global flags like ``-p <profile>`` put it) so
+# unrelated commands that merely mention both words in different arguments
+# never arm a 300s hard-exit timer, while flag-carrying invocations still
+# do — under-arming recreates OOF-298. Foreground `hermes gateway run`
+# still arms — a pre-loop wedge is just as dead without a supervisor, and
+# the stack dump plus exit beats a silent hang; GatewayRunner disarms once
+# the event loop is confirmed live.
+def _argv_is_gateway_run(argv: list) -> bool:
+    return any(
+        a == "gateway" and b == "run" for a, b in zip(argv, argv[1:])
+    )
+
+
+if _argv_is_gateway_run(sys.argv[1:]):
+    try:
+        from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw
+
+        _arm_sw()
+        del _arm_sw
+    except Exception:
+        pass
+
 
 def _exit_after_oneshot(rc: object) -> None:
     """Exit one-shot mode without letting late native finalizers change rc.
@@ -633,17 +661,55 @@ def _apply_profile_override() -> None:
 
     # 2. If no flag, check active_profile in the hermes root.
     #
-    # EXCEPTION: a supervised s6 gateway child (exported by the container
-    # run-script as HERMES_S6_SUPERVISED_CHILD=1) must NOT follow the sticky
-    # active_profile. Each supervised slot has a fixed profile identity: named
-    # slots pass ``-p <name>`` explicitly (handled in step 1 above), and the
-    # reserved ``gateway-default`` slot runs bare ``hermes gateway run`` to mean
-    # "the root HERMES_HOME profile". If the reserved default child read
-    # active_profile here, switching the active profile (e.g. via the dashboard)
-    # would silently redirect the default gateway into that profile — yielding a
-    # duplicate gateway for the active profile and no real default gateway. See
-    # the "Docker & Profiles & Dashboard" report.
-    if profile_name is None and not os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+    # EXCEPTION: a supervisor-launched gateway child must NOT follow the
+    # sticky active_profile. Each supervised slot has a fixed profile
+    # identity: named slots pass ``-p <name>`` explicitly (handled in step 1
+    # above) or pin ``HERMES_HOME`` to the profile directory (step 1.5), and
+    # a bare invocation means "the root HERMES_HOME profile". If a supervised
+    # default-profile child read active_profile here, switching the active
+    # profile (e.g. via the dashboard or ``hermes profile use``) would
+    # silently redirect the default gateway into that profile — the default
+    # gateway then assumes the other profile's identity/credentials (logs
+    # under the other profile's tree, connects with its Telegram bot token)
+    # and double-polls a token already owned by that profile's own gateway.
+    # See issue #74872 and the "Docker & Profiles & Dashboard" report.
+    #
+    # Supervisor markers honored (see gateway/restart.py
+    # ``is_gateway_supervisor_process`` for the sibling detection used by
+    # restart routing):
+    #   - HERMES_SUPERVISED_CHILD: generalized marker exported by the
+    #     generated systemd unit, launchd plist, and Windows Scheduled-Task
+    #     launchers (#74872).
+    #   - HERMES_S6_SUPERVISED_CHILD: legacy s6 container marker (back-compat;
+    #     exported by S6ServiceManager's run-script).
+    #   - INVOCATION_ID: set by systemd for service children only (never in
+    #     interactive shells) — covers already-installed gateway units that
+    #     predate the HERMES_SUPERVISED_CHILD marker. Consulted ONLY for
+    #     gateway commands: INVOCATION_ID is inherited by every descendant of
+    #     a systemd-launched process (self-hosted CI runners, user services
+    #     running unrelated hermes commands), so honoring it globally would
+    #     silently disable the sticky active_profile for those.
+    #   - HERMES_GATEWAY_EXTERNAL_SUPERVISOR: explicit external-supervisor
+    #     opt-in (``hermes gateway run --external-supervisor``).
+    #
+    # XPC_SERVICE_NAME is deliberately NOT consulted here: interactive macOS
+    # terminals set it too, and a false positive would silently break the
+    # sticky active_profile for every interactive command.
+    def _under_gateway_supervisor() -> bool:
+        if os.environ.get("HERMES_SUPERVISED_CHILD"):
+            return True
+        if os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+            return True
+        is_gateway_cmd = next(
+            (a for a in argv if not a.startswith("-")), None
+        ) == "gateway"
+        if is_gateway_cmd and os.environ.get("INVOCATION_ID"):
+            return True
+        return os.environ.get(
+            "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    if profile_name is None and not _under_gateway_supervisor():
         try:
             from hermes_constants import get_default_hermes_root
 
@@ -3399,9 +3465,6 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
         )
 
-    # Import and run the CLI
-    from cli import main as cli_main
-
     # --query-file: read the single query from a file (or stdin via '-') so
     # callers never have to shell-quote message bodies. This is the transport
     # the Bot Mode DM protocol uses — interpolating arbitrary text into a
@@ -3437,6 +3500,7 @@ def cmd_chat(args):
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
+        "oneshot": bool(getattr(args, "oneshot_exit", False)),
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),
@@ -3452,10 +3516,23 @@ def cmd_chat(args):
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     try:
+        from cli import main as cli_main
+
         cli_main(**kwargs)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
+    except ImportError as e:
+        # Mixed-version installs (new cli.py, older hermes_cli.config) crash
+        # here — e.g. missing resolve_turn_limit / split_model_config_default
+        # (#96900). The agent-setup mixin prints this hint too late: HermesCLI
+        # construction already failed. Fast-chat launch also goes through
+        # cmd_chat, so this one catch covers `hermes` / `hermes chat`.
+        from hermes_constants import emit_partial_update_hint
+
+        if emit_partial_update_hint(e):
+            sys.exit(1)
+        raise
 
 
 def cmd_gateway(args):
@@ -4209,6 +4286,7 @@ def select_provider_and_model(args=None):
         "nvidia",
         "ollama-cloud",
         "tencent-tokenhub",
+        "tencent-tokenplan",
         "lmstudio",
     } or _is_profile_api_key_provider(selected_provider):
         _model_flow_api_key_provider(config, selected_provider, current_model)
@@ -8096,6 +8174,37 @@ def _desktop_linux_needs_no_sandbox() -> bool:
         return False
 
 
+def _desktop_linux_userns_sandbox_available() -> bool:
+    """Return True when Chromium's unprivileged user-namespace sandbox works.
+
+    When an unprivileged process can create a user namespace, Chromium uses the
+    namespace sandbox and never consults the setuid ``chrome-sandbox`` helper,
+    so requiring the helper to be root-owned 4755 (and prompting for sudo) is
+    unnecessary. Probe the real capability with ``unshare`` instead of reading
+    distro-specific sysctls: the probe fails closed on hosts where user
+    namespaces are disabled or AppArmor-restricted, which then follow the
+    existing setuid-helper path.
+    """
+    if sys.platform != "linux":
+        return False
+    unshare = shutil.which("unshare")
+    if not unshare:
+        return False
+    try:
+        return (
+            subprocess.run(
+                [unshare, "--user", "--map-root-user", "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> bool:
     """Return True when ``chrome-sandbox`` exists as a regular file."""
     if sys.platform != "linux":
@@ -8134,6 +8243,10 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
     if sandbox_lstat.st_uid == 0 and stat.S_IMODE(sandbox_lstat.st_mode) == 0o4755:
         return True
 
+    if _desktop_linux_userns_sandbox_available():
+        print("✓ Using Chromium's user-namespace sandbox (setuid helper not needed).")
+        return True
+
     sudo = shutil.which("sudo")
     if not sudo:
         print("✗ Hermes Desktop requires sudo to configure Electron's Linux sandbox helper.")
@@ -8144,6 +8257,29 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
         if subprocess.run(command, check=False).returncode != 0:
             print(f"✗ Failed to configure Electron's Linux sandbox helper: {sandbox}")
             return False
+    return True
+
+
+def _desktop_linux_needs_disable_setuid_sandbox(packaged_executable: Path) -> bool:
+    """Return True when Chromium should skip the present-but-non-setuid helper.
+
+    A user-owned ``chrome-sandbox`` still makes Chromium abort with
+    ``setuid_sandbox_host`` even when the namespace sandbox works. Passing
+    ``--disable-setuid-sandbox`` keeps the userns sandbox and avoids sudo.
+    Call only after ``_desktop_linux_sandbox_fixup`` succeeded without making
+    the helper root-owned 4755 (the userns path). Does not re-probe userns.
+    """
+    if sys.platform != "linux":
+        return False
+    sandbox = packaged_executable.parent / "chrome-sandbox"
+    try:
+        sandbox_lstat = sandbox.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(sandbox_lstat.st_mode):
+        return False
+    if sandbox_lstat.st_uid == 0 and stat.S_IMODE(sandbox_lstat.st_mode) == 0o4755:
+        return False
     return True
 
 
@@ -8541,6 +8677,8 @@ def cmd_gui(args: argparse.Namespace):
             launch_command.append("--no-sandbox")
         else:
             sys.exit(1)
+    elif _desktop_linux_needs_disable_setuid_sandbox(packaged_executable):
+        launch_command.append("--disable-setuid-sandbox")
 
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
@@ -11165,7 +11303,7 @@ def cmd_profile(args):
 
             # Profile dir for display
             try:
-                profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))
+                profile_dir_display = "~/" + profile_dir.relative_to(Path.home()).as_posix()
             except ValueError:
                 profile_dir_display = str(profile_dir)
 
@@ -11398,14 +11536,14 @@ def cmd_profile(args):
             sys.exit(1)
 
     elif action == "export":
-        from hermes_cli.profiles import export_profile
+        from hermes_cli.profiles import export_profile, get_profile_export_path
 
         name = args.profile_name
-        output = args.output or f"{name}.tar.gz"
         try:
+            output = args.output or str(get_profile_export_path(name))
             result_path = export_profile(name, output)
             print(f"✓ Exported '{name}' to {result_path}")
-        except (ValueError, FileNotFoundError) as e:
+        except (ValueError, FileNotFoundError, OSError) as e:
             print(f"Error: {e}")
             sys.exit(1)
 
@@ -13296,7 +13434,7 @@ def main():
     )
     browser_close.add_argument(
         "--browser",
-        help="Override detected default browser (chrome/edge/brave/chromium)",
+        help="Override detected default browser (chrome/edge/brave/brave-origin/chromium)",
     )
 
     def _dispatch_browser(_args):
