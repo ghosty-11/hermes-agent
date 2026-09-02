@@ -5228,6 +5228,58 @@ def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:
         return False
 
 
+def _satellite_delivery_via_primary_enabled() -> bool:
+    """True when the primary gateway's adapters front EVERY satellite's cron
+    delivery, and the scheduler is currently serving a satellite.
+
+    ``gateway.satellite_cron_delivery_via_primary`` (bool, default false, so
+    upstream behaviour is unchanged when unset) declares a shared-bot
+    topology: one bot token lives in the primary home and fronts the whole
+    multiplex, and the satellite profiles are deliberately credential-less
+    because a second token for the same bot is a ``duplicate_credential``
+    fatal. Upstream a07370abd0 ("fix(cron): reserve shared adapters for the
+    default profile only") assumes the opposite — a bot per profile — so from
+    that commit on every satellite cron job was refused ``blocked_config``
+    here: this check loads the gateway config of the job's OWN home, where the
+    platform correctly reads as unconnected.
+
+    Independent of ``_delivery_platform_routed_from_primary_gateway``, which
+    rescues one platform routed to one profile via ``profile_routes``; this
+    knob covers the deployment where the primary fronts them all. Read the
+    primary config.yaml directly (both the top-level and nested ``gateway.``
+    forms), same as that function, so no primary platform config leaks into
+    this process's environment. Fails closed.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+
+        primary_home = get_default_hermes_root()
+        current_home = Path(get_hermes_home())
+        if (
+            primary_home.expanduser().resolve(strict=False)
+            == current_home.expanduser().resolve(strict=False)
+        ):
+            return False  # this IS the primary home — it owns the adapters
+        config_path = primary_home.expanduser() / "config.yaml"
+        if not config_path.exists():
+            return False
+
+        import yaml
+
+        with open(config_path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        value = raw.get("satellite_cron_delivery_via_primary")
+        if value is None and isinstance(raw.get("gateway"), dict):
+            value = raw["gateway"].get("satellite_cron_delivery_via_primary")
+        return bool(value)
+    except Exception:
+        logger.debug(
+            "preflight: primary-gateway satellite-delivery knob unavailable",
+            exc_info=True,
+        )
+        return False
+
+
 def _preflight_check_delivery(job: dict, live_adapters=None) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
@@ -5288,6 +5340,14 @@ def _preflight_check_delivery(job: dict, live_adapters=None) -> Optional[str]:
             # by the primary's adapters, so its own unconnected reading is
             # a false block (#97476).
             if _delivery_platform_routed_from_primary_gateway(platform_name):
+                continue
+            # Downstream, same shape, different mechanism: on a shared-bot
+            # topology the primary's adapters front EVERY satellite's cron, so
+            # a credential-less satellite home is the designed state, not a
+            # misconfiguration. Without this, a07370abd0's per-profile adapter
+            # reservation turns every satellite cron job into a permanent
+            # blocked_config.
+            if _satellite_delivery_via_primary_enabled():
                 continue
             return (
                 f"delivery platform '{platform_name}' has no gateway "

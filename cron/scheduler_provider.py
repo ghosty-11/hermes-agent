@@ -350,6 +350,47 @@ def _misfire_grace_minutes() -> float:
         return float(DEFAULT_MISFIRE_GRACE_MINUTES)
 
 
+def _satellite_delivery_via_primary_enabled() -> bool:
+    """Downstream knob: may a credential-less satellite profile's cron tick
+    borrow the primary gateway's shared adapters?
+
+    ``gateway.satellite_cron_delivery_via_primary`` (bool, default false, so
+    upstream behaviour is unchanged when unset).
+
+    Upstream a07370abd0 ("fix(cron): reserve shared adapters for the default
+    profile only") reserves the shared ``adapters`` map for the default
+    profile, which is right when every multiplexed profile connects a bot of
+    its own. On a shared-bot topology it is not: the satellites hold no
+    platform credentials by design (a second token for the same bot is a
+    ``duplicate_credential`` fatal), so ``profile_adapters[name]`` is
+    permanently empty and their cron output silently stops going anywhere.
+    This knob declares that the primary's bot fronts them.
+
+    Accepts the nested ``gateway.`` form and the top-level one, matching
+    ``cron.scheduler._satellite_delivery_via_primary_enabled`` so a config
+    written either way moves both halves of this fix together.
+
+    Resolved from the config of whatever home is current, and read ONCE by
+    ``_start_multiplex`` before it starts overriding HERMES_HOME per profile —
+    i.e. from the PRIMARY home, which is the only place the topology is known.
+    Fails closed.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        config = load_config()
+        value = cfg_get(
+            config, "gateway", "satellite_cron_delivery_via_primary", default=None
+        )
+        if value is None:
+            value = cfg_get(
+                config, "satellite_cron_delivery_via_primary", default=False
+            )
+        return bool(value)
+    except Exception:
+        return False
+
+
 def fire_overdue_jobs(
     provider: "CronScheduler",
     *,
@@ -717,6 +758,11 @@ class InProcessCronScheduler(CronScheduler):
             finally:
                 reset_hermes_home_override(home_token)
 
+        # Downstream: resolve the shared-bot knob ONCE, while HERMES_HOME is
+        # still the primary home — inside the loop below it names a satellite
+        # whose config never carries the topology (see the helper's docstring).
+        satellite_via_primary = _satellite_delivery_via_primary_enabled()
+
         consecutive_failures = 0
         while not stop_event.is_set():
             ok = False
@@ -745,6 +791,18 @@ class InProcessCronScheduler(CronScheduler):
                                     _tick_adapters = adapters
                                 else:
                                     _tick_adapters = (profile_adapters or {}).get(_pname) or {}
+                                    # Downstream escape hatch: on a shared-bot
+                                    # topology the satellite's map is empty by
+                                    # DESIGN, not "not connected yet", so
+                                    # a07370abd0's reservation above means it
+                                    # never delivers at all. With
+                                    # gateway.satellite_cron_delivery_via_primary
+                                    # on, it borrows the primary's adapters —
+                                    # which is the bot that fronted it before
+                                    # a07370abd0. A satellite that DID connect
+                                    # its own adapters keeps them.
+                                    if not _tick_adapters and satellite_via_primary:
+                                        _tick_adapters = adapters
                                 cron_tick(
                                     verbose=False,
                                     adapters=_tick_adapters,
