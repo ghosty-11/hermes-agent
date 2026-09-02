@@ -213,7 +213,13 @@ keep working.
 Per-profile `.env` credential isolation is preserved and, if anything,
 stricter: a profile's keys are resolved from its own scope and are never unioned
 into a shared environment (this also means subprocesses like MCP servers and
-Kanban workers only ever see their own profile's secrets). Kanban,
+Kanban workers only ever see their own profile's secrets). Terminal settings
+(`terminal.backend`, `terminal.cwd`, `terminal.docker_volumes`,
+`terminal.docker_shared_container_key`, SSH targets, …) are likewise resolved
+per profile on every routed turn: a profile that omits a terminal key gets the
+documented default, never the launch profile's value, and a profile whose
+`config.yaml`/`.env` cannot be parsed has terminal execution refused rather than
+run under another profile's sandbox policy. Kanban,
 profile-scoped skills/memory/SOUL, and model routing all behave per-profile
 exactly as they do with separate gateways.
 
@@ -287,6 +293,12 @@ target profile is not installed or is outside `multiplex_profile_allowlist`,
 the gateway rejects that ingress and logs the route and target. It does not run
 the default profile. Traffic that matches no route keeps the historical
 default-profile behavior.
+
+Cron jobs owned by a routed profile deliver through the shared bot too, but
+only to targets an enabled route with a `chat_id`/`thread_id` maps to that
+profile — a routed profile's job targeting an unrouted chat (or a chat routed
+to another profile) is never sent through the shared bot. Guild-only routes do
+not qualify a cron target; add a `chat_id` route for the delivery channel.
 
 ## Start, stop, or restart all gateways at once
 

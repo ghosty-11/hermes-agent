@@ -809,8 +809,25 @@ def test_multiplex_missing_secondary_does_not_fall_back_to_shared(tmp_path):
 # (a second token for the same bot is a ``duplicate_credential`` fatal), so
 # their adapter map is empty by design and the reservation above makes their
 # cron silently undeliverable. The knob opts such a deployment back in.
+#
+# Since the 2026-09-02 merge the knob composes with upstream's exact-route
+# resolver (#101113) instead of replacing it: the satellite always receives a
+# SharedRouteAdapters wrapper, exact routes resolve first, and the knob decides
+# only what an UNMATCHED target does — borrow the primary adapter (knob on) or
+# fail closed (knob off, upstream behaviour). So "the satellite delivers"
+# is now asserted by resolving a target through the wrapper, not by identity
+# with the shared map.
 
 _KNOB_ON = {"gateway": {"satellite_cron_delivery_via_primary": True}}
+
+
+def _borrows_primary(adapter_map, primary) -> bool:
+    """True when an unrouted target resolves to the primary's adapter."""
+    if not adapter_map:
+        return False
+    platform, adapter = next(iter(primary.items()))
+    resolved = adapter_map.get(platform, {"chat_id": "9999999999", "thread_id": None})
+    return resolved == adapter
 
 
 def test_multiplex_empty_secondary_uses_shared_when_via_primary_enabled(tmp_path):
@@ -822,7 +839,7 @@ def test_multiplex_empty_secondary_uses_shared_when_via_primary_enabled(tmp_path
         primary_config=_KNOB_ON,
     )
     assert default_ad is shared
-    assert sec_ad is shared
+    assert _borrows_primary(sec_ad, shared)
 
 
 def test_multiplex_missing_secondary_uses_shared_when_via_primary_enabled(tmp_path):
@@ -833,7 +850,7 @@ def test_multiplex_missing_secondary_uses_shared_when_via_primary_enabled(tmp_pa
         primary_config=_KNOB_ON,
     )
     assert default_ad is shared
-    assert sec_ad is shared
+    assert _borrows_primary(sec_ad, shared)
 
 
 def test_multiplex_knob_never_overrides_a_connected_secondary(tmp_path):
@@ -947,7 +964,113 @@ def test_multiplex_knob_change_takes_effect_on_the_next_tick(tmp_path):
     assert first_default is shared
     assert not first_secondary  # knob off during cycle 1 — no rescue yet
     assert second_default is shared
-    assert second_secondary is shared, (
+    assert _borrows_primary(second_secondary, shared), (
         "knob flipped ON at runtime must rescue the satellite on the very "
         "next tick, without a gateway restart"
     )
+
+
+def test_multiplex_ticker_isolates_profile_failures(tmp_path):
+    """A failing profile's tick must not skip healthy siblings in the same
+    cycle, nor darken their status (#74878)."""
+    from cron.jobs import get_ticker_last_error, record_ticker_error, use_cron_store
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    failing_home = tmp_path / "failing"
+    healthy_home = tmp_path / "healthy"
+    for home in (failing_home, healthy_home):
+        (home / "cron").mkdir(parents=True)
+        with use_cron_store(home):
+            record_ticker_error("RuntimeError: stale failure")
+
+    stop = threading.Event()
+    tick_homes: list[str] = []
+
+    def _tick(*args, **kwargs):
+        home = str(get_hermes_home())
+        tick_homes.append(home)
+        if home == str(failing_home):
+            raise RuntimeError("profile-local failure")
+        stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tick):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": [("failing", failing_home), ("healthy", healthy_home)],
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert str(healthy_home) in tick_homes, "healthy sibling was skipped"
+    assert not (failing_home / "cron" / "ticker_last_success").exists()
+    assert (healthy_home / "cron" / "ticker_last_success").exists()
+    with use_cron_store(failing_home):
+        assert get_ticker_last_error() == "RuntimeError: profile-local failure"
+    with use_cron_store(healthy_home):
+        assert get_ticker_last_error() is None
+
+
+def test_multiplex_recovery_isolates_profile_failures(tmp_path):
+    """A startup-recovery error in one profile's ledger must not kill the
+    ticker thread before it ever ticks (#74878)."""
+    import sqlite3
+
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    failing_home = tmp_path / "failing"
+    healthy_home = tmp_path / "healthy"
+    for home in (failing_home, healthy_home):
+        (home / "cron").mkdir(parents=True)
+
+    stop = threading.Event()
+    recovery_homes: list[str] = []
+    tick_homes: list[str] = []
+
+    def _recover():
+        home = str(get_hermes_home())
+        recovery_homes.append(home)
+        if home == str(failing_home):
+            raise sqlite3.OperationalError("unable to open database file")
+        return 0
+
+    def _tick(*args, **kwargs):
+        tick_homes.append(str(get_hermes_home()))
+        if len(tick_homes) >= 2:
+            stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with (
+        patch.object(provider, "recover_interrupted", side_effect=_recover),
+        patch("cron.scheduler.tick", side_effect=_tick),
+    ):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": [("failing", failing_home), ("healthy", healthy_home)],
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert recovery_homes == [str(failing_home), str(healthy_home)]
+    # The failing profile stays in rotation: its ledger may still hold jobs.
+    assert set(tick_homes) == {str(failing_home), str(healthy_home)}
