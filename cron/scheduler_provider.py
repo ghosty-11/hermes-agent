@@ -366,25 +366,31 @@ def _satellite_delivery_via_primary_enabled() -> bool:
     permanently empty and their cron output silently stops going anywhere.
     This knob declares that the primary's bot fronts them.
 
-    Accepts the nested ``gateway.`` form and the top-level one, matching
+    Accepts the top-level form and the nested ``gateway.`` one, checked in
+    that order — matching
     ``cron.scheduler._satellite_delivery_via_primary_enabled`` so a config
-    written either way moves both halves of this fix together.
+    written either way moves both halves of this fix together, and
+    ``_delivery_platform_routed_from_primary_gateway``'s
+    ``profile_routes`` precedence.
 
-    Resolved from the config of whatever home is current, and read ONCE by
-    ``_start_multiplex`` before it starts overriding HERMES_HOME per profile —
-    i.e. from the PRIMARY home, which is the only place the topology is known.
-    Fails closed.
+    Resolved from the config of whatever home is current. Read fresh on
+    every multiplex tick cycle (not once for the ticker's lifetime) so a
+    runtime flip takes effect on the very next tick — the same fresh-read
+    contract preflight already honors. Called by ``_start_multiplex`` while
+    HERMES_HOME is still the primary home, before it starts overriding
+    HERMES_HOME per profile, i.e. from the PRIMARY home, which is the only
+    place the topology is known. Fails closed.
     """
     try:
         from hermes_cli.config import cfg_get, load_config
 
         config = load_config()
         value = cfg_get(
-            config, "gateway", "satellite_cron_delivery_via_primary", default=None
+            config, "satellite_cron_delivery_via_primary", default=None
         )
         if value is None:
             value = cfg_get(
-                config, "satellite_cron_delivery_via_primary", default=False
+                config, "gateway", "satellite_cron_delivery_via_primary", default=False
             )
         return bool(value)
     except Exception:
@@ -758,12 +764,8 @@ class InProcessCronScheduler(CronScheduler):
             finally:
                 reset_hermes_home_override(home_token)
 
-        # Downstream: resolve the shared-bot knob ONCE, while HERMES_HOME is
-        # still the primary home — inside the loop below it names a satellite
-        # whose config never carries the topology (see the helper's docstring).
-        satellite_via_primary = _satellite_delivery_via_primary_enabled()
-
         consecutive_failures = 0
+
         while not stop_event.is_set():
             ok = False
             _tick_error = None
@@ -772,6 +774,15 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
+                    # Downstream: resolve the shared-bot knob fresh on EVERY
+                    # tick cycle (not once for the ticker's lifetime) so a
+                    # runtime flip takes effect on the very next tick — the
+                    # same fresh-read contract preflight already honors. A
+                    # frozen read let a knob flipped ON unblock preflight
+                    # while the tick kept handing satellites an empty
+                    # adapter map: the job would run (spending the LLM
+                    # call) and then silently fail to deliver.
+                    satellite_via_primary = _satellite_delivery_via_primary_enabled()
                     for entry in _existing_profile_homes(profile_homes):
                         _pname = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry

@@ -861,3 +861,93 @@ def test_multiplex_knob_off_preserves_upstream_reservation(tmp_path):
     assert default_ad is shared
     assert sec_ad is not shared
     assert not sec_ad
+
+
+def test_multiplex_knob_top_level_wins_over_conflicting_nested_form(tmp_path):
+    """Contradictory config (top-level false, nested ``gateway.`` true) must
+    resolve DISABLED: the provider-side read checks the top-level key
+    first, exactly like ``cron.scheduler._satellite_delivery_via_primary_enabled``
+    and ``_delivery_platform_routed_from_primary_gateway``. Before this fix
+    the provider checked the nested form first, so this contradictory config
+    wrongly rescued the secondary even though the top-level key explicitly
+    says no."""
+    shared = {"kind": "shared"}
+    default_ad, sec_ad = _run_multiplex_capture(
+        tmp_path, profile_adapters={"home-ops": {}}, shared_adapters=shared,
+        primary_config={
+            "satellite_cron_delivery_via_primary": False,
+            "gateway": {"satellite_cron_delivery_via_primary": True},
+        },
+    )
+    assert default_ad is shared
+    assert sec_ad is not shared
+    assert not sec_ad
+
+
+def test_multiplex_knob_change_takes_effect_on_the_next_tick(tmp_path):
+    """A runtime knob flip must be honored by the very next tick, without a
+    gateway restart. Before this fix ``_start_multiplex`` resolved the knob
+    ONCE and froze it for the ticker's lifetime, while preflight re-read it
+    every call — the asymmetry let a knob flipped ON unblock preflight while
+    the tick kept handing the satellite an empty adapter map: the job would
+    run (spending an LLM call) and then silently fail to deliver."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p_default = tmp_path / "default"
+    p_sec = tmp_path / "home-ops"
+    for d in (p_default, p_sec):
+        (d / "cron").mkdir(parents=True)
+    profile_homes = [("default", p_default), ("home-ops", p_sec)]
+
+    shared = {"kind": "shared"}
+    captured: list = []
+    config_box = {"gateway": {"satellite_cron_delivery_via_primary": False}}
+
+    def _capturing_tick(*args, **kwargs):
+        captured.append(kwargs.get("adapters"))
+        if len(captured) == 2:
+            # Flip the knob at runtime, deterministically between the first
+            # and second full tick cycle — no restart.
+            config_box["gateway"]["satellite_cron_delivery_via_primary"] = True
+        return 0
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("cron.scheduler.tick", side_effect=_capturing_tick))
+        stack.enter_context(
+            patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None))
+        stack.enter_context(
+            patch("hermes_cli.config.load_config",
+                  lambda: dict(config_box)))
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": shared,
+                "profile_adapters": {"home-ops": {}},
+                "default_profile": "default",
+            },
+            daemon=True,
+        )
+        t.start()
+        deadline = time.monotonic() + 10
+        while len(captured) < 4 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert len(captured) >= 4, f"expected >= 4 tick calls, got {len(captured)}"
+    first_default, first_secondary, second_default, second_secondary = captured[:4]
+    assert first_default is shared
+    assert not first_secondary  # knob off during cycle 1 — no rescue yet
+    assert second_default is shared
+    assert second_secondary is shared, (
+        "knob flipped ON at runtime must rescue the satellite on the very "
+        "next tick, without a gateway restart"
+    )
