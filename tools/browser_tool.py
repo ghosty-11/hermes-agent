@@ -1032,7 +1032,11 @@ def _is_local_backend() -> bool:
         return False
     # When terminal runs in a container, browser on host can access
     # internal networks the terminal can't → treat as non-local.
-    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
+    # Scope-aware: under gateway multiplexing the routed profile's backend
+    # lives in the per-turn terminal scope, not the process env (#68559).
+    from tools.terminal_scope import terminal_env
+
+    terminal_backend = terminal_env("TERMINAL_ENV", "local").strip().lower()
     return terminal_backend in ("local", "")
 
 
@@ -1357,6 +1361,10 @@ def _run_chrome_fallback_command(
 
     task_socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{tmp_session}")
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+    # Claim the dir before using it: another hermes process's orphan reaper
+    # rmtree's any agent-browser-* dir in the shared tmpdir that carries no
+    # live owner, which otherwise deletes this one mid-command.
+    _write_owner_pid(task_socket_dir, tmp_session)
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
     browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
@@ -2642,7 +2650,14 @@ def _reap_orphaned_browser_sessions():
         # owner_alive is False (dead owner) OR legacy daemon not tracked here.
         pid_file = os.path.join(socket_dir, f"{session_name}.pid")
         if not os.path.isfile(pid_file):
-            # No daemon PID file — just a stale dir, remove it
+            # A newly-created session directory exists briefly before
+            # agent-browser writes its PID/owner files. Another Hermes process
+            # may run this global reaper during that window. Treat a pidless
+            # directory as stale only after the orphan grace period; deleting
+            # it immediately races the creator's first stdout/stderr open.
+            idle_s = _socket_dir_idle_seconds(socket_dir)
+            if idle_s is None or idle_s < BROWSER_ORPHAN_GRACE_SECONDS:
+                continue
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
 

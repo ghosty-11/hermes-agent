@@ -607,6 +607,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None,
         profile_adapters=None,
         default_profile=None,
+        profile_gate=None,
     ):
         import logging
         from cron.scheduler import CronTickYielded
@@ -637,6 +638,7 @@ class InProcessCronScheduler(CronScheduler):
                 can_dispatch=can_dispatch,
                 profile_adapters=profile_adapters,
                 default_profile=default_profile,
+                profile_gate=profile_gate,
             )
             return
 
@@ -717,6 +719,7 @@ class InProcessCronScheduler(CronScheduler):
         can_dispatch=None,
         profile_adapters=None,
         default_profile=None,
+        profile_gate=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -725,10 +728,20 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``profile_gate(name, home) -> bool``, when given, is consulted every
+        cycle; a profile it rejects is neither ticked nor heartbeated that
+        cycle (the desktop ticker uses it to stand down for profiles whose
+        own gateway is running, #100489).
         """
         import logging
         from cron.scheduler import tick as cron_tick
-        from cron.scheduler import CronTickYielded
+        from cron.scheduler import (
+            CronTickYielded,
+            SharedRouteAdapters,
+            _is_fd_exhaustion,
+            _primary_profile_routes_for_current_home,
+        )
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -748,6 +761,8 @@ class InProcessCronScheduler(CronScheduler):
         # A profile may have been deleted since this snapshot was taken;
         # never recreate a deleted home's cron workspace via the heartbeat
         # below (#47368).
+        # One profile's broken store (corrupt executions.db, unreadable
+        # cron dir) must not abort startup for every other profile (#74878).
         for entry in _existing_profile_homes(profile_homes):
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
@@ -761,6 +776,13 @@ class InProcessCronScheduler(CronScheduler):
                             home,
                         )
                     record_ticker_heartbeat()
+            except BaseException as e:
+                logger.error(
+                    "Cron startup recovery error for profile at %s: %s",
+                    home,
+                    e,
+                    exc_info=True,
+                )
             finally:
                 reset_hermes_home_override(home_token)
 
@@ -770,6 +792,19 @@ class InProcessCronScheduler(CronScheduler):
             ok = False
             _tick_error = None
             _profile_errors: dict[str, str] = {}
+            # Worst per-profile failure this cycle (fd exhaustion wins) so the
+            # #87644 backoff/reclaim is applied once per cycle, not per profile.
+            _cycle_exc: BaseException | None = None
+            cycle_homes = _existing_profile_homes(profile_homes)
+            if profile_gate is not None:
+                cycle_homes = [
+                    entry
+                    for entry in cycle_homes
+                    if profile_gate(
+                        entry[0] if isinstance(entry, tuple) else None,
+                        entry[1] if isinstance(entry, tuple) else entry,
+                    )
+                ]
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
@@ -783,7 +818,7 @@ class InProcessCronScheduler(CronScheduler):
                     # adapter map: the job would run (spending the LLM
                     # call) and then silently fail to deliver.
                     satellite_via_primary = _satellite_delivery_via_primary_enabled()
-                    for entry in _existing_profile_homes(profile_homes):
+                    for entry in cycle_homes:
                         _pname = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
@@ -802,18 +837,24 @@ class InProcessCronScheduler(CronScheduler):
                                     _tick_adapters = adapters
                                 else:
                                     _tick_adapters = (profile_adapters or {}).get(_pname) or {}
-                                    # Downstream escape hatch: on a shared-bot
-                                    # topology the satellite's map is empty by
-                                    # DESIGN, not "not connected yet", so
-                                    # a07370abd0's reservation above means it
-                                    # never delivers at all. With
-                                    # gateway.satellite_cron_delivery_via_primary
-                                    # on, it borrows the primary's adapters —
-                                    # which is the bot that fronted it before
-                                    # a07370abd0. A satellite that DID connect
-                                    # its own adapters keeps them.
-                                    if not _tick_adapters and satellite_via_primary:
-                                        _tick_adapters = adapters
+                                    if not _tick_adapters and adapters:
+                                        # Credentialless satellite under
+                                        # gateway.profile_routes: no bot of its
+                                        # own, so its output may ride the
+                                        # PRIMARY adapter — but only for
+                                        # targets an exact enabled primary
+                                        # route maps to this profile
+                                        # (#101113). Unmatched targets fail
+                                        # closed UNLESS the downstream
+                                        # shared-bot knob is on, in which case
+                                        # they borrow the primary adapter that
+                                        # fronted them before a07370abd0 —
+                                        # exact routes still resolve first.
+                                        _tick_adapters = SharedRouteAdapters(
+                                            adapters,
+                                            _primary_profile_routes_for_current_home(),
+                                            allow_unrouted=satellite_via_primary,
+                                        )
                                 cron_tick(
                                     verbose=False,
                                     adapters=_tick_adapters,
@@ -830,9 +871,26 @@ class InProcessCronScheduler(CronScheduler):
                             # only ticker in the same cycle.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)
                             _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                        except BaseException as e:
+                            # Any other failure is THIS profile's failure
+                            # (#74878): record it against this profile's
+                            # status and keep ticking the remaining profiles.
+                            # BaseException for the same reason as the
+                            # single-profile loop (#32612).
+                            logger.error(
+                                "Cron tick error for profile at %s: %s",
+                                home,
+                                e,
+                                exc_info=True,
+                            )
+                            _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                            if _cycle_exc is None or _is_fd_exhaustion(e):
+                                _cycle_exc = e
                         finally:
                             reset_hermes_home_override(home_token)
                     ok = not _profile_errors
+                    if _cycle_exc is not None:
+                        consecutive_failures = _note_tick_failure(_cycle_exc, consecutive_failures)
             except BaseException as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)
                 _tick_error = f"{type(e).__name__}: {e}"
@@ -843,7 +901,7 @@ class InProcessCronScheduler(CronScheduler):
             # beat reflects its own outcome, so a yielding profile does not
             # darken healthy siblings — from an aborted one (exception), where
             # no profile completed and all beats are unsuccessful (#32612).
-            for entry in _existing_profile_homes(profile_homes):
+            for entry in cycle_homes:
                 home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
                 try:
