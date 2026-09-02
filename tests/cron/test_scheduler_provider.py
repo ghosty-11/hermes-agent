@@ -693,10 +693,16 @@ def test_existing_profile_homes_filters_deleted(tmp_path):
     assert [p for p in as_paths] == [live]
 
 
-def _run_multiplex_capture(tmp_path, *, profile_adapters, shared_adapters):
+def _run_multiplex_capture(tmp_path, *, profile_adapters, shared_adapters,
+                           primary_config=None):
     """Run the multiplex ticker one full cycle and return the ``adapters``
     object passed to ``tick()`` for the default profile and the secondary
-    profile (in ``profile_homes`` order: default first, secondary second)."""
+    profile (in ``profile_homes`` order: default first, secondary second).
+
+    ``primary_config`` is the primary home's config dict the ticker resolves
+    its downstream knobs from; it defaults to an empty config so these tests
+    never read the host's real ``config.yaml``.
+    """
     from cron.scheduler_provider import InProcessCronScheduler
 
     p_default = tmp_path / "default"
@@ -713,8 +719,15 @@ def _run_multiplex_capture(tmp_path, *, profile_adapters, shared_adapters):
 
     stop = threading.Event()
     prov = InProcessCronScheduler()
-    with patch("cron.scheduler.tick", side_effect=_capturing_tick), \
-         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("cron.scheduler.tick", side_effect=_capturing_tick))
+        stack.enter_context(
+            patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None))
+        stack.enter_context(
+            patch("hermes_cli.config.load_config",
+                  lambda: dict(primary_config or {})))
         t = threading.Thread(
             target=prov.start,
             args=(stop,),
@@ -782,6 +795,68 @@ def test_multiplex_missing_secondary_does_not_fall_back_to_shared(tmp_path):
     shared = {"kind": "shared"}
     default_ad, sec_ad = _run_multiplex_capture(
         tmp_path, profile_adapters={}, shared_adapters=shared,
+    )
+    assert default_ad is shared
+    assert sec_ad is not shared
+    assert not sec_ad
+
+
+# --- downstream: gateway.satellite_cron_delivery_via_primary -----------------
+#
+# Upstream a07370abd0 ("fix(cron): reserve shared adapters for the default
+# profile only") assumes every multiplexed profile owns its own bot. On a
+# shared-bot topology the satellite profiles are deliberately credential-less
+# (a second token for the same bot is a ``duplicate_credential`` fatal), so
+# their adapter map is empty by design and the reservation above makes their
+# cron silently undeliverable. The knob opts such a deployment back in.
+
+_KNOB_ON = {"gateway": {"satellite_cron_delivery_via_primary": True}}
+
+
+def test_multiplex_empty_secondary_uses_shared_when_via_primary_enabled(tmp_path):
+    """Knob on + present-but-empty secondary map → the shared default adapters
+    front the satellite's tick, so its cron delivers through the shared bot."""
+    shared = {"kind": "shared"}
+    default_ad, sec_ad = _run_multiplex_capture(
+        tmp_path, profile_adapters={"home-ops": {}}, shared_adapters=shared,
+        primary_config=_KNOB_ON,
+    )
+    assert default_ad is shared
+    assert sec_ad is shared
+
+
+def test_multiplex_missing_secondary_uses_shared_when_via_primary_enabled(tmp_path):
+    """Knob on + secondary absent from profile_adapters → same rescue."""
+    shared = {"kind": "shared"}
+    default_ad, sec_ad = _run_multiplex_capture(
+        tmp_path, profile_adapters={}, shared_adapters=shared,
+        primary_config=_KNOB_ON,
+    )
+    assert default_ad is shared
+    assert sec_ad is shared
+
+
+def test_multiplex_knob_never_overrides_a_connected_secondary(tmp_path):
+    """The knob rescues an EMPTY map only. A secondary that DID connect its own
+    bot keeps delivering through it — otherwise the knob would re-introduce the
+    wrong-bot delivery a07370abd0 fixed."""
+    shared = {"kind": "shared"}
+    sec = {"kind": "secondary"}
+    default_ad, sec_ad = _run_multiplex_capture(
+        tmp_path, profile_adapters={"home-ops": sec}, shared_adapters=shared,
+        primary_config=_KNOB_ON,
+    )
+    assert default_ad is shared
+    assert sec_ad is sec
+
+
+def test_multiplex_knob_off_preserves_upstream_reservation(tmp_path):
+    """Knob explicitly false → byte-for-byte upstream behaviour: the empty
+    secondary gets an empty adapter set, never the shared one."""
+    shared = {"kind": "shared"}
+    default_ad, sec_ad = _run_multiplex_capture(
+        tmp_path, profile_adapters={"home-ops": {}}, shared_adapters=shared,
+        primary_config={"gateway": {"satellite_cron_delivery_via_primary": False}},
     )
     assert default_ad is shared
     assert sec_ad is not shared
