@@ -754,6 +754,11 @@ DEFAULT_CONFIG = {
     # and override the dynamic behavior. Separate from read_file tool limits.
     "context_file_max_chars": None,
 
+    # Seconds to wait for a single context file read before skipping it with a
+    # warning. Guards startup against network-backed filesystems (iCloud Drive,
+    # OneDrive, NFS) that can block a cold read on an evicted file.
+    "context_file_read_timeout": 5.0,
+
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
@@ -3482,13 +3487,18 @@ DEFAULT_CONFIG = {
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
     "sessions": {
-        # When true, prune ended sessions inactive for retention_days once
+        # When true, prune ENDED sessions inactive for retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
         # Activity is the latest message timestamp, falling back to creation
-        # time for empty sessions. Active sessions are always preserved.
-        # Default false: session history is valuable for search recall, and
-        # silently deleting it could surprise users.  Opt in explicitly.
-        "auto_prune": False,
+        # time for empty sessions. Sessions that are still open, pinned, or
+        # mid-turn are never deleted — the only open rows the sweep touches
+        # are stale automation sessions (cron/kanban/subagent/one-shot CLI)
+        # whose process died without closing them; those are *closed*, not
+        # deleted, and get a further full retention window before removal.
+        # Default true since #54189: without it state.db grows without bound
+        # (multi-GB installs reported within weeks).  Set false to keep every
+        # ended session forever.
+        "auto_prune": True,
         # How many inactive days of ended-session history to keep. Matches
         # the default of ``hermes sessions prune``.
         "retention_days": 90,
@@ -3506,7 +3516,9 @@ DEFAULT_CONFIG = {
         # subsequent INSERTs — so without VACUUM the file stays bloated
         # even after pruning.  VACUUM blocks writes for a few seconds per
         # 100MB, so it only runs at startup, and only when prune deleted
-        # ≥1 session.
+        # ≥1 session AND the reclaimable fraction of the file
+        # (PRAGMA freelist_count / page_count) exceeds 25% — a dense DB
+        # never pays for a full rewrite to reclaim a few MB (#54189).
         "vacuum_after_prune": True,
         # Minimum days between successful VACUUM rewrites. Pruning can still
         # run on its normal cadence while SQLite reuses the freed pages.
@@ -3887,6 +3899,7 @@ DEFAULT_CONFIG = {
         # every invocation (MCP backend, status, doctor, install). Set true
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
+        "native_wayland": False,
         # Cap driver screenshot longest edge (pixels) via set_config on
         # session start. Shrinks SOM multimodal payloads; 0 disables.
         "max_image_dimension": 1456,
@@ -4058,6 +4071,15 @@ DEFAULT_CONFIG = {
     # settings are non-secret routing config and live here. Both are bridged to
     # the VERTEX_PROJECT_ID / VERTEX_REGION env vars the adapter reads, so an
     # explicit env var still wins over config.yaml.
+    "nous": {
+        # Upper bound on the Nous auth keepalive tick, in seconds. The tick
+        # actually used derives from the credential lifetime the server issued
+        # and is capped by this value, so lowering it makes the keepalive more
+        # frequent while raising it has no effect below the derived tick.
+        # 0 disables the keepalive thread entirely.
+        "keepalive_interval_seconds": 900,
+    },
+
     "vertex": {
         # GCP project ID. Empty → use the project_id embedded in the service
         # account JSON (or ADC-resolved project).

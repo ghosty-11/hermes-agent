@@ -314,6 +314,15 @@ def _strip_reasoning_tags(text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
+    # Unterminated opener / stray <arg_key>/<arg_value> markup = stream cut
+    # mid tool-call serialization (#101899); strip to end of text.
+    cleaned = re.sub(
+        r'(?:^|\n)[ \t]*<(?:tool_call|tool_calls|tool_result|function_call|function_calls)\b[^>]*>.*$'
+        r'|(?:^|\n)[^\n<]*</?arg_(?:key|value)\b.*$',
+        '',
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     return cleaned.strip()
 
 
@@ -1837,6 +1846,10 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
     """
     import subprocess
 
+    from hermes_cli._subprocess_compat import (
+        noninteractive_git_env as _noninteractive_git_env,
+    )
+
     repo_root = repo_root or _git_repo_root()
     if not repo_root:
         _cprint("\033[31m✗ --worktree requires being inside a git repository.\033[0m")
@@ -1910,6 +1923,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
         result = subprocess.run(
             ["git", *_wt_add_cfg, "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=repo_root,
+            stdin=subprocess.DEVNULL, env=_noninteractive_git_env(),
         )
         if result.returncode != 0:
             # If branching from the resolved remote ref failed for any reason
@@ -1925,6 +1939,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
                 result = subprocess.run(
                     ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=repo_root,
+                    stdin=subprocess.DEVNULL, env=_noninteractive_git_env(),
                 )
             if result.returncode != 0:
                 _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
@@ -14764,7 +14779,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         sees the updated tools on the next turn.
         """
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                shutdown_mcp_servers, discover_mcp_tools, reprobe_tool_availability, _servers, _lock,
+            )
 
             # Capture old server names
             with _lock:
@@ -14776,6 +14793,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Shutdown existing connections
             shutdown_mcp_servers()
 
+            # Explicit reload also re-probes tool availability (check_fn).
+            reprobe_tool_availability()
             # Reconnect (reads config.yaml fresh)
             new_tools = discover_mcp_tools()
 

@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import functools
 import inspect
 import json
 import logging
@@ -50,6 +51,7 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
+    COMPACTION_HEARTBEAT_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -130,7 +132,8 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|auto-lowered\s+(?:this\s+)?session'?s?\s+threshold"
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
-    r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    rf"|{re.escape(COMPACTION_STATUS)}"
+    rf"|{re.escape(COMPACTION_HEARTBEAT_STATUS)}"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
@@ -390,20 +393,27 @@ async def run_codex_hygiene_compaction(
     loop = asyncio.get_running_loop()
     compressor = getattr(agent, "context_compressor", None)
     count_before = getattr(compressor, "compression_count", 0)
+    worker_future = loop.run_in_executor(
+        None,
+        # Keep the caller's multiplexed profile secret scope and HERMES_HOME
+        # override in the worker. The default executor does not propagate
+        # ContextVars on the Python runtimes Hermes currently ships.
+        copy_context().run,
+        lambda: agent._compress_context(
+            history,
+            "",
+            approx_tokens=approx_tokens,
+        ),
+    )
+    track_worker = getattr(gateway, "_track_deferred_agent_worker", None)
+    if callable(track_worker):
+        # ``wait_for`` only cancels the asyncio wrapper; the executor thread
+        # keeps running. Keep it visible to gateway shutdown until the real
+        # worker finishes, just like the detached local-compressor path.
+        track_worker(worker_future, agent)
     try:
         await asyncio.wait_for(
-            # copy_context().run: keep the caller's profile secret scope /
-            # HERMES_HOME override in the worker (multiplex_profiles) — same
-            # class as the detached-agent hygiene path below.
-            loop.run_in_executor(
-                None,
-                copy_context().run,
-                lambda: agent._compress_context(
-                    history,
-                    "",
-                    approx_tokens=approx_tokens,
-                ),
-            ),
+            asyncio.shield(worker_future),
             timeout=max(float(timeout_seconds), 1.0),
         )
     except asyncio.TimeoutError:
@@ -525,6 +535,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         _status_template_to_regex(_template)
         for _template in (
             COMPACTION_STATUS,
+            COMPACTION_HEARTBEAT_STATUS,
             COMPACTION_DONE_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
             PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
@@ -2479,6 +2490,30 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     )
 
 
+def _enable_multiplex_log_routing(config: object) -> bool:
+    """Route agent.log/errors.log/gateway.log records to their owning profile.
+
+    ``setup_logging(mode="gateway")`` binds the queued file handlers to the
+    launch home, so under ``multiplex_profiles`` every secondary profile's
+    records (emitted inside ``_profile_runtime_scope``) land in the default
+    profile's log files (#82936). Swap the static handlers for the
+    profile routers from #99440 — the same primitive the Desktop cron ticker
+    uses — once the served-profile set is known. Inert for single-profile
+    gateways (``enable_profile_log_routing`` is a no-op below two homes).
+    """
+    if not getattr(config, "multiplex_profiles", False):
+        return False
+    try:
+        from hermes_logging import enable_profile_log_routing
+
+        return enable_profile_log_routing(
+            [home for _name, home in _multiplex_profile_homes(config)]
+        )
+    except Exception:
+        logger.debug("could not enable per-profile log routing", exc_info=True)
+        return False
+
+
 def _handoff_watch_scopes(runner: object) -> list:
     """``(profile_name, home)`` pairs whose ``state.db`` the watcher must poll.
 
@@ -2578,7 +2613,10 @@ def _load_profile_secret_scope(profile_home: "Path") -> dict:
 
 @_contextmanager
 def _profile_runtime_scope(
-    profile_home: "Path", prepared_secret_scope: Optional[dict] = None,
+    profile_home: "Path",
+    prepared_secret_scope: Optional[dict] = None,
+    *,
+    hydrate_secrets: bool = True,
 ):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
@@ -2608,11 +2646,15 @@ def _profile_runtime_scope(
     )
 
     home_token = set_hermes_home_override(str(profile_home))
-    secrets = (
-        prepared_secret_scope
-        if prepared_secret_scope is not None
-        else _load_profile_secret_scope(Path(profile_home))
-    )
+    if prepared_secret_scope is not None:
+        secrets = prepared_secret_scope
+    elif hydrate_secrets:
+        secrets = _load_profile_secret_scope(Path(profile_home))
+    else:
+        # Caller already hydrated external sources off-loop (#99519).
+        from agent.secret_scope import build_profile_secret_scope
+
+        secrets = build_profile_secret_scope(Path(profile_home))
     secret_token = set_secret_scope(secrets)
     # Downstream seam kept across the 2026-09-02 merge: instruction discovery
     # reads the routed profile's home while execution cwd stays shared, so the
@@ -2677,6 +2719,33 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
             exc_info=True,
         )
         return cfg
+
+
+async def _discover_gateway_mcp_tools(config: object) -> None:
+    """Run startup MCP discovery for every profile this gateway serves.
+
+    ``discover_mcp_tools`` reads ``mcp_servers`` from ``get_hermes_home()``'s
+    config, so an unscoped call only ever connects the launch profile's
+    servers (#95518). Under multiplex, run it once per served profile inside
+    that profile's ``_profile_runtime_scope`` and carry the scope into the
+    executor thread with ``copy_context()`` (the same shape as
+    ``_run_in_executor_with_context``). Single-profile gateways keep the one
+    unscoped call.
+    """
+    from tools.mcp_tool import discover_mcp_tools
+
+    loop = asyncio.get_running_loop()
+    if not getattr(config, "multiplex_profiles", False):
+        await loop.run_in_executor(None, discover_mcp_tools)
+        return
+    for profile_name, profile_home in _multiplex_profile_homes(config):
+        try:
+            with _profile_runtime_scope(Path(profile_home)):
+                await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+        except Exception:
+            logger.warning(
+                "MCP tool discovery failed for profile '%s'", profile_name, exc_info=True,
+            )
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
@@ -3068,6 +3137,7 @@ from gateway.session import (
     SessionSource,
     SessionContext,
     TranscriptReadError,
+    _session_key_namespace,
     build_session_context,
     build_session_context_prompt,
     build_channel_continuity_note,
@@ -3142,6 +3212,13 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# Ceiling for the shutdown quiesce of the gateway-owned thread pool. Drain has
+# already waited for the agents, so what is left here is short blocking work
+# (a transcript append, a routing save); anything slower is a stuck worker we
+# must not wait on, and the caller clamps this to the watchdog leash anyway.
+_EXECUTOR_QUIESCE_TIMEOUT = 2.0
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -8148,9 +8225,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
 
-    def _voice_key(self, platform: Platform, chat_id: str) -> str:
-        """Return a platform-namespaced key for voice mode state."""
-        return f"{platform.value}:{chat_id}"
+    def _voice_key(
+        self, platform: Platform, chat_id: str, profile: Optional[str] = None
+    ) -> str:
+        """Return a platform-namespaced key for voice mode state.
+
+        Under multiplexing the key is additionally namespaced by the profile
+        whose bot speaks in the chat (``<profile>:<platform>:<chat_id>``); the
+        default profile keeps the historical ``<platform>:<chat_id>`` shape so
+        persisted state stays valid. Two bots in one Discord channel otherwise
+        share a key and one profile's ``/voice`` flips the other's (#75198).
+        """
+        base = f"{platform.value}:{chat_id}"
+        profile = profile.strip() if isinstance(profile, str) else ""
+        if not profile or profile == "default":
+            return base
+        return f"{profile}:{base}"
+
+    def _voice_key_for_source(self, source: SessionSource) -> str:
+        """Voice-state key for an inbound source, namespaced by its transport owner.
+
+        Voice mode belongs to the (bot, chat) pair, so the namespace is the
+        profile that OWNS the receiving adapter (``_adapter_profile_for_source``)
+        — the same profile ``_sync_voice_mode_state_to_adapter`` uses on
+        reconnect — not the routed runtime profile.
+        """
+        return self._voice_key(
+            source.platform,
+            source.chat_id,
+            profile=self._adapter_profile_for_source(source),
+        )
+
+    def _bind_voice_input_callback(self, adapter) -> None:
+        """Route voice transcripts back through the adapter that captured them."""
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = functools.partial(
+                self._handle_voice_channel_input, adapter=adapter
+            )
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
@@ -8249,7 +8360,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hasattr(adapter, "_auto_tts_default"):
             adapter._auto_tts_default = _auto_tts_default
 
-        prefix = f"{platform.value}:"
+        prefix = self._voice_key(platform, "", profile=getattr(adapter, "_owner_profile", None))
         if isinstance(disabled_chats, set):
             disabled_chats.clear()
             disabled_chats.update(
@@ -9345,6 +9456,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_deferred_agent_worker_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -9397,6 +9509,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("Failed interrupting api_server runs during shutdown: %s", exc)
             return 0
+
+    def _active_deferred_agent_worker_count(self) -> int:
+        """Count executor workers that outlived their owning gateway turn.
+
+        A timed-out hygiene compression keeps running in its executor thread.
+        Some paths defer agent cleanup; the live Codex path keeps its cached
+        agent. In both cases the turn can finish before the worker does, so
+        ``_running_agents`` no longer represents it. Count the worker itself.
+        """
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if not isinstance(workers, dict):
+            return 0
+        return sum(1 for future in list(workers) if not future.done())
+
+    def _track_deferred_agent_worker(
+        self,
+        future: asyncio.Future,
+        agent: Any,
+    ) -> None:
+        """Expose an executor worker to drain/interrupt until it really exits."""
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if workers is None:
+            workers = {}
+            self._deferred_agent_workers = workers
+        workers[future] = agent
+
+        def _discard_worker(done_future: asyncio.Future) -> None:
+            workers.pop(done_future, None)
+            # Some tracked workers intentionally outlive the coroutine that
+            # started them and therefore have no later waiter. Consume their
+            # terminal exception so asyncio does not emit an unhandled-future
+            # warning after the worker eventually unwinds (#98973).
+            if not done_future.cancelled():
+                try:
+                    done_future.exception()
+                except Exception:
+                    pass
+
+        future.add_done_callback(_discard_worker)
+
+    def _interrupt_deferred_agent_workers(self, reason: str) -> int:
+        """Request cancellation of detached executor-backed agent work."""
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if not isinstance(workers, dict):
+            return 0
+        interrupted = 0
+        seen: set[int] = set()
+        for future, agent in list(workers.items()):
+            if future.done() or agent is None or id(agent) in seen:
+                continue
+            seen.add(id(agent))
+            try:
+                request_hard_interrupt(agent, reason)
+                interrupted += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed interrupting deferred agent worker during shutdown: %s",
+                    exc,
+                )
+        return interrupted
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -11570,25 +11742,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_deferred_count = self._active_deferred_agent_worker_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count
+            nonlocal last_deferred_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            deferred_count = self._active_deferred_agent_worker_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or deferred_count != last_deferred_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_deferred_count = deferred_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -11597,7 +11774,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_deferred_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -11618,7 +11800,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _still_draining() -> bool:
             now = loop.time()
             if (
-                len(self._running_agents) or self._active_api_run_count()
+                len(self._running_agents)
+                or self._active_api_run_count()
+                or self._active_deferred_agent_worker_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -11634,6 +11818,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(len(self._running_agents))
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_deferred_agent_worker_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -11653,6 +11838,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupted_api = self._interrupt_api_server_runs(reason)
         if interrupted_api:
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
+        interrupted_deferred = self._interrupt_deferred_agent_workers(reason)
+        if interrupted_deferred:
+            logger.debug(
+                "Interrupted %d deferred agent worker(s) during shutdown",
+                interrupted_deferred,
+            )
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died.
@@ -11692,7 +11883,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # deliver=local jobs — and deliver=origin jobs with no
                 # resolvable origin (#43014) — resolve to zero targets and
                 # must stay silent rather than fall back to a home channel.
-                targets = _resolve_delivery_targets(job)
+                # Interrupted notices are failure-category engine status, so
+                # they honor the job's failure_deliver override (NS-788).
+                targets = _resolve_delivery_targets(job, for_failure=True)
             except Exception as e:
                 logger.debug("Cron interrupt targets unresolved for %s: %s", job_id, e)
                 continue
@@ -12089,6 +12282,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
             await self._cleanup_agent_resources_off_loop(agent, context=context)
+
+        self._track_deferred_agent_worker(future, agent)
 
         task = asyncio.create_task(_cleanup_when_done())
         tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
@@ -14264,13 +14459,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._sync_voice_mode_state_to_adapter(adapter)
                 # Wire voice input callback at connect time so voice
                 # transcription is forwarded without requiring /voice join.
-                if hasattr(adapter, "_voice_input_callback"):
-                    adapter._voice_input_callback = self._handle_voice_channel_input
+                self._bind_voice_input_callback(adapter)
                 connected_count += 1
+                _degraded = adapter.send_path_degraded
                 self._update_platform_runtime_status(
-                    platform.value, platform_state="connected", error_code=None, error_message=None,
+                    platform.value,
+                    platform_state="retrying" if _degraded else "connected",
+                    error_code=None,
+                    error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
                 )
-                logger.info("\u2713 %s connected", platform.value)
+                logger.info("\u2713 %s connected%s", platform.value, " (degraded)" if _degraded else "")
             else:  # outcome == "failed"
                 logger.warning("\u2717 %s failed to connect", platform.value)
                 # Defensive cleanup: a failed connect() may have allocated resources
@@ -16028,19 +16226,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
-                        if hasattr(adapter, "_voice_input_callback"):
-                            adapter._voice_input_callback = self._handle_voice_channel_input
+                        self._bind_voice_input_callback(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
+                        # connect() returning True does not mean the adapter's
+                        # receive path is confirmed -- Telegram's degraded
+                        # reconnect returns True so the gateway stays up while
+                        # its own ladder retries. Stamping "connected" here
+                        # would undo the adapter's accurate status (#101391).
+                        _degraded = adapter.send_path_degraded
                         self._update_platform_runtime_status(
                             platform.value,
-                            platform_state="connected",
+                            platform_state="retrying" if _degraded else "connected",
                             error_code=None,
-                            error_message=None,
+                            error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
                             needs_attention=False,
                             retrying_since=None,
                         )
-                        logger.info("✓ %s reconnected successfully", platform.value)
+                        if _degraded:
+                            logger.info("⚠ %s reconnected in degraded mode (receive path not yet confirmed)", platform.value)
+                        else:
+                            logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Final responses rejected while this adapter was down
                         # are still owned by this live process, so startup
@@ -16330,6 +16536,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "active_agents": self._running_agent_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
+                    "active_deferred_agent_workers": getattr(
+                        self,
+                        "_active_deferred_agent_worker_count",
+                        lambda: 0,
+                    )(),
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "watchdog_delay_s": resolve_shutdown_watchdog_delay(
                         self._restart_drain_timeout
@@ -16356,6 +16567,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _watchdog_done.set()
 
         async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+            # Shutdown-path tests and third-party runner doubles may only
+            # implement the older drain-count surface.
+            _deferred_worker_count = getattr(
+                self,
+                "_active_deferred_agent_worker_count",
+                lambda: 0,
+            )
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -16421,6 +16639,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
+            _deferred_at_start = _deferred_worker_count()
             # In-flight cron work gets its own floor, clamped to the watchdog
             # leash we're already running under so the extra wait can never
             # cost us the post-drain cleanup window (#82161).
@@ -16455,7 +16674,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, "
+                "deferred_at_start=%d, deferred_now=%d)",
                 _phase_elapsed(),
                 _drain_elapsed,
                 timed_out,
@@ -16465,6 +16685,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                _deferred_at_start,
+                _deferred_worker_count(),
             )
 
             if not timed_out:
@@ -16484,12 +16706,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "%d in-flight cron job(s), %d api_server run(s), and "
+                    "%d deferred agent worker(s); "
                     "interrupting remaining work.",
                     _drain_elapsed,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    _deferred_worker_count(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -16544,7 +16768,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # to stop gets its tool subprocesses killed below before it can
                 # unwind — the exact amputation this interrupt exists to avoid.
                 while (
-                    self._running_agents or self._active_api_run_count()
+                    self._running_agents
+                    or self._active_api_run_count()
+                    or _deferred_worker_count()
                 ) and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
@@ -16559,7 +16785,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # at settle-loop exit, re-signal so a late-materializing
                 # agent gets a cooperative interrupt instead of going
                 # straight to the tool-subprocess kill.
-                if self._running_agents or self._active_api_run_count():
+                if (
+                    self._running_agents
+                    or self._active_api_run_count()
+                    or _deferred_worker_count()
+                ):
                     self._interrupt_running_agents(
                         _INTERRUPT_REASON_GATEWAY_RESTART
                         if self._restart_requested
@@ -16731,58 +16961,115 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _e:
                 logger.debug("shutdown_cached_clients error: %s", _e)
 
-            # Close SQLite session DBs so the WAL write lock is released.
-            # Without this, --replace and similar restart flows leave the
-            # old gateway's connection holding the WAL lock until Python
-            # actually exits — causing 'database is locked' errors when
-            # the new gateway tries to open the same file.
-            # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
-            # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
-            _self_db = getattr(self, "_session_db", None)
-            _self_db = getattr(_self_db, "_db", _self_db)
-            for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
-                if _db is None or not hasattr(_db, "close"):
-                    continue
-                try:
-                    _db.close()
-                except Exception as _e:
-                    logger.debug("SessionDB close error: %s", _e)
-            # A multiplexed session_store caches one SessionDB per profile
-            # path (#88532); reading ``_db`` above only resolved the handle
-            # for the shutdown task's own (root) scope. Sweep the rest so
-            # secondary profiles' WAL locks are released before --replace
-            # brings a new gateway up on the same files.
-            _sweep = getattr(
-                getattr(self, "session_store", None), "close_all_db_handles", None
+            # Quiesce the gateway thread pool BEFORE the session databases
+            # are closed.  This used to run *after* the close block below,
+            # which left two holes:
+            #
+            #   (a) `_executor_closing` was still False during the close, so
+            #       any coroutine reaching `_run_in_executor_with_context`
+            #       minted a brand-new pool and ran more blocking DB work
+            #       against handles that had just been closed;
+            #   (b) cancelling `self._background_tasks` above does not stop a
+            #       `run_in_executor` future that already started — the task
+            #       dies, the worker thread keeps writing.
+            #
+            # Either way a write lands after `SessionDB.close()`, which has
+            # already checkpointed the WAL and let SQLite unlink the sidecar.
+            # The late write silently reopens the handle (#94736) and mints a
+            # fresh WAL generation behind that checkpoint, so teardown
+            # checkpoints the same file a second time from a connection the
+            # shutdown log never accounts for — the close-time page-write
+            # damage in #101093 and the split WAL generation in #101064.
+            #
+            # The wait is bounded and clamped to what is left of the shutdown
+            # watchdog leash (minus a second for the close itself), so a stuck
+            # worker can never cost us the post-close cleanup window (#82161).
+            _exec_quiesce_budget = max(
+                0.0,
+                min(
+                    _EXECUTOR_QUIESCE_TIMEOUT,
+                    resolve_shutdown_watchdog_delay(timeout)
+                    - _phase_elapsed()
+                    - 1.0,
+                ),
             )
-            if _sweep is not None:
-                try:
-                    _sweep()
-                except Exception as _e:
-                    logger.debug("SessionDB handle sweep error: %s", _e)
-            # Same sweep for the runner's own per-profile session_search
-            # handles (slash commands resolve them under profile scopes).
-            try:
-                GatewayRunner.close_all_session_db_handles(self)
-            except Exception as _e:
-                logger.debug("Runner SessionDB handle sweep error: %s", _e)
-            # Final sweep: close any shared SessionDB instances still held by
-            # the process-wide registry (in-process tools, cron, mirror, etc.
-            # that opened via get_shared_session_db but weren't released by
-            # the sweeps above).  This is the safety net that guarantees no
-            # WAL write lock survives past gateway shutdown (#90837).
-            try:
-                from hermes_state import close_shared_session_dbs
-                closed = close_shared_session_dbs()
-                if closed:
-                    logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
-            except Exception as _e:
-                logger.debug("Shared SessionDB close error: %s", _e)
-            GatewayRunner._shutdown_executor(self)
-            logger.info(
-                "Shutdown phase: SessionDB close done at +%.2fs",
-                _phase_elapsed(),
+            _exec_live = GatewayRunner._shutdown_executor(
+                self, drain_timeout=_exec_quiesce_budget
             )
+            if _exec_live:
+                # A live worker can still be mid-write against a SessionDB
+                # handle. Checkpointing/closing it now is exactly the
+                # sequence that produced the wrong-page-number corruption in
+                # #101093, so the close path below is skipped entirely
+                # rather than raced — the handle is left open for SQLite to
+                # recover from its own WAL on the next open, which is a
+                # transient "database is locked" on an immediate --replace
+                # at worst, not a corrupt file.
+                logger.warning(
+                    "Shutdown phase: %d executor worker(s) still running after "
+                    "a %.2fs quiesce — skipping the SessionDB close/checkpoint "
+                    "to avoid racing a live write (#101093); handles are left "
+                    "open for SQLite to recover on next open",
+                    _exec_live,
+                    _exec_quiesce_budget,
+                )
+            else:
+                logger.info(
+                    "Shutdown phase: executor quiesced at +%.2fs",
+                    _phase_elapsed(),
+                )
+
+                # Close SQLite session DBs so the WAL write lock is released.
+                # Without this, --replace and similar restart flows leave the
+                # old gateway's connection holding the WAL lock until Python
+                # actually exits — causing 'database is locked' errors when
+                # the new gateway tries to open the same file.
+                # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
+                # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
+                _self_db = getattr(self, "_session_db", None)
+                _self_db = getattr(_self_db, "_db", _self_db)
+                for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
+                    if _db is None or not hasattr(_db, "close"):
+                        continue
+                    try:
+                        _db.close()
+                    except Exception as _e:
+                        logger.debug("SessionDB close error: %s", _e)
+                # A multiplexed session_store caches one SessionDB per profile
+                # path (#88532); reading ``_db`` above only resolved the handle
+                # for the shutdown task's own (root) scope. Sweep the rest so
+                # secondary profiles' WAL locks are released before --replace
+                # brings a new gateway up on the same files.
+                _sweep = getattr(
+                    getattr(self, "session_store", None), "close_all_db_handles", None
+                )
+                if _sweep is not None:
+                    try:
+                        _sweep()
+                    except Exception as _e:
+                        logger.debug("SessionDB handle sweep error: %s", _e)
+                # Same sweep for the runner's own per-profile session_search
+                # handles (slash commands resolve them under profile scopes).
+                try:
+                    GatewayRunner.close_all_session_db_handles(self)
+                except Exception as _e:
+                    logger.debug("Runner SessionDB handle sweep error: %s", _e)
+                # Final sweep: close any shared SessionDB instances still held by
+                # the process-wide registry (in-process tools, cron, mirror, etc.
+                # that opened via get_shared_session_db but weren't released by
+                # the sweeps above).  This is the safety net that guarantees no
+                # WAL write lock survives past gateway shutdown (#90837).
+                try:
+                    from hermes_state import close_shared_session_dbs
+                    closed = close_shared_session_dbs()
+                    if closed:
+                        logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
+                except Exception as _e:
+                    logger.debug("Shared SessionDB close error: %s", _e)
+                logger.info(
+                    "Shutdown phase: SessionDB close done at +%.2fs",
+                    _phase_elapsed(),
+                )
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -16980,12 +17267,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.config import load_gateway_config
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
 
-        with _profile_runtime_scope(profile_home):
+        # Hydrate external secret sources (1Password/vault/...) off-loop ONCE,
+        # then enter the scope without re-hydrating: the sync hydration is
+        # network-bound and would otherwise stall every other profile's
+        # heartbeat while this one boots (same class as the reconnect path).
+        await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
+
+        with _profile_runtime_scope(profile_home, hydrate_secrets=False):
             profile_runtime_cfg = _load_gateway_runtime_config()
             from hermes_cli.plugins import discover_plugins
 
             discover_plugins()
+
+            # Register this profile's own declarative shell hooks and
+            # outbound webhooks. The startup-time registration in
+            # start() only ever sees the root/default profile's config
+            # (it runs before any profile scope exists), so without this
+            # a secondary profile's `hooks:` block is silently inert —
+            # its turns run under this profile's own plugin manager
+            # (hermes_cli.plugins.get_plugin_manager keys by resolved
+            # home), which never received the callbacks.
+            try:
+                from hermes_cli.config import load_config as _load_profile_config
+                from agent.shell_hooks import (
+                    register_from_config as _register_shell_hooks,
+                )
+                from agent.outbound_webhooks import (
+                    register_from_config as _register_outbound_webhooks,
+                )
+
+                _profile_hooks_cfg = _load_profile_config()
+                _register_shell_hooks(_profile_hooks_cfg, accept_hooks=False)
+                _register_outbound_webhooks(_profile_hooks_cfg)
+            except Exception:
+                logger.warning(
+                    "shell-hook/webhook registration failed for profile '%s'",
+                    profile_name,
+                    exc_info=True,
+                )
+
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
@@ -17038,16 +17360,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value,
                 )
                 continue
-            # Relay is shared process-level ingress in multiplex mode. The
-            # active profile owns the one connection; connector-stamped
-            # source.profile routes inbound turns to secondary profiles.
+            # Relay and WhatsApp are shared process-level ingress in multiplex
+            # mode: one connection owned by the active profile, with
+            # route-stamped source.profile fanning inbound turns out to
+            # secondary profiles. The WhatsApp bridge is a single authenticated
+            # session tied to one phone number -- a secondary profile has no
+            # credential of its own to bring, so constructing an adapter for it
+            # only yields a connect/retry loop that stalls startup for every
+            # profile queued behind it.
             if (
                 getattr(self.config, "multiplex_profiles", False)
-                and platform is Platform.RELAY
+                and platform in (Platform.RELAY, Platform.WHATSAPP)
             ):
                 continue
             try:
-                with _profile_runtime_scope(profile_home):
+                with _profile_runtime_scope(profile_home, hydrate_secrets=False):
                     adapter = self._create_adapter(platform, platform_config)
             except Exception as e:
                 logger.error(
@@ -17131,12 +17458,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._configure_profile_adapter(adapter, profile_name, platform)
 
             try:
-                with _profile_runtime_scope(profile_home):
+                with _profile_runtime_scope(profile_home, hydrate_secrets=False):
                     success = await self._connect_initial_adapter_with_timeout(
                         adapter, platform
                     )
                 if success:
                     profile_map[platform] = adapter
+                    # Restore persisted /voice state for this bot (#84872) —
+                    # primary startup and every reconnect path already do.
+                    self._sync_voice_mode_state_to_adapter(adapter)
                     if credential_claim is not None:
                         claimed[credential_claim] = profile_name
                     if listener_claim is not None:
@@ -17195,6 +17525,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_platform_event_handler(
             self._make_profile_platform_event_handler(profile_name)
         )
+        # Voice transcripts from this bot's channels dispatch through THIS
+        # adapter (primary wiring lives at connect time; see #75198).
+        self._bind_voice_input_callback(adapter)
         text_modes = getattr(self, "_busy_text_modes_by_profile", None)
         adapter._busy_text_mode = (
             text_modes.get(profile_name, self._busy_text_mode)
@@ -17216,10 +17549,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = None
                 try:
                     from hermes_cli.profiles import get_profile_dir
+                    from hermes_cli.env_loader import hydrate_profile_secret_sources
                     from gateway.config import load_gateway_config
 
                     profile_home = get_profile_dir(profile_name)
-                    with _profile_runtime_scope(profile_home):
+                    # Like the #16856 MCP discovery path, hydrate external secret
+                    # sources off-loop so they cannot starve platform heartbeats.
+                    await asyncio.to_thread(
+                        hydrate_profile_secret_sources, profile_home
+                    )
+                    with _profile_runtime_scope(profile_home, hydrate_secrets=False):
                         profile_config = load_gateway_config().platforms.get(platform)
                         if profile_config is None or not profile_config.enabled:
                             return
@@ -17704,6 +18043,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # of a bot token. Including its secret keeps multiplexed profiles
             # from spawning competing sidecars for the same account and port.
             "_project_secret",
+            # Feishu/Lark authenticates with an app_id/app_secret pair rather
+            # than a single token (one active WebSocket connection per app).
+            # app_id is stable, log-safe, and already used as the adapter's
+            # _app_lock_identity, so including it lets the multiplex guard
+            # refuse cloned profiles competing for the same Feishu app.
+            "_app_id",
+            # Same class: Teams (client_id/client_secret) and WeCom
+            # (bot_id/secret) authenticate with an app-style id pair too.
+            "_client_id",
+            "_bot_id",
         ):
             val = getattr(adapter, attr, None)
             if isinstance(val, str) and val.strip():
@@ -17734,11 +18083,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
     def _create_adapter(
-        self, 
-        platform: Platform, 
-        config: Any
+        self,
+        platform: Platform,
+        config: Any,
     ) -> Optional[BasePlatformAdapter]:
-        """Create the appropriate adapter for a platform.
+        """Create an adapter and bind it to this gateway runner.
+
+        Every lifecycle path — primary/secondary startup and reconnect — goes
+        through this method. Keep runner binding here so adapters can resolve
+        inbound profile routes before handlers or ``connect()`` run.
+        """
+        adapter = self._instantiate_adapter(platform, config)
+        if adapter is not None:
+            adapter.gateway_runner = self
+        return adapter
+
+    def _instantiate_adapter(
+        self,
+        platform: Platform,
+        config: Any,
+    ) -> Optional[BasePlatformAdapter]:
+        """Instantiate the appropriate adapter for a platform.
 
         Checks the platform_registry first (plugin adapters), then falls
         through to the built-in if/elif chain for core platforms.
@@ -17759,14 +18124,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if platform_registry.is_registered(platform.value):
                 adapter = platform_registry.create_adapter(platform.value, config)
                 if adapter is not None:
-                    # Inject a back-reference to the gateway runner so every
-                    # adapter can (a) deliver cross-platform admin alerts and
-                    # (b) resolve inbound profile routing through
-                    # ``runner._profile_name_for_source``. Unconditional:
-                    # ``BasePlatformAdapter`` declares ``gateway_runner``, so
-                    # this reaches ALL platforms (not just the ones that
-                    # pre-declared it), making profile routing platform-generic.
-                    adapter.gateway_runner = self
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).
@@ -17818,18 +18175,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            adapter = APIServerAdapter(config)
-            adapter.gateway_runner = self
-            return adapter
+            return APIServerAdapter(config)
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
             if not check_webhook_requirements():
                 logger.warning("Webhook: aiohttp not installed")
                 return None
-            adapter = WebhookAdapter(config)
-            adapter.gateway_runner = self  # For cross-platform delivery
-            return adapter
+            return WebhookAdapter(config)
 
         elif platform == Platform.MSGRAPH_WEBHOOK:
             from gateway.platforms.msgraph_webhook import (
@@ -24397,8 +24750,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # init on the loop thread before the first read.
                 await self._warm_goals_session_db("loop wakeup")
 
+                # Every SessionDB call in this scan runs off the loop thread.
+                # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) that
+                # take the writer lock; a slow writer elsewhere (FTS merge, WAL
+                # checkpoint, a long flush) holding it while the watcher blocked
+                # the loop on the same lock froze the gateway for 90+ s until
+                # the liveness watchdog force-exited. list_active_loops() reads
+                # via _read_ctx (lock-free under WAL) but still convoys on the
+                # writer lock when WAL is unavailable, so it goes off-loop too.
+                # _run_in_executor_with_context keeps the profile HERMES_HOME
+                # override alive under multiplex, like the warm-up above.
+                active_loops = await self._run_in_executor_with_context(list_active_loops)
+
                 now = time.time()
-                for sid, state in list_active_loops():
+                for sid, state in active_loops:
                     if state.awaiting_response or now < state.next_due_at:
                         continue
                     route = state.route or {}
@@ -24446,7 +24811,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     mgr = LoopManager(session_id=sid)
                     if not mgr.is_due(now):
                         continue
-                    wakeup = mgr.fire_tick()
+                    wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
                     if not wakeup:
                         continue
                     try:
@@ -24466,7 +24831,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # path and never hit the post-turn completion hook —
                         # complete the tick immediately (caps + scheduling).
                         if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
+                            await self._run_in_executor_with_context(mgr.complete_tick, "")
                     except Exception as exc:
                         logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
                         try:
@@ -24510,15 +24875,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
-        if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+        self._bind_voice_input_callback(adapter)
+        voice_profile = self._adapter_profile_for_source(event.source)
         if hasattr(adapter, "_on_voice_disconnect"):
-            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+            adapter._on_voice_disconnect = functools.partial(
+                self._handle_voice_timeout_cleanup, adapter=adapter
+            )
         # Let the adapter's inactivity timer see the live voice-reply mode so it
         # doesn't disconnect a deliberately text-only (/voice off) session.
         if hasattr(adapter, "_voice_mode_getter"):
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
-                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+                self._voice_key(Platform.DISCORD, str(chat_id), profile=voice_profile),
+                "off",
             )
 
         try:
@@ -24538,7 +24906,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
             if hasattr(adapter, "_voice_sources"):
                 adapter._voice_sources[guild_id] = event.source.to_dict()
-            self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
+            self._voice_mode[self._voice_key_for_source(event.source)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
             return (
@@ -24565,21 +24933,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
         # Always clean up state even if leave raised an exception
-        self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
+        self._voice_mode[self._voice_key_for_source(event.source)] = "off"
         self._save_voice_modes()
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
         return "Left voice channel."
 
-    def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
+    def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
         """Called by the adapter when a voice channel times out.
 
         Cleans up runner-side voice_mode state that the adapter cannot reach.
+        ``adapter`` is the Discord adapter that timed out (bound at join time);
+        under multiplexing that is a specific profile's bot, not necessarily
+        ``self.adapters[DISCORD]``.
         """
-        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
+        profile = getattr(adapter, "_owner_profile", None)
+        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id, profile=profile)] = "off"
         self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
@@ -24624,14 +24997,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
+        ``adapter`` is the Discord adapter that captured the audio (bound via
+        ``_bind_voice_input_callback``); under multiplexing each profile's bot
+        must dispatch through its own adapter, never the default profile's.
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
         if not adapter:
             return
 
@@ -24653,6 +25030,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=str(user_id),
                 user_name=str(user_id),
                 chat_type="channel",
+                profile=getattr(adapter, "_owner_profile", None),
             )
 
         # Check authorization before processing voice input
@@ -24724,11 +25102,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         chat_id = event.source.chat_id
-        voice_key = self._voice_key(event.source.platform, chat_id)
+        voice_key = self._voice_key_for_source(event.source)
         voice_mode = self._voice_mode.get(voice_key)
         is_voice_input = (event.message_type == MessageType.VOICE)
 
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._adapter_for_source(event.source)
         adapter_auto_tts = False
         if adapter and hasattr(adapter, "_should_auto_tts_for_chat"):
             try:
@@ -26065,25 +26443,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Split out from ``_handle_reload_mcp_command`` so the confirmation
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
+
+        Under multiplex the reload runs inside the requesting profile's
+        runtime scope (entered here when the caller — e.g. a button-confirm
+        callback — did not), and only that profile's servers are torn down
+        and rediscovered (#95518).
         """
-        loop = asyncio.get_running_loop()
+        multiplex = bool(getattr(self.config, "multiplex_profiles", False))
+        if multiplex and not get_hermes_home_override():
+            profile_home = self._resolve_profile_home_for_source(event.source)
+            with _profile_runtime_scope(Path(profile_home)):
+                return await self._execute_mcp_reload(event)
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import _server_scope_keys, reprobe_tool_availability
+            from tools.registry import registry
+
+            reload_scope = registry.current_scope_key() if multiplex else None
+
+            def _scoped_server_names() -> set:
+                with _lock:
+                    return {
+                        name for name in _servers
+                        if reload_scope is None or _server_scope_keys.get(name) == reload_scope
+                    }
 
             # Capture old server names before shutdown
-            with _lock:
-                old_servers = set(_servers.keys())
+            old_servers = _scoped_server_names()
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            await self._run_in_executor_with_context(
+                lambda: shutdown_mcp_servers(scope=reload_scope)
+            )
+            # Explicit reload also re-probes tool availability (check_fn).
+            reprobe_tool_availability()
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
 
             # Compute what changed
-            with _lock:
-                connected_servers = set(_servers.keys())
+            connected_servers = _scoped_server_names()
+            if reload_scope is not None:
+                from tools.mcp_tool import _mcp_tool_server_names
+
+                with _lock:
+                    new_tools = [
+                        n for n in new_tools
+                        if _mcp_tool_server_names.get(n) in connected_servers
+                    ]
 
             added = connected_servers - old_servers
             removed = old_servers - connected_servers
@@ -26112,8 +26520,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache = getattr(self, "_agent_cache", None)
                 _cache_lock = getattr(self, "_agent_cache_lock", None)
                 if _cache_lock is not None and _cache:
+                    # Multiplex: only this profile's sessions. Rebuilding
+                    # another profile's agent inside this scope would hand it
+                    # this profile's tool registry.
+                    _ns_prefix = (
+                        _session_key_namespace(event.source.profile) + ":"
+                        if multiplex else None
+                    )
                     with _cache_lock:
                         for _sess_key, _entry in list(_cache.items()):
+                            if _ns_prefix and not str(_sess_key).startswith(_ns_prefix):
+                                continue
                             try:
                                 _agent = _entry[0] if isinstance(_entry, tuple) else _entry
                             except Exception:
@@ -27078,17 +27495,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not error:
             return
 
-        from hermes_state import classify_persistence_error, format_session_db_unavailable
+        from hermes_state import (
+            _default_db_path,
+            classify_persistence_error,
+            format_session_db_unavailable,
+        )
 
         cause = classify_persistence_error(error)
         hint = format_session_db_unavailable()
         if cause == "corrupt":
+            # Copy-pasteable, so name the real store (profiles / HERMES_HOME
+            # do not live under ~/.hermes).
+            db_path = _default_db_path()
             message = (
                 "⚠️ Session database corruption detected. Messages may not be "
                 "persisted. Recovery options:\n"
                 "1. Run `hermes doctor --fix`\n"
-                "2. Salvage with: sqlite3 ~/.hermes/state.db \".recover\" "
-                "(then replace state.db)\n"
+                "2. Stop the gateway, then recover with:\n"
+                f"   hermes sessions recover --source {db_path} "
+                "--inspect-only\n"
+                "   (if it reports recoverable) hermes sessions recover "
+                f"--source {db_path} --output recovered-state.db\n"
+                "   — recovery snapshots the damaged file first; do NOT run "
+                "`sqlite3 ... \".recover\"` against the live state.db, a "
+                "vulnerable sqlite3 CLI can corrupt it further\n"
                 "3. Restore from a backup in ~/.hermes/backups/\n"
                 "Run `hermes doctor` for sanitized diagnostics."
             )
@@ -27222,11 +27652,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._executor = executor
             return executor
 
-    def _shutdown_executor(self) -> None:
-        """Stop the gateway-owned executor without touching the loop default."""
+    def _shutdown_executor(self, drain_timeout: float = 0.0) -> int:
+        """Stop the gateway-owned executor without touching the loop default.
+
+        Returns the number of worker threads still running when this returns.
+        With the default ``drain_timeout`` of 0 this is the historical
+        fire-and-forget teardown; shutdown passes a bounded budget so blocking
+        DB work cannot outlive ``SessionDB.close()`` (see ``_stop_impl``).
+
+        ``cancel_futures`` only drops work that has not started yet, and a
+        cancelled ``run_in_executor`` awaitable does not stop the thread behind
+        it, so the running futures have to be waited on explicitly.
+        """
         lock = getattr(self, "_executor_lock", None)
         if lock is None:
-            return
+            return 0
 
         with lock:
             self._executor_closing = True
@@ -27234,12 +27674,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._executor = None
 
         if executor is None:
-            return
+            return 0
 
         try:
             executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
             executor.shutdown(wait=False)
+
+        # ThreadPoolExecutor.shutdown() has no timeout, so join the worker
+        # threads directly.  `_threads` is absent on the doubles some tests
+        # pass in, which just means no wait.
+        workers = list(getattr(executor, "_threads", None) or ())
+        deadline = time.monotonic() + max(float(drain_timeout or 0.0), 0.0)
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+        return sum(1 for worker in workers if worker.is_alive())
 
     def _decide_image_input_mode(
         self,
@@ -32843,7 +33295,42 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None):
+def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
+    """Drain each profile's worker queue through its matching live adapters."""
+    from cron import scheduler as cron_scheduler
+
+    if runner is None:
+        if adapters is not None:
+            cron_scheduler.drain_delivery_queue(adapters, loop)
+        return
+    for profile_name, profile_home in _handoff_watch_scopes(runner):
+        scoped_home = profile_home or get_hermes_home()
+        if profile_name is None:
+            profile_adapters = adapters
+        else:
+            profile_adapters = getattr(runner, "_profile_adapters", {}).get(
+                profile_name
+            )
+        if profile_adapters is None:
+            continue
+        with _profile_runtime_scope(scoped_home):
+            if profile_name is not None and not profile_adapters and adapters:
+                routes = cron_scheduler._primary_profile_routes_for_current_home()
+                if routes:
+                    profile_adapters = cron_scheduler.SharedRouteAdapters(
+                        adapters, routes
+                    )
+            cron_scheduler.drain_delivery_queue(profile_adapters, loop)
+
+
+def _start_gateway_housekeeping(
+    stop_event: threading.Event,
+    adapters=None,
+    loop=None,
+    interval: int = 60,
+    cron_provider=None,
+    runner=None,
+):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -32897,6 +33384,16 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        # Restart-safe cron workers run outside the gateway cgroup and queue
+        # their final send for whichever gateway instance is live.  Drain on
+        # the gateway-wide housekeeper rather than the built-in scheduler tick:
+        # external providers do not run that ticker.
+        if adapters is not None or runner is not None:
+            try:
+                _drain_restart_safe_cron_deliveries(adapters, loop, runner)
+            except Exception as exc:
+                logger.debug("Cron durable delivery queue drain error: %s", exc)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -33632,6 +34129,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logging.getLogger().setLevel(_stderr_level)
 
     runner = GatewayRunner(config)
+    # Multiplex: swap the launch-home file handlers for per-profile routers so
+    # each profile's records land in its own logs/ (#82936). Must run after
+    # the runner resolved the (possibly None) config and after setup_logging.
+    _enable_multiplex_log_routing(runner.config)
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.
@@ -33911,9 +34412,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # heartbeats (Discord shard, Telegram polling) until it returned.
     # See #16856.
     try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        await _discover_gateway_mcp_tools(runner.config)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
@@ -34077,6 +34576,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "adapters": runner.adapters,
             "loop": asyncio.get_running_loop(),
             "cron_provider": cron_provider,
+            "runner": runner,
         },
         daemon=True,
         name="gateway-housekeeping",
