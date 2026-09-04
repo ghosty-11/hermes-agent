@@ -37,6 +37,7 @@ from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
+    TranscriptReadError,
     build_session_key,
     is_shared_multi_user_session,
 )
@@ -48,6 +49,11 @@ from utils import (
 )
 
 logger = logging.getLogger("gateway.run")
+
+HISTORY_UNREADABLE = (
+    "⚠️ Conversation history is unreadable (state.db). "
+    "This is not a new conversation — earlier messages exist but cannot be loaded."
+)
 
 # Upper bound on the off-loop agent-resource cleanup during a /new or /reset
 # (see _handle_reset_command). A stuck teardown must not block the event loop;
@@ -963,7 +969,10 @@ class GatewaySlashCommandsMixin:
             return "\n".join(lines)
 
         # Last resort: rough estimate from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        try:
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+        except TranscriptReadError:
+            return HISTORY_UNREADABLE
         if history:
             from agent.model_metadata import estimate_messages_tokens_rough
 
@@ -2641,8 +2650,11 @@ class GatewaySlashCommandsMixin:
         """Handle /retry command - re-send the last user message."""
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
-        
+        try:
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+        except TranscriptReadError:
+            return HISTORY_UNREADABLE
+
         # Find the last *real* user message. Timeline bookkeeping rows carry
         # role=user + display_kind (model_switch / async_delegation_complete /
         # auto_continue / hidden); clients never count them as user turns.
@@ -2834,6 +2846,22 @@ class GatewaySlashCommandsMixin:
             if not gate_arg or gate_lower == "list":
                 return mgr.render_gates()
             if gate_lower.startswith("add "):
+                # SECURITY: a gate is persisted and later executed with
+                # shell=True at every goal turn boundary (run_gate), with no
+                # approval prompt. Letting an allowed but non-admin gateway
+                # sender choose that string is authenticated RCE under the
+                # Hermes process account — and with no admin list configured
+                # (the backward-compatible default) every allowed sender is
+                # treated as unrestricted. Gate ONLY this shell-creating
+                # operation behind a real, explicitly-configured admin (the
+                # same fail-closed check that guards cross-origin /resume);
+                # list/remove/clear stay open so a non-admin can still recover.
+                if not self._resume_caller_is_admin(event.source):
+                    return (
+                        "⛔ /goal gate add requires an explicitly configured "
+                        "gateway admin (allow_admin_from for DMs, "
+                        "group_allow_admin_from for groups)."
+                    )
                 command = gate_arg[len("add"):].strip()
                 try:
                     gate = mgr.add_gate(command)
@@ -3347,10 +3375,12 @@ class GatewaySlashCommandsMixin:
         """Handle /voice [on|off|tts|channel|leave|status] command."""
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
-        platform = event.source.platform
-        voice_key = self._voice_key(platform, chat_id)
+        # Voice state belongs to the (bot, chat) pair: resolve the adapter that
+        # received the command and key the mode by its owning profile so two
+        # multiplexed bots in one chat keep independent /voice state (#75198).
+        voice_key = self._voice_key_for_source(event.source)
 
-        adapter = self.adapters.get(platform)
+        adapter = self._adapter_for_source(event.source)
 
         if args in {"on", "enable"}:
             self._voice_mode[voice_key] = "voice_only"
@@ -3382,7 +3412,6 @@ class GatewaySlashCommandsMixin:
                 "all": t("gateway.voice.label_all"),
             }
             # Append voice channel info if connected
-            adapter = self.adapters.get(event.source.platform)
             guild_id = self._get_guild_id(event)
             if guild_id and hasattr(adapter, "get_voice_channel_info"):
                 info = adapter.get_voice_channel_info(guild_id)
@@ -3676,7 +3705,10 @@ class GatewaySlashCommandsMixin:
 
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        try:
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+        except TranscriptReadError:
+            return HISTORY_UNREADABLE
         if not history:
             return t("gateway.btw.no_history")
 
@@ -4544,7 +4576,10 @@ class GatewaySlashCommandsMixin:
         """
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        try:
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+        except TranscriptReadError:
+            return HISTORY_UNREADABLE
 
         if not history or len(history) < 4:
             return t("gateway.compress.not_enough")
@@ -5335,7 +5370,17 @@ class GatewaySlashCommandsMixin:
         title = await self._session_db.get_session_title(target_id) or name
 
         # Count messages for context
-        history = await self.async_session_store.load_transcript(target_id)
+        try:
+            history = await self.async_session_store.load_transcript(target_id)
+        except TranscriptReadError:
+            # The resume itself succeeded; only the count is missing. Say the
+            # history is unreadable rather than reporting an empty session
+            # (#100788).
+            return (
+                t("gateway.resume.resumed_no_count", title=title)
+                + "\n"
+                + HISTORY_UNREADABLE
+            )
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
@@ -5452,7 +5497,10 @@ class GatewaySlashCommandsMixin:
 
         # Load the current session and its transcript
         current_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(current_entry.session_id)
+        try:
+            history = await self.async_session_store.load_transcript(current_entry.session_id)
+        except TranscriptReadError:
+            return HISTORY_UNREADABLE
         if not history:
             return t("gateway.branch.no_conversation")
 
@@ -5637,6 +5685,10 @@ class GatewaySlashCommandsMixin:
             try:
                 entry = self.session_store.get_or_create_session(source)
                 history = self.session_store.load_transcript(entry.session_id) or []
+            except TranscriptReadError:
+                # A read failure is not an empty transcript (#100788): the
+                # breakdown would understate the context by the whole chat.
+                return [HISTORY_UNREADABLE]
             except Exception:
                 history = []
 
@@ -5668,6 +5720,10 @@ class GatewaySlashCommandsMixin:
             try:
                 entry = self.session_store.get_or_create_session(source)
                 history = self.session_store.load_transcript(entry.session_id) or []
+            except TranscriptReadError:
+                # See _context_breakdown_block: don't pass a read failure off
+                # as an empty transcript (#100788).
+                return [HISTORY_UNREADABLE]
             except Exception:
                 history = []
 
@@ -5851,7 +5907,10 @@ class GatewaySlashCommandsMixin:
 
         # No agent at all -- check session history for a rough count
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        try:
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+        except TranscriptReadError:
+            return HISTORY_UNREADABLE
         if history:
             from agent.model_metadata import estimate_messages_tokens_rough
             msgs = [m for m in history if m.get("role") in {"user", "assistant"} and m.get("content")]
