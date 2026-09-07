@@ -8772,6 +8772,13 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
+    # A strict no-tools agent (hermes.strict_run.v1, tool_policy:none) owns
+    # an intentionally empty surface for its whole life: no caller of this
+    # rebuild — between-turns prologue, compaction commit, /reload-mcp, the
+    # late-binding thread — may re-grant it the registry.
+    if getattr(agent, "_strict_no_tools", False) is True:
+        return set()
+
     from model_tools import get_tool_definitions
     from tools.registry import registry
 

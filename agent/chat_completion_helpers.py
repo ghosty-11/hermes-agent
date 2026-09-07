@@ -2025,6 +2025,11 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
     _wire_reasoning_config = _reasoning_config_for_wire(agent)
     if tools_for_api is None:
         tools_for_api = agent.tools
+    if getattr(agent, "_strict_no_tools", False) is True:
+        # tool_policy:none (hermes.strict_run.v1): the wire carries no tool
+        # definitions regardless of what any in-turn snapshot rebuild put on
+        # agent.tools. Every transport omits ``tools`` for an empty list.
+        tools_for_api = []
     # The one place request_overrides are consumed: static /fast values are
     # already pinned in agent.request_overrides; auto/cold windows layer the
     # fast override here, per request, only while the window is open.

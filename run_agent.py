@@ -3479,6 +3479,13 @@ class AIAgent:
                 if "content" in msg:
                     msg = dict(msg)
                     msg["content"] = self._redact_message_content(msg.get("content"))
+                    if getattr(self, "_hermes_strict_run", False) is True and isinstance(msg["content"], list):
+                        msg["content"] = [
+                            {"type": "text", "text": "[screenshot]"}
+                            if isinstance(part, dict) and part.get("type") in {"image", "image_url", "input_image"}
+                            else part
+                            for part in msg["content"]
+                        ]
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.
@@ -7857,7 +7864,9 @@ class AIAgent:
         self._anthropic_image_fallback_cache[cache_key] = note
         return note
 
-    def _model_supports_vision(self) -> bool:
+    def _model_supports_vision(
+        self, *, requested_provider: str = "", require_configured_model: bool = False,
+    ) -> bool:
         """Return True if the active provider+model reports native vision.
 
         Used to decide whether to strip image content parts from API-bound
@@ -7870,6 +7879,14 @@ class AIAgent:
           3. models.dev capability lookup
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
+
+        ``requested_provider`` names the canonical ``custom:<name>`` identity
+        when the caller has confirmed it (strict runs); the lookup otherwise
+        recovers it from the context-local main runtime, which a per-request
+        API agent does not own.
+        Strict admission sets ``require_configured_model``: only the exact
+        provider/model declaration may authorize an image, never the active
+        profile's top-level shortcut or a network capability probe.
         """
         try:
             from hermes_cli.config import load_config
@@ -7877,7 +7894,18 @@ class AIAgent:
             cfg = load_config()
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
-            return _lookup_supports_vision(provider, model, cfg) is True
+            if require_configured_model:
+                from agent.image_routing import _supports_vision_override
+
+                declared = {
+                    key: cfg.get(key) for key in ("providers", "custom_providers")
+                } if isinstance(cfg, dict) else {}
+                return _supports_vision_override(
+                    declared, provider, model, requested_provider=requested_provider,
+                ) is True
+            return _lookup_supports_vision(
+                provider, model, cfg, requested_provider=requested_provider or ""
+            ) is True
         except Exception:
             return False
 
@@ -7961,6 +7989,10 @@ class AIAgent:
         return t
 
     def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
+        # Strict runs deliver images through the exact native capability of
+        # the locked model: no text-fallback preprocessor, no aux detour.
+        if getattr(self, "_strict_force_native_images", False) is True:
+            return api_messages
         # Fast exit when no message carries image content at all.
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -7997,6 +8029,11 @@ class AIAgent:
         replaced by a cached vision_analyze text description so the turn
         doesn't fail with "model does not support image input".
         """
+        # Strict runs never route images to an auxiliary detour or a
+        # text-only downgrade: the image reaches the provider natively or
+        # the run fails visibly.
+        if getattr(self, "_strict_force_native_images", False) is True:
+            return api_messages
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
             for msg in api_messages

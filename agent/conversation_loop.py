@@ -1402,6 +1402,97 @@ _CODEX_ACK_CONTINUATION_NUDGE = (
 # below). Named for the same reason as _CODEX_ACK_CONTINUATION_NUDGE — this
 # pair is only stripped from the durable transcript once the turn reaches
 # finalization; an interrupt/crash mid-retry can still persist it.
+
+
+def _strict_run_active(agent) -> bool:
+    """True when this agent turn enforces ``hermes.strict_run.v1`` policy."""
+    return getattr(agent, "_hermes_strict_run", False) is True
+
+
+def _strict_terminal_failure(
+    agent,
+    *,
+    messages: list,
+    conversation_history,
+    api_call_count: int,
+    api_error: Optional[BaseException] = None,
+    reason: str = "provider_error",
+    summary: Optional[str] = None,
+) -> dict:
+    """Fail a strict run terminally with a safe, sanitized error.
+
+    Zero retries, no fallback activation, no image strip or downgrade, no
+    credential rotation, no second model round. The error text carries only
+    a fixed summary and (for provider exceptions) the HTTP status class —
+    never provider bodies, data URLs, or input echoes.
+    """
+    status_code = getattr(api_error, "status_code", None) if api_error is not None else None
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    detail = f" (HTTP {status_code})" if status_code else ""
+    if summary is None:
+        summary = f"Strict run provider request failed{detail}."
+    logger.warning(
+        "%sStrict run terminal failure%s reason=%s error_type=%s",
+        agent.log_prefix,
+        detail,
+        reason,
+        type(api_error).__name__ if api_error is not None else "-",
+    )
+    try:
+        agent._persist_session(messages, conversation_history)
+    except Exception:
+        logger.debug("strict run: session persist after terminal failure failed",
+                     exc_info=True)
+    return {
+        "final_response": summary,
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": False,
+        "failed": True,
+        "error": summary,
+        "failure_reason": f"strict_run_{reason}",
+        "failure_retryable": False,
+    }
+
+
+def _apply_strict_run_controls(agent) -> None:
+    """Enforce strict-run transport policy on this agent, per request.
+
+    Disables the inherited fallback chain and zeroes actual SDK transport
+    retries through a private copy of the client options. A shared or
+    legacy client is never mutated: ``with_options`` returns a copy that
+    only this strict agent uses, and ``_client_kwargs`` is per-agent.
+    Idempotent — safe to re-apply for every API call block in a turn.
+    """
+    if not _strict_run_active(agent):
+        return
+    agent._fallback_chain = []
+    agent._fallback_model = None
+    agent._fallback_index = 0
+
+    client_kwargs = getattr(agent, "_client_kwargs", None)
+    if isinstance(client_kwargs, dict):
+        client_kwargs["max_retries"] = 0
+
+    client = getattr(agent, "client", None)
+    if client is None:
+        return
+    try:
+        current_retries = getattr(client, "max_retries", None)
+        if current_retries == 0:
+            return
+        private_client = client.with_options(max_retries=0)
+        agent.client = private_client
+    except Exception:
+        logger.debug(
+            "strict run: could not apply private zero-retry client copy",
+            exc_info=True,
+        )
+
+
 _DROPPED_TOOLCALL_NUDGE_CONTENT = (
     "Your previous turn indicated a tool call but none was "
     "included. Do not narrate a plan or restate intent — issue "
@@ -2227,6 +2318,8 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    strict_request_attempted = False
+    strict_tool_followup = False
     final_response = None
     interrupted = False
     failed = False
@@ -3350,6 +3443,11 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        # Strict runs enforce their per-request policy here, once per API
+        # call block (idempotent): no inherited fallback, zero actual SDK
+        # transport retries via a private client/options copy — legacy and
+        # shared clients keep their own retry policy untouched.
+        _apply_strict_run_controls(agent)
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -3361,6 +3459,15 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            if _strict_run_active(agent):
+                if strict_request_attempted and not strict_tool_followup:
+                    return _strict_terminal_failure(
+                        agent, messages=messages, conversation_history=conversation_history,
+                        api_call_count=api_call_count - 1, reason="strict_run_recovery_refused",
+                        summary="Strict run refused an automatic model continuation.",
+                    )
+                strict_request_attempted = True
+                strict_tool_followup = False
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -3864,6 +3971,19 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     
+                    # ── Strict runs: an invalid/empty-choices response is a
+                    # terminal failure. No backoff retry, no fallback: the
+                    # same request (and screenshot) is never re-issued.
+                    if _strict_run_active(agent):
+                        return _strict_terminal_failure(
+                            agent,
+                            messages=messages,
+                            conversation_history=conversation_history,
+                            api_call_count=api_call_count,
+                            reason="invalid_response",
+                            summary="Strict run provider returned an invalid response.",
+                        )
+
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
                     retry_count += 1
@@ -5035,6 +5155,20 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                # ── Strict runs: single terminal failure, no recovery ──
+                # A strict run (hermes.strict_run.v1) fails visibly on the
+                # first provider error: zero retries, no fallback, no image
+                # strip or downgrade, no credential rotation. This gate sits
+                # ahead of every recovery branch below so none can fire.
+                if _strict_run_active(agent):
+                    return _strict_terminal_failure(
+                        agent,
+                        messages=messages,
+                        conversation_history=conversation_history,
+                        api_error=api_error,
+                        api_call_count=api_call_count,
+                    )
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -7566,6 +7700,16 @@ def run_conversation(
                     except Exception:
                         pass
             
+            if _strict_run_active(agent) and not assistant_message.tool_calls:
+                content = assistant_message.content or ""
+                if (has_incomplete_scratchpad(content)
+                        or finish_reason in {"incomplete", "tool_calls"}
+                        or not agent._strip_think_blocks(content).strip()):
+                    return _strict_terminal_failure(
+                        agent, messages=messages, conversation_history=conversation_history,
+                        api_call_count=api_call_count, reason="strict_run_incomplete_response",
+                        summary="Strict run received no complete answer.",
+                    )
             # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
             # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
             if has_incomplete_scratchpad(assistant_message.content or ""):
@@ -7763,6 +7907,32 @@ def run_conversation(
                 agent._codex_incomplete_retries = 0
             
             # Check for tool calls
+            if assistant_message.tool_calls and getattr(agent, "_strict_no_tools", False) is True:
+                # tool_policy:none (hermes.strict_run.v1): the provider was
+                # offered no tools, so any tool call is fabricated. Refuse it
+                # through the shared dispatch guard (zero handlers, one
+                # refusal result per call so the transcript stays consistent)
+                # and END the turn: a screen turn never buys a second model
+                # round — the screenshot is not re-sent and nothing a second
+                # round might say is ever spoken.
+                from agent.tool_executor import _refuse_strict_tool_calls
+
+                agent._uniquify_tool_call_ids(assistant_message.tool_calls)
+                append_message(
+                    messages,
+                    agent._build_assistant_message(assistant_message, finish_reason),
+                )
+                _refuse_strict_tool_calls(
+                    agent, assistant_message, messages, effective_task_id
+                )
+                return _strict_terminal_failure(
+                    agent,
+                    messages=messages,
+                    conversation_history=conversation_history,
+                    api_call_count=api_call_count,
+                    reason="tool_call_refused",
+                    summary="Strict run refused a tool call on a no-tools turn.",
+                )
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
@@ -8181,6 +8351,7 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                strict_tool_followup = True
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -8608,6 +8779,18 @@ def run_conversation(
                     _empty_candidate = _truly_empty and (
                         not _has_structured or _prefill_exhausted
                     )
+                    # ── Strict runs: an empty answer is a terminal failure.
+                    # No empty-content retry, no fallback, no spoken
+                    # "(empty)" sentinel — the backend gets a real failure.
+                    if _empty_candidate and _strict_run_active(agent):
+                        return _strict_terminal_failure(
+                            agent,
+                            messages=messages,
+                            conversation_history=conversation_history,
+                            api_call_count=api_call_count,
+                            reason="empty_response",
+                            summary="Strict run provider returned an empty response.",
+                        )
                     if _empty_candidate:
                         # NS-503: every empty attempt re-sends the full
                         # conversation input at full price. Record the

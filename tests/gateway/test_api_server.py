@@ -2521,8 +2521,93 @@ class TestModelRoutesModelsEndpoint:
             alias_entry = next(m for m in data["data"] if m["id"] == "my-alias")
             assert alias_entry["root"] == "openai/gpt-5"
             assert alias_entry["parent"] == adapter._model_name
-            # per-route api_key must never leak through the discovery endpoint
+            # Per-route credentials must never leak through discovery.
+            assert "api_key" not in alias_entry
+            assert "base_url" not in alias_entry
             assert "sk-route-secret" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("supports_vision", [True, False])
+    async def test_models_endpoint_uses_configured_custom_provider_vision_capability(
+        self, monkeypatch, supports_vision
+    ):
+        routes = {
+            "avatar": {
+                "model": "bb-avatar",
+                "provider": "custom:gateway",
+                "api_key": "sk-avatar-secret",
+                "base_url": "https://gateway.invalid/v1",
+            }
+        }
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        config = {
+            "model": {
+                "provider": "unrelated-default",
+                "supports_vision": not supports_vision,
+            },
+            "providers": {
+                "gateway": {
+                    "models": {
+                        "bb-avatar": {"supports_vision": supports_vision}
+                    }
+                }
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            assert resp.status == 200
+            data = await resp.json()
+            avatar = next(m for m in data["data"] if m["id"] == "avatar")
+            assert avatar["capabilities"]["vision"] is supports_vision
+            assert "api_key" not in avatar
+            assert "base_url" not in avatar
+            assert "sk-avatar-secret" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_models_endpoint_preserves_virtual_model_when_route_alias_collides(self):
+        adapter = _make_routing_adapter(
+            {
+                "hermes-agent": {
+                    "model": "openai/gpt-5",
+                    "provider": "openai",
+                }
+            }
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            assert resp.status == 200
+            data = await resp.json()
+            ids = [model["id"] for model in data["data"]]
+            assert len(ids) == len(set(ids))
+            assert ids == [adapter._model_name]
+            virtual = data["data"][0]
+            assert virtual["id"] == adapter._model_name
+            assert virtual["root"] == adapter._model_name
+            assert virtual["parent"] is None
+
+    @pytest.mark.asyncio
+    async def test_models_endpoint_requires_explicit_capability_without_network_discovery(self, monkeypatch):
+        adapter = _make_routing_adapter({
+            "avatar": {"model": "bb-avatar", "provider": "custom:gateway"}
+        })
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        lookups = []
+
+        def catalog(provider, model, *, allow_network=False):
+            lookups.append(allow_network)
+            return types.SimpleNamespace(supports_vision=True)
+
+        monkeypatch.setattr("agent.models_dev.get_model_capabilities", catalog)
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.get("/v1/models")
+            payload = await response.json()
+        avatar = next(model for model in payload["data"] if model["id"] == "avatar")
+        assert avatar["capabilities"]["vision"] is False
+        assert not any(lookups), "model discovery must not authorize an outbound capability query"
 
 
 class TestModelRoutesHandlers:

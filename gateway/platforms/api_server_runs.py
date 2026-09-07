@@ -80,6 +80,147 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._run_approval_sessions: Dict[str, str] = {}
 
 
+def _strict_constructed_base_url(agent: Any) -> Any:
+    """The endpoint the constructed agent's client actually dials.
+
+    Prefers the live client's own ``base_url`` (the URL requests go to);
+    falls back to the agent attribute for client-less transports. Returned
+    raw — confirmation decides whether it is an admissible endpoint.
+    """
+    client = getattr(agent, "client", None)
+    url = getattr(client, "base_url", None) if client is not None else None
+    if url is None:
+        url = getattr(agent, "base_url", None)
+    return url
+
+
+def _strict_constructed_provider(agent: Any, base_url: Any) -> Any:
+    """Canonical identity of the constructed agent's provider.
+
+    Named custom providers resolve to the billing class ``custom``; the
+    routable identity is recovered from the endpoint the client dials
+    (``find_custom_provider_identity``), never from config-default recovery.
+    An unrecoverable identity stays ``custom`` and fails the equality check.
+    """
+    provider = getattr(agent, "provider", None)
+    if provider != "custom":
+        return provider
+    try:
+        from hermes_cli.runtime_provider import find_custom_provider_identity
+
+        recovered = find_custom_provider_identity(str(base_url or ""))
+    except Exception:
+        recovered = None
+    return recovered or provider
+
+
+def _confirm_strict_run_before_inference(
+    self,
+    agent: Any,
+    _strict,
+    *,
+    strict: Dict[str, Any],
+    strict_runtime_request: Dict[str, Any],
+    session_id: str,
+) -> Dict[str, Any]:
+    """Confirm runtime, image capability and the effective-session lock.
+
+    Runs after admission and agent construction, BEFORE run_conversation.
+    Every check reads the constructed agent, not the request. Raises
+    ``StrictRunError`` with a safe code so the caller fails the run without
+    a provider request. Returns the confirmed ``run.runtime`` descriptor.
+    """
+    base_url = _strict_constructed_base_url(agent)
+    provider = _strict_constructed_provider(agent, base_url)
+    if getattr(agent, "_fallback_activated", False) is True:
+        raise _strict.StrictRunError(
+            "runtime_mismatch",
+            "Strict runtime mismatch: a fallback provider was activated at "
+            "construction; refusing before inference.",
+        )
+    runtime = _strict.confirm_strict_runtime(
+        requested_model=strict["model"],
+        requested_provider=strict["provider"],
+        actual_model=getattr(agent, "model", None),
+        actual_provider=provider,
+        actual_base_url=base_url,
+        route_source=strict_runtime_request.get("route_source") or "raw_request",
+        tool_policy=strict["tool_policy"],
+        require_image_input=strict["require_image_input"],
+        has_image=strict["has_image"],
+    )
+    if strict["has_image"]:
+        try:
+            supports_vision = agent._model_supports_vision(
+                requested_provider=runtime["provider"], require_configured_model=True,
+            )
+        except Exception:
+            supports_vision = False
+        if supports_vision is not True:
+            raise _strict.StrictRunError(
+                "image_capability_unavailable",
+                "Strict image turn refused: the resolved model has no confirmed "
+                "native image capability.",
+            )
+
+    # The effective session must carry the confirmed lock before inference.
+    # The row is created lazily by the agent; make it exist now so the lock
+    # is durable, then read the real persisted lock back.
+    try:
+        agent._ensure_db_session()
+    except Exception:
+        logger.debug("[%s] strict run: session row creation failed", self.name, exc_info=True)
+    lock = _strict_persisted_lock(self, _strict, session_id)
+    if _strict.strict_session_lock_conflict(
+        requested_model=strict["model"],
+        requested_provider=strict["provider"],
+        persisted_lock=lock,
+        session_model_override=None,
+    ):
+        raise _strict.StrictRunError(
+            "model_lock_conflict",
+            "Session has a confirmed model lock for a different model/provider; "
+            "refusing the strict request.",
+        )
+
+    def _matches(entry: Optional[Dict[str, Any]]) -> bool:
+        return (
+            isinstance(entry, dict)
+            and entry.get("model") == strict["model"]
+            and entry.get("provider") == strict["provider"]
+        )
+
+    if not _matches(lock):
+        # No lock, or a non-conflicting partial one: persist the strict pair
+        # now (admission and runtime confirmation already passed), then read
+        # the durable row back rather than trusting the write.
+        self._persist_session_runtime_lock(session_id, strict_runtime_request)
+        lock = _strict_persisted_lock(self, _strict, session_id)
+    if not _matches(lock):
+        raise _strict.StrictRunError(
+            "model_lock_unconfirmed",
+            "Strict run refused: the effective session model lock could not be confirmed.",
+        )
+    runtime["model_lock"] = True
+    return runtime
+
+
+def _strict_persisted_lock(self, _strict, session_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The confirmed ``browser_model_lock`` on *session_id*'s row, if any."""
+    if not session_id:
+        return None
+    db = self._ensure_session_db()
+    if db is None:
+        return None
+    try:
+        row = db.get_session(session_id)
+    except Exception:
+        return None
+    if not isinstance(row, dict):
+        return None
+    return _strict.parse_persisted_browser_lock(row.get("model_config"))
+
+
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs),
@@ -481,21 +622,110 @@ async def _handle_runs(
         else ""
     )
 
+    from gateway.platforms import api_server_strict_runs as _strict
+
     raw_input = body.get("input")
     if not raw_input:
         return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-    user_message = (
-        raw_input
-        if isinstance(raw_input, str)
-        else (
-            raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
+    # ── Strict discriminated protocol (hermes.strict_run.v1) ─────────────
+    # A dict input is strict: validated exactly, fail-closed, BEFORE any
+    # idempotency reservation, concurrency admission, or agent creation.
+    # Legacy string/list input keeps its documented behavior untouched.
+    strict = None
+    strict_runtime_request: Optional[Dict[str, Any]] = None
+    strict_user_message: List[Dict[str, Any]] = []
+    if _strict.is_strict_run_input(raw_input):
+        try:
+            strict = _strict.parse_strict_body(body)
+            if strict["has_image"]:
+                # Full decode of a bounded frame — off the event loop.
+                await asyncio.to_thread(
+                    _strict.validate_strict_image_data_url, strict["image_url"]
+                )
+        except _strict.StrictRunError as exc:
+            return web.json_response(
+                _openai_error(exc.message, code=exc.code), status=400
+            )
+
+        strict_runtime_request = self._session_runtime_request_from_body(body)
+        strict_runtime_request["require_model_lock"] = True
+        lock_error = self._runtime_lock_error(strict_runtime_request)
+        if lock_error is not None:
+            return lock_error
+        # A model_routes alias pinned to another provider (or pinning route
+        # credentials without one) is an ambiguous runtime for an explicit
+        # strict provider: refuse before any agent work. The session-override
+        # bypass is deliberately not offered here — strict runs never resolve
+        # through a session /model override.
+        route_conflict = self._request_route_conflict_error(
+            session_id=None,
+            gateway_session_key=None,
+            requested_model=strict["model"],
+            requested_provider=strict["provider"],
+            route=strict_runtime_request.get("route"),
         )
-    )
-    if not user_message:
-        return web.json_response(
-            _openai_error("No user message found in input"), status=400
+        if route_conflict:
+            # Fixed text: the legacy message quotes the alias; strict errors
+            # never echo request fields.
+            return web.json_response(
+                _openai_error(
+                    "Strict run model/provider pair conflicts with the configured model route.",
+                    code="model_route_conflict",
+                ),
+                status=400,
+            )
+
+        # Resolve the effective conversation session ONCE, with the same
+        # precedence the run uses below: explicit body session_id, then the
+        # conversation declared via X-Hermes-Session-Key. Real explicit locks
+        # only: a confirmed model lock on THAT row or a gateway /model
+        # override may conflict with the strict request. A historical
+        # last-used model on the session row is not a lock and never
+        # conflicts. Nothing is written here: the lock is persisted and
+        # confirmed only after admission and runtime confirmation.
+        strict_effective_session = (
+            strict.get("session_id")
+            or self._declared_conversation_session(gateway_session_key)
         )
+        persisted_lock = _strict_persisted_lock(self, _strict, strict_effective_session)
+        strict_session_override = self._session_model_override_for(
+            gateway_session_key or strict_effective_session
+        )
+        lock_conflict = _strict.strict_session_lock_conflict(
+            requested_model=strict["model"],
+            requested_provider=strict["provider"],
+            persisted_lock=persisted_lock,
+            session_model_override=strict_session_override,
+        )
+        if lock_conflict:
+            return web.json_response(
+                _openai_error(lock_conflict, code="model_lock_conflict"),
+                status=409,
+            )
+
+        strict_user_message = list(strict["text_parts"])
+        if strict["has_image"]:
+            strict_user_message.append(
+                {"type": "image_url", "image_url": {"url": strict["image_url"]}}
+            )
+
+    if strict is not None:
+        # Strict content is never stringified: the parts list reaches the
+        # agent exactly as normalized, images intact.
+        user_message = strict_user_message
+    else:
+        user_message = (
+            raw_input
+            if isinstance(raw_input, str)
+            else (
+                raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
+            )
+        )
+        if not user_message:
+            return web.json_response(
+                _openai_error("No user message found in input"), status=400
+            )
 
     instructions = body.get("instructions")
     previous_response_id = body.get("previous_response_id")
@@ -547,15 +777,30 @@ async def _handle_runs(
     session_id = body.get("session_id") or stored_session_id
     route = self._resolve_route(body.get("model"))
     agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
-    selection_error = self._request_route_conflict_error(
-        session_id=session_id,
-        gateway_session_key=gateway_session_key,
-        requested_model=agent_overrides.get("requested_model"),
-        requested_provider=agent_overrides.get("requested_provider"),
-        route=route,
-    )
-    if selection_error:
-        return web.json_response(_openai_error(selection_error), status=400)
+    if strict is not None:
+        # Strict runs resolve their route through the same runtime-request
+        # semantics (alias routes keep their pinned provider/base_url), and
+        # carry per-request controls instead of the generic override dict.
+        route = strict_runtime_request.get("route")
+        agent_overrides = {
+            "requested_model": strict["model"],
+            "requested_provider": strict["provider"],
+            "strict_controls": {
+                "tool_policy": strict["tool_policy"],
+                "require_image_input": strict["require_image_input"],
+                "has_image": strict["has_image"],
+            },
+        }
+    else:
+        selection_error = self._request_route_conflict_error(
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            requested_model=agent_overrides.get("requested_model"),
+            requested_provider=agent_overrides.get("requested_provider"),
+            route=route,
+        )
+        if selection_error:
+            return web.json_response(_openai_error(selection_error), status=400)
 
     # A lost-acceptance replay must resolve even while the original run
     # consumes the final concurrency slot. This read does not reserve a
@@ -716,6 +961,7 @@ async def _handle_runs(
     )
 
     async def _run_and_close():
+        strict_runtime = None
         try:
             self._set_run_status(run_id, "running")
             if run_id in self._stopping_run_ids:
@@ -743,8 +989,20 @@ async def _handle_runs(
                     route=route,
                     room_dispatch=room_dispatch,
                     room_execution_policy=room_execution_policy,
+                    strict_controls=agent_overrides.get("strict_controls"),
                 )
             self._active_run_agents[run_id] = agent
+
+            def _publish_strict_runtime(runtime: Dict[str, Any]) -> None:
+                """Queue run.runtime and merge it into status — called on the
+                executor thread after confirmation, before run_conversation."""
+                self._set_run_status(run_id, "running", runtime=runtime)
+                loop.call_soon_threadsafe(_put_event_if_active, {
+                    "event": "run.runtime",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "runtime": runtime,
+                })
 
             def _approval_notify(approval_data: Dict[str, Any]) -> None:
                 event = dict(approval_data or {})
@@ -778,6 +1036,7 @@ async def _handle_runs(
                     pass
 
             def _run_sync():
+                nonlocal strict_runtime
                 from gateway.session_context import clear_session_vars
                 from tools.approval import (
                     register_gateway_notify,
@@ -831,11 +1090,45 @@ async def _handle_runs(
                         # ownership so stop/cancel can reap only the
                         # background processes this run created (#76115).
                         _publish_turn_process_ownership(agent, effective_task_id)
-                        r = agent.run_conversation(
-                            user_message=user_message,
-                            conversation_history=conversation_history,
-                            task_id=effective_task_id,
-                        )
+                        refusal = None
+                        if strict is not None:
+                            # Confirm the CONSTRUCTED runtime, image capability
+                            # and the effective-session lock now — after
+                            # admission, before any provider request. A
+                            # refusal is a terminal failure with a safe code;
+                            # run_conversation never starts.
+                            try:
+                                strict_runtime = _confirm_strict_run_before_inference(
+                                    self,
+                                    agent,
+                                    _strict,
+                                    strict=strict,
+                                    strict_runtime_request=strict_runtime_request,
+                                    session_id=session_id,
+                                )
+                            except _strict.StrictRunError as exc:
+                                logger.warning(
+                                    "[%s] strict run %s refused before inference: %s %s",
+                                    self.name, run_id, exc.code, exc.message,
+                                )
+                                refusal = {
+                                    "final_response": exc.message,
+                                    "completed": False,
+                                    "failed": True,
+                                    "error": exc.message,
+                                    "error_code": exc.code,
+                                    "failure_retryable": False,
+                                }
+                            else:
+                                _publish_strict_runtime(strict_runtime)
+                        if refusal is not None:
+                            r = refusal
+                        else:
+                            r = agent.run_conversation(
+                                user_message=user_message,
+                                conversation_history=conversation_history,
+                                task_id=effective_task_id,
+                            )
                     finally:
                         # Worker finished (interrupted or complete) —
                         # clear turn ownership immediately so a later
@@ -897,23 +1190,31 @@ async def _handle_runs(
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
+                    **({"runtime": strict_runtime} if strict_runtime else {}),
                 )
             # Check for structured failure (non-retryable client errors like
             # 401/400 return failed=True instead of raising, so the except
             # block below never fires — issue #15561).
             elif isinstance(result, dict) and result.get("failed"):
                 error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                error_code = result.get("error_code")
+                error_fields = (
+                    {"error_code": str(error_code)} if isinstance(error_code, str) and error_code else {}
+                )
                 _put_event_if_active({
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "error": error_msg,
+                    **error_fields,
                 })
                 self._set_run_status(
                     run_id,
                     "failed",
                     error=error_msg,
                     last_event="run.failed",
+                    **error_fields,
+                    **({"runtime": strict_runtime} if strict_runtime else {}),
                 )
             else:
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -937,6 +1238,7 @@ async def _handle_runs(
                     output=final_response,
                     usage=usage,
                     last_event="run.completed",
+                    **({"runtime": strict_runtime} if strict_runtime else {}),
                     **({"pending_steer": pending_steer} if pending_steer else {}),
                 )
         except asyncio.CancelledError:
@@ -944,6 +1246,7 @@ async def _handle_runs(
                 run_id,
                 "cancelled",
                 last_event="run.cancelled",
+                **({"runtime": strict_runtime} if strict_runtime else {}),
             )
             try:
                 _put_event_if_active({
@@ -969,6 +1272,7 @@ async def _handle_runs(
                 "failed",
                 error=error_msg,
                 last_event="run.failed",
+                **({"runtime": strict_runtime} if strict_runtime else {}),
             )
             try:
                 _put_event_if_active({
@@ -986,6 +1290,7 @@ async def _handle_runs(
                 "failed",
                 error=_redact_api_error_text(exc),
                 last_event="run.failed",
+                **({"runtime": strict_runtime} if strict_runtime else {}),
             )
             try:
                 _put_event_if_active({

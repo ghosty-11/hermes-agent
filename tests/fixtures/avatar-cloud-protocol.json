@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "description": "Synthetic interoperability vectors; never production credentials or screenshots",
+  "client_token_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "vectors": [
+    {
+      "text": "Describe what is currently visible on my desktop.",
+      "image": {
+        "source": "screen",
+        "mime_type": "image/png",
+        "data": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAFUlEQVR4nGMU13VmYGBgYGBgYoABAAmOAIvSZeoDAAAAAElFTkSuQmCC"
+      },
+      "claims": {
+        "context_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "destination": "bb-avatar",
+        "expires_at": 1800000030000,
+        "image_sha256": "2c54852388dd43ccab88b67b4900bdd53499a2e059f809a6466fa24f5b580ccf",
+        "issued_at": 1800000000000,
+        "mime_type": "image/png",
+        "question_sha256": "f96319d07481a26a94826616837891daa1124aa4093f57bdcc3a964840b00872",
+        "request_id": "123e4567-e89b-42d3-a456-426614174000",
+        "source": "screen",
+        "version": 1
+      },
+      "canonical_claims": "{\"context_token\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"destination\":\"bb-avatar\",\"expires_at\":1800000030000,\"image_sha256\":\"2c54852388dd43ccab88b67b4900bdd53499a2e059f809a6466fa24f5b580ccf\",\"issued_at\":1800000000000,\"mime_type\":\"image/png\",\"question_sha256\":\"f96319d07481a26a94826616837891daa1124aa4093f57bdcc3a964840b00872\",\"request_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"source\":\"screen\",\"version\":1}",
+      "approval": "eyJjb250ZXh0X3Rva2VuIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsImRlc3RpbmF0aW9uIjoiYmItYXZhdGFyIiwiZXhwaXJlc19hdCI6MTgwMDAwMDAzMDAwMCwiaW1hZ2Vfc2hhMjU2IjoiMmM1NDg1MjM4OGRkNDNjY2FiODhiNjdiNDkwMGJkZDUzNDk5YTJlMDU5ZjgwOWE2NDY2ZmEyNGY1YjU4MGNjZiIsImlzc3VlZF9hdCI6MTgwMDAwMDAwMDAwMCwibWltZV90eXBlIjoiaW1hZ2UvcG5nIiwicXVlc3Rpb25fc2hhMjU2IjoiZjk2MzE5ZDA3NDgxYTI2YTk0ODI2NjE2ODM3ODkxZGFhMTEyNGFhNDA5M2Y1N2JkY2MzYTk2NDg0MGIwMDg3MiIsInJlcXVlc3RfaWQiOiIxMjNlNDU2Ny1lODliLTQyZDMtYTQ1Ni00MjY2MTQxNzQwMDAiLCJzb3VyY2UiOiJzY3JlZW4iLCJ2ZXJzaW9uIjoxfQ.xL20G6lUaT-8Os-TIIeAM1jpVmoDarRyxPS1-deKTIw",
+      "verify_at_ms": 1800000001000
+    },
+    {
+      "text": "Explain the fenêtre title.",
+      "image": {
+        "source": "screen",
+        "mime_type": "image/jpeg",
+        "data": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAMDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDyiiiiu04z/9k="
+      },
+      "claims": {
+        "context_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "destination": "bb-avatar",
+        "expires_at": 1800000030000,
+        "image_sha256": "75a8d0fe74d065be198bd3316f0dbd90a467fde20839b574e52b7a419a8b9155",
+        "issued_at": 1800000000000,
+        "mime_type": "image/jpeg",
+        "question_sha256": "fa93d02cd8d1cb495c4468288383047206fefc21ad2af27f9e63aa6b09315c2c",
+        "request_id": "123e4567-e89b-42d3-a456-426614174001",
+        "source": "screen",
+        "version": 1
+      },
+      "canonical_claims": "{\"context_token\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"destination\":\"bb-avatar\",\"expires_at\":1800000030000,\"image_sha256\":\"75a8d0fe74d065be198bd3316f0dbd90a467fde20839b574e52b7a419a8b9155\",\"issued_at\":1800000000000,\"mime_type\":\"image/jpeg\",\"question_sha256\":\"fa93d02cd8d1cb495c4468288383047206fefc21ad2af27f9e63aa6b09315c2c\",\"request_id\":\"123e4567-e89b-42d3-a456-426614174001\",\"source\":\"screen\",\"version\":1}",
+      "approval": "eyJjb250ZXh0X3Rva2VuIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsImRlc3RpbmF0aW9uIjoiYmItYXZhdGFyIiwiZXhwaXJlc19hdCI6MTgwMDAwMDAzMDAwMCwiaW1hZ2Vfc2hhMjU2IjoiNzVhOGQwZmU3NGQwNjViZTE5OGJkMzMxNmYwZGJkOTBhNDY3ZmRlMjA4MzliNTc0ZTUyYjdhNDE5YThiOTE1NSIsImlzc3VlZF9hdCI6MTgwMDAwMDAwMDAwMCwibWltZV90eXBlIjoiaW1hZ2UvanBlZyIsInF1ZXN0aW9uX3NoYTI1NiI6ImZhOTNkMDJjZDhkMWNiNDk1YzQ0NjgyODgzODMwNDcyMDZmZWZjMjFhZDJhZjI3ZjllNjNhYTZiMDkzMTVjMmMiLCJyZXF1ZXN0X2lkIjoiMTIzZTQ1NjctZTg5Yi00MmQzLWE0NTYtNDI2NjE0MTc0MDAxIiwic291cmNlIjoic2NyZWVuIiwidmVyc2lvbiI6MX0.QWJ5vYapyax-eBUlAq_oG3mLu_cdfS6Q9Hcx4urfnNc",
+      "verify_at_ms": 1800000001000
+    }
+  ]
+}

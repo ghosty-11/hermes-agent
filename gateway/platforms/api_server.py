@@ -1486,6 +1486,30 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+
+def _lookup_supports_vision(
+    provider: str,
+    model: str,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    requested_provider: str = "",
+) -> Optional[bool]:
+    """Read only this route's explicit model declaration; never perform discovery."""
+    try:
+        from agent.image_routing import _supports_vision_override
+    except Exception:
+        return None
+    try:
+        declared = {
+            key: config.get(key) for key in ("providers", "custom_providers")
+        } if isinstance(config, dict) else {}
+        return _supports_vision_override(
+            declared, provider, model, requested_provider=requested_provider,
+        )
+    except Exception:
+        return None
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -2545,10 +2569,6 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
-    # ------------------------------------------------------------------
-    # Agent creation helper
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _parse_model_routes(raw: Any) -> Dict[str, Dict[str, Any]]:
         """Validate and normalize the ``model_routes`` config block.
@@ -2922,6 +2942,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        strict_controls: Optional[Dict[str, Any]] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -2968,6 +2989,13 @@ class APIServerAdapter(BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        ``strict_controls`` marks a ``hermes.strict_run.v1`` run. The agent
+        is built from the explicitly requested provider alone (no global
+        seed, no session override, no fallback chain, no legacy per-provider
+        fallback resolver); ``tool_policy: none`` empties the tool surface
+        and pins it across snapshot rebuilds. The caller confirms the
+        constructed runtime against the request before inference.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2980,6 +3008,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
+        strict_run = strict_controls is not None
         # Catch RuntimeError ONLY around this call, not the wider
         # _create_agent()+run_conversation() span --
         # _resolve_runtime_agent_kwargs() is the sole raiser of
@@ -2988,10 +3017,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # _ProviderAuthResolutionError lets _run_agent() (and
         # _handle_runs()) distinguish this from an unrelated RuntimeError
         # elsewhere in the call graph.
-        try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
-        except RuntimeError as exc:
-            raise _ProviderAuthResolutionError(str(exc)) from exc
+        #
+        # A strict run (hermes.strict_run.v1) never seeds from the global
+        # resolver: that path may fall through to the configured fallback
+        # provider chain, and a strict runtime is exactly the explicitly
+        # requested provider or nothing. Its kwargs come solely from the
+        # requested-provider resolution below.
+        if strict_run:
+            runtime_kwargs: Dict[str, Any] = {}
+        else:
+            try:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+            except RuntimeError as exc:
+                raise _ProviderAuthResolutionError(str(exc)) from exc
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -3031,6 +3069,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     target_model=target_model or None,
                 )
             except Exception as exc:
+                if strict_run:
+                    # Strict runs resolve ONLY the explicit requested
+                    # provider: no legacy per-provider fallback resolver,
+                    # no silent reuse of other credentials.
+                    raise _ProviderAuthResolutionError(str(exc)) from exc
                 try:
                     from gateway.run import _resolve_runtime_agent_kwargs_for_provider
 
@@ -3062,7 +3105,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
         session_override = None
-        if not confirmed_runtime_lock:
+        # A confirmed lock and a strict run are both execution contracts on
+        # the explicit requested pair: neither resolves through a session
+        # /model override or a session-persisted model.
+        if not confirmed_runtime_lock and not strict_run:
             session_override = self._session_model_override_for(session_key)
         # Model-string precedence delegates to the shared owner
         # hermes_cli.model_switch.resolve_effective_model (session /model
@@ -3193,7 +3239,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     _resolved_key, _recovered,
                 )
                 model = _recovered
-        elif model:
+        elif model and not strict_run:
+            # A strict run's model is a per-request execution contract, not
+            # a last-known-good default for other clients' empty-model
+            # recovery.
             if model != self._model_name:
                 if _resolved_key:
                     self._last_resolved_model[_resolved_key] = model
@@ -3213,7 +3262,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
             None
-            if confirmed_runtime_lock
+            if confirmed_runtime_lock or strict_run
             else GatewayRunner._load_fallback_model()
         )
 
@@ -3255,6 +3304,24 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if strict_run:
+            # Per-request strict-run controls (hermes.strict_run.v1). They
+            # gate this agent instance only — global/profile toolsets and
+            # every other caller are untouched.
+            agent._hermes_strict_run = True
+            agent._strict_no_tools = strict_controls.get("tool_policy") == "none"
+            agent._strict_force_native_images = bool(strict_controls.get("has_image"))
+            if agent._strict_no_tools:
+                # Exposure-level denial: no tool definitions and no valid
+                # dispatch names for this agent. The shared tool-snapshot
+                # rebuild (between-turns MCP refresh, compaction commit,
+                # /reload-mcp) skips strict no-tools agents, the request
+                # builder drops tools at the wire, and every dispatch entry
+                # point re-checks the flag, so a fabricated provider tool
+                # call still executes zero handlers.
+                agent.tools = []
+                agent.valid_tool_names = set()
+                agent._skip_mcp_refresh = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3349,7 +3416,6 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-
         now = int(time.time())
         # Middleware already entered the profile runtime scope when a /p/
         # prefix was present, so get_active_profile_name() resolves correctly.
@@ -3358,6 +3424,12 @@ class APIServerAdapter(BasePlatformAdapter):
             if _api_request_profile.get()
             else self._model_name
         )
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
         models = [
             {
                 "id": model_name,
@@ -3374,7 +3446,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # credentials.
         for alias, route_cfg in self._model_routes.items():
             if alias == model_name:
-                continue  # already listed above
+                continue
+            # The backend gates capture on this metadata; expose only
+            # capability shape, never provider credentials.
+            vision_capable = _lookup_supports_vision(
+                route_cfg.get("provider") or "",
+                route_cfg.get("model") or alias,
+                config=config,
+                requested_provider=route_cfg.get("provider") or "",
+            )
             models.append({
                 "id": alias,
                 "object": "model",
@@ -3383,8 +3463,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "permission": [],
                 "root": route_cfg.get("model", alias),
                 "parent": model_name,
+                "capabilities": {"vision": vision_capable is True},
             })
-
         return web.json_response({"object": "list", "data": models})
 
     async def _handle_model_options(self, request: "web.Request") -> "web.Response":
@@ -3476,6 +3556,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "strict_runs": {
+                    "protocol_version": 1,
+                    "input_type": "hermes.strict_run.v1",
+                    "model_lock": True,
+                    "tool_policy_none": True,
+                    "require_image_input": True,
+                    "zero_retries": True,
+                    "max_image_bytes": 3145728,
+                    "max_image_pixels": 4000000,
+                },
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,

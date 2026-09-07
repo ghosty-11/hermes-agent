@@ -1099,6 +1099,42 @@ def _begin_tool_execution(
             pass
 
 
+def _refuse_strict_tool_calls(agent, assistant_message, messages: list, effective_task_id: str) -> bool:
+    """Deny every dispatch entry when ``tool_policy:none`` is enforced.
+
+    Appends one refusal tool result per fabricated call so the conversation
+    stays provider-consistent, fires the terminal post-tool hook, and
+    returns True for callers to skip dispatch entirely. Zero handlers run.
+    """
+    if getattr(agent, "_strict_no_tools", False) is not True:
+        return False
+    refusal = json.dumps(
+        {"error": "Tool execution is not permitted for this run."},
+        ensure_ascii=False,
+    )
+    for tool_call in list(getattr(assistant_message, "tool_calls", None) or []):
+        call_id = _pairing_tool_call_id(tool_call)
+        function = getattr(tool_call, "function", None)
+        function_name = getattr(function, "name", "") or ""
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": refusal,
+        })
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args={},
+            result=refusal,
+            effective_task_id=effective_task_id,
+            tool_call_id=call_id,
+            status="refused_strict_no_tools",
+            error_type="StrictNoTools",
+            error_message="Tool execution is not permitted for this run.",
+        )
+    return True
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -1109,6 +1145,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     and /steer injection — used when this call is one segment of a larger
     mixed batch and the segmented dispatcher owns the turn-end work.
     """
+    if _refuse_strict_tool_calls(agent, assistant_message, messages, effective_task_id):
+        return
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
 
@@ -1964,6 +2002,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     and /steer injection — used when this call is one segment of a larger
     mixed batch and the segmented dispatcher owns the turn-end work.
     """
+    if _refuse_strict_tool_calls(agent, assistant_message, messages, effective_task_id):
+        return
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
 
@@ -2899,6 +2939,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     *k+1..n* without executing them while preserving one result per
     tool_call_id.
     """
+    if _refuse_strict_tool_calls(agent, assistant_message, messages, effective_task_id):
+        return
     from types import SimpleNamespace
 
     if segments is None:
