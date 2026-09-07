@@ -2075,6 +2075,9 @@ def dump_api_request_debug(
     like timeout). Intended for debugging provider-side 4xx failures where
     retries are not useful.
     """
+    # Strict turns must not leave a request-body archive, even in debug mode.
+    if getattr(agent, "_hermes_strict_run", False) is True:
+        return None
     try:
         body = copy.deepcopy(api_kwargs)
         body.pop("timeout", None)

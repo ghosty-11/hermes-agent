@@ -541,3 +541,21 @@ def test_strict_json_snapshot_redacts_images_without_mutating_request(tmp_path):
     assert image_url.split(",", 1)[1] not in stored
     assert "[screenshot]" in stored
     assert messages == original
+
+
+def test_strict_request_debug_dump_never_archives_or_prints_pixels(tmp_path, monkeypatch, capsys):
+    agent = _make_agent()
+    agent._hermes_strict_run = True
+    agent.logs_dir = tmp_path
+    agent.session_id = "strict-request-dump"
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+    messages = _image_history()
+    image_url = messages[0]["content"][1]["image_url"]["url"]
+    result = agent._dump_api_request_debug(
+        {"model": "bb-avatar", "messages": messages},
+        reason="preflight",
+        error=RuntimeError(image_url),
+    )
+    assert result is None
+    assert not list(tmp_path.glob("request_dump_*.json"))
+    assert image_url not in capsys.readouterr().out
