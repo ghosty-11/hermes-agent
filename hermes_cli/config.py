@@ -1693,6 +1693,7 @@ def _normalize_custom_provider_entry(
         "defaultModel": "default_model",
         "contextLength": "context_length",
         "rateLimitDelay": "rate_limit_delay",
+        "sessionAffinityHeader": "session_affinity_header",
     }
     # api_key_env is a documented snake_case alias for key_env (see
     # website/docs/guides/azure-foundry.md).  Normalize it up front so the
@@ -1712,7 +1713,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers", "capabilities",
-        "ssl_ca_cert", "ssl_verify",
+        "ssl_ca_cert", "ssl_verify", "session_affinity_header",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -1869,10 +1870,11 @@ def _normalize_custom_provider_entry(
     if normalized_headers:
         normalized["extra_headers"] = normalized_headers
 
+    if isinstance(entry.get("session_affinity_header"), str) and entry["session_affinity_header"].strip():
+        normalized["session_affinity_header"] = entry["session_affinity_header"].strip()
     ssl_ca_cert = entry.get("ssl_ca_cert")
     if isinstance(ssl_ca_cert, str) and ssl_ca_cert.strip():
         normalized["ssl_ca_cert"] = ssl_ca_cert.strip()
-
     ssl_verify = entry.get("ssl_verify")
     if isinstance(ssl_verify, bool):
         normalized["ssl_verify"] = ssl_verify
@@ -1908,6 +1910,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "session_affinity_header",
         "ssl_ca_cert",
         "ssl_verify",
     ):
@@ -2102,6 +2105,43 @@ def get_custom_provider_extra_headers(
             return headers
     return {}
 
+
+def get_custom_provider_session_affinity_header(
+    base_url: Optional[str] = None,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
+) -> Optional[str]:
+    """Return a configured session-affinity header for the selected route."""
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            custom_providers = []
+    if not isinstance(custom_providers, list):
+        return None
+
+    want_provider = str(provider or "").strip().lower()
+    target_url = normalize_route_base_url(base_url) if base_url else ""
+    if not target_url and not want_provider:
+        return None
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        header = entry.get("session_affinity_header")
+        if not isinstance(header, str) or not header.strip():
+            continue
+        entry_url = normalize_route_base_url(entry.get("base_url"))
+        if target_url:
+            if not entry_url or entry_url != target_url:
+                continue
+        else:
+            entry_provider = str(entry.get("provider_key") or "").strip().lower()
+            entry_name = str(entry.get("name") or "").strip().lower()
+            if want_provider not in {entry_provider, entry_name}:
+                continue
+        return header.strip()
+    return None
 
 def apply_custom_provider_extra_headers_to_client_kwargs(
     client_kwargs: Dict[str, Any],

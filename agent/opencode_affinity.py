@@ -43,6 +43,19 @@ def is_opencode_target(provider: Optional[str], base_url: Optional[str]) -> bool
         return False
 
 
+def resolve_affinity_key(session_id: Optional[str] = None) -> str:
+    """Return the normalized rotation-stable conversation affinity key."""
+    try:
+        from agent.portal_tags import get_affinity_scope, get_conversation_context
+        from agent.transports.codex import _cache_scope_from_session_id
+
+        return _cache_scope_from_session_id(
+            get_affinity_scope() or get_conversation_context() or session_id
+        )
+    except Exception:
+        return str(session_id or "")
+
+
 def opencode_session_headers(
     provider: Optional[str],
     base_url: Optional[str],
@@ -51,16 +64,28 @@ def opencode_session_headers(
     """Return ``{"x-opencode-session": <key>}`` for OpenCode targets, else ``{}``."""
     if not is_opencode_target(provider, base_url):
         return {}
-    try:
-        from agent.portal_tags import get_affinity_scope, get_conversation_context
-        from agent.transports.codex import _cache_scope_from_session_id
-
-        key = _cache_scope_from_session_id(
-            get_affinity_scope() or get_conversation_context() or session_id
-        )
-    except Exception:
-        key = str(session_id or "")
+    key = resolve_affinity_key(session_id)
     return {OPENCODE_SESSION_HEADER: key} if key else {}
+
+
+def custom_provider_session_affinity_headers(
+    provider: Optional[str],
+    base_url: Optional[str],
+    session_id: Optional[str] = None,
+) -> dict[str, str]:
+    """Return a configured generic affinity header, or ``{}``."""
+    try:
+        from hermes_cli.config import get_custom_provider_session_affinity_header
+
+        header = get_custom_provider_session_affinity_header(
+            base_url=base_url, provider=provider
+        )
+        if not header:
+            return {}
+        key = resolve_affinity_key(session_id)
+        return {header: key} if key else {}
+    except Exception:
+        return {}
 
 
 def merge_opencode_session_headers(
@@ -69,12 +94,12 @@ def merge_opencode_session_headers(
     base_url: Optional[str],
     session_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Merge the affinity header into ``kwargs["extra_headers"]`` (in place).
-
-    Existing per-request headers win, so a caller-pinned value is preserved.
-    Non-OpenCode targets are left untouched.
-    """
+    """Merge OpenCode or configured provider affinity into ``extra_headers``."""
     headers = opencode_session_headers(provider, base_url, session_id)
+    if not headers:
+        headers = custom_provider_session_affinity_headers(
+            provider, base_url, session_id
+        )
     if headers:
         existing = kwargs.get("extra_headers")
         merged = dict(existing) if isinstance(existing, dict) else {}
@@ -82,3 +107,5 @@ def merge_opencode_session_headers(
             merged.setdefault(key, value)
         kwargs["extra_headers"] = merged
     return kwargs
+
+
