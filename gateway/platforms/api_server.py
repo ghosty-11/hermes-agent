@@ -2215,7 +2215,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — hermes-agent plus configured model_routes aliases (alias + resolved
         model only, never credentials). Under /p/<profile>/ the primary id follows that profile."""
-        from agent.image_routing import _lookup_declared_supports_vision
+        from agent.image_routing import _lookup_declared_supports_vision, _supports_vision_override
         from hermes_cli.config import load_config, split_model_config_default
 
         try:
@@ -2230,8 +2230,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             primary_provider = _clean_request_string(model_cfg.get("provider")) or default_provider
         else:
             primary_model, primary_provider = split_model_config_default(model_cfg)
-        primary_vision = _lookup_declared_supports_vision(
-            primary_provider, primary_model, config, requested_provider=primary_provider,
+        primary_vision = _supports_vision_override(
+            config, primary_provider, primary_model, requested_provider=primary_provider,
         )
         now = int(time.time())
         # The middleware already entered the profile scope, so get_active_profile_name() resolves.

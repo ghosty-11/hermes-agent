@@ -2572,7 +2572,6 @@ class TestModelRoutesModelsEndpoint:
         config = {
             "model": {
                 "provider": "custom:gateway", "default": "primary-model",
-                "supports_vision": not supports_vision,
             },
             "providers": {"gateway": {"models": {
                 "primary-model": {"supports_vision": supports_vision},
@@ -2593,6 +2592,30 @@ class TestModelRoutesModelsEndpoint:
         primary = next(row for row in payload["data"] if row["id"] == adapter._model_name)
         assert primary["capabilities"]["vision"] is supports_vision
         assert "sk-route-private" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("supports_vision", [True, False])
+    async def test_default_vision_declaration_applies_only_to_primary(self, monkeypatch, supports_vision):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+            "model": {
+                "provider": "custom:gateway",
+                "default": "primary-model",
+                "supports_vision": supports_vision,
+            },
+            "providers": {"gateway": {"models": {
+                "primary-model": {"supports_vision": not supports_vision},
+            }}},
+        })
+        adapter = _make_routing_adapter({
+            "other": {"provider": "custom:gateway", "model": "other-model"},
+        })
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.get("/v1/models")
+            assert response.status == 200
+            payload = await response.json()
+        capabilities = {row["id"]: row["capabilities"]["vision"] for row in payload["data"]}
+        assert capabilities[adapter._model_name] is supports_vision
+        assert capabilities["other"] is False
 
     @pytest.mark.asyncio
     async def test_models_endpoint_preserves_virtual_model_when_route_alias_collides(self):
