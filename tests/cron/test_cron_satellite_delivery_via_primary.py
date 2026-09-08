@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from cron.scheduler import (
+from cron.scheduler_preflight import (
     _preflight_check_delivery,
     _satellite_delivery_via_primary_enabled,
 )
@@ -103,7 +103,7 @@ class TestSatelliteDeliveryViaPrimaryPreflight:
     def test_unknown_platform_still_blocks_under_the_knob(self, satellite_home):
         """The knob speaks to credentials, never to a bogus deliver target."""
         satellite_home(_NESTED_ON)
-        with patch("cron.scheduler._is_known_delivery_platform",
+        with patch("cron.scheduler_delivery._is_known_delivery_platform",
                    return_value=False):
             reason = _preflight_check_delivery({"deliver": "nonexistent-platform"})
             assert reason is not None

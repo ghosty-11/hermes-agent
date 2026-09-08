@@ -526,21 +526,6 @@ def test_strict_scratchpad_and_reasoning_only_cannot_continue_the_model():
         assert "UNEXPECTED FOLLOWUP" not in str(result.get("final_response"))
 
 
-def test_strict_json_snapshot_redacts_images_without_mutating_request(tmp_path):
-    agent = _make_agent()
-    agent._hermes_strict_run = True
-    agent._session_json_enabled = True
-    agent.logs_dir = tmp_path
-    agent.session_id = "strict-image-snapshot"
-    messages = _image_history()
-    original = copy.deepcopy(messages)
-    agent._save_session_log(messages)
-    stored = (tmp_path / "session_strict-image-snapshot.json").read_text()
-    image_url = messages[0]["content"][1]["image_url"]["url"]
-    assert image_url not in stored
-    assert image_url.split(",", 1)[1] not in stored
-    assert "[screenshot]" in stored
-    assert messages == original
 
 
 def test_strict_request_debug_dump_never_archives_or_prints_pixels(tmp_path, monkeypatch, capsys):

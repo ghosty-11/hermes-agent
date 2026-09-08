@@ -108,4 +108,3 @@ def merge_opencode_session_headers(
         kwargs["extra_headers"] = merged
     return kwargs
 
-
