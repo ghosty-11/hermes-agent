@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import copy
 import json
 from pathlib import Path
 import logging

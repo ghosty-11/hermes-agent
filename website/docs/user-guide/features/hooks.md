@@ -452,7 +452,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `api_request_error` | Observer | On each failed provider attempt; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `status_code`, `retry_count`, `max_retries`, `retryable`, `reason`, `error`, `request` | Error text may contain provider/user data; `request` is intended to be sanitized. |
 | `on_stream_start` | Observer | Dispatched when a streaming LLM response begins; delivered off the token path via a host-owned bounded queue with one worker per callback; return ignored. | `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Identifiers and routing metadata only. |
 | `on_stream_delta` | Observer | Dispatched per normalized streaming text delta via the bounded observer queue; a stalled callback drops only its own oldest events; return ignored. | `delta`, `kind` (`text` or `reasoning`), `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Delta text is raw model output; reasoning deltas require the `plugins.stream_reasoning_deltas` opt-in. |
-| `on_stream_end` | Observer | Dispatched when a streaming response finishes or errors, after the stream closes; return ignored. | `final_text`, `finished`, `error`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Full assembled response text; error text may include provider data. |
+| `on_stream_end` | Observer | Dispatched when a streaming response finishes or errors, after the stream closes; return ignored. | `final_text`, `finished`, `error`, `stream_diag`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Full assembled response text; error text may include provider data. `stream_diag` carries per-attempt counters and timing. |
 | `on_interim_message` | Observer | Dispatched when a mid-loop assistant message is surfaced before the final answer (streaming or non-streaming); return ignored. | `text`, `already_streamed`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Full interim assistant text. |
 | `transform_api_error_classification` | Transform | On each failed provider attempt, at the top of the built-in classifier; all callbacks run, then the first dict with a valid `reason` wins (run-all-then-pick-first), and skipped valid results log a runtime warning. Python plugins only. | `provider`, `model`, `status_code`, `error_type`, `error_code`, `error_message`, `error_body`, `error`, `approx_tokens`, `context_length`, `num_messages` | `error_message` and `error_body` may contain raw provider/user data. |
 | `on_session_start` | Observer | First turn of a new session; return ignored. | `session_id`, `model`, `platform` | Identifiers and routing metadata only. |
@@ -510,10 +510,16 @@ Additional fields:
 |------|--------------|
 | `on_stream_start` | none |
 | `on_stream_delta` | `delta: str`, `kind: "text" | "reasoning"` |
-| `on_stream_end` | `final_text: str`, `finished: bool`, `error: str | None` |
+| `on_stream_end` | `final_text: str`, `finished: bool`, `error: Optional[str]`, `stream_diag: Optional[dict]` |
 | `on_interim_message` | `text: str`, `already_streamed: bool` |
 
 `on_interim_message` can also fire after a non-streaming response, so registering only that hook does not force a provider call onto streaming transport.
+
+`stream_diag` is an optional per-attempt snapshot with elapsed time, time to first
+chunk, maximum inter-chunk gap, idle time at close, chunk/byte counts, HTTP status
+and reported usage. Missing measurements remain `None`, not zero. It counts raw
+provider chunks, including tool-call and keep-alive chunks, rather than only text
+deltas. See `agent/stream_diag.py::stream_diag_snapshot` for the field names.
 
 Reasoning deltas are not exposed to plugins by default. Opt in explicitly:
 

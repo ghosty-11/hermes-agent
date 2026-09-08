@@ -759,8 +759,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     identity, runtime_marker, runtime = prompt.rpartition(f"\n\n{RUNTIME_ENVIRONMENT_HEADING}\n\n")
     # Legacy prose may quote the heading, but only the new renderer ends in this boundary.
     runtime_marker = runtime_marker if prompt.endswith(RUNTIME_ENVIRONMENT_END) else ""
-    # The final runtime block can contain embedder prose, not authoritative identity.
-    lines = (identity if runtime_marker else prompt).splitlines()
+    # Identity is the final volatile paragraph before the renderer-owned runtime
+    # block. Earlier project or memory labels must not force a prompt rebuild.
+    lines = (identity.rsplit("\n\n", 1)[-1] if runtime_marker else prompt).splitlines()
 
     def line_value(label: str) -> str:
         """Last matching line wins for fields emitted at the end of the volatile tier."""

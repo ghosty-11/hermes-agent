@@ -249,7 +249,7 @@ def _satellite_delivery_via_primary_enabled() -> bool:
 
     Accepts the top-level form and the nested ``gateway.`` one, checked in
     that order — matching
-    ``cron.scheduler._satellite_delivery_via_primary_enabled`` so a config
+    ``cron.scheduler_preflight._satellite_delivery_via_primary_enabled`` so a config
     written either way moves both halves of this fix together, and
     ``_delivery_platform_routed_from_primary_gateway``'s
     ``profile_routes`` precedence.

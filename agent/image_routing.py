@@ -165,6 +165,22 @@ def _supports_vision_override(
     return next((v for v in (_model_supports_vision_override(m, model) for m in model_maps) if v is not None), None)
 
 
+def _lookup_declared_supports_vision(
+    provider: str,
+    model: str,
+    cfg: Optional[Dict[str, Any]] = None,
+    *,
+    requested_provider: str = "",
+) -> Optional[bool]:
+    """Read this route's per-model declaration without default-model or network fallback."""
+    declared = {
+        key: cfg.get(key) for key in ("providers", "custom_providers")
+    } if isinstance(cfg, dict) else {}
+    return _supports_vision_override(
+        declared, provider, model, requested_provider=requested_provider,
+    )
+
+
 def _resolve_inference_value(
     cfg: Optional[Dict[str, Any]],
     provider: str,

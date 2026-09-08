@@ -1036,25 +1036,6 @@ class _ProviderAuthResolutionError(RuntimeError):
 
 
 
-def _lookup_supports_vision(
-    provider: str,
-    model: str,
-    *,
-    config: Optional[Dict[str, Any]] = None,
-    requested_provider: str = "",
-) -> Optional[bool]:
-    """Read only this route's explicit model declaration."""
-    try:
-        from agent.image_routing import _supports_vision_override
-
-        declared = {
-            key: config.get(key) for key in ("providers", "custom_providers")
-        } if isinstance(config, dict) else {}
-        return _supports_vision_override(
-            declared, provider, model, requested_provider=requested_provider,
-        )
-    except Exception:
-        return None
 
 class _SessionEventQueue:
     """Ordered SSE event queue for one /api/sessions/{id}/chat/stream run. ``payload`` stamps
@@ -1976,15 +1957,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @staticmethod
     def _resolve_provider_runtime(
         provider: Optional[str], *, target_model: Optional[str], required: bool,
+        strict_run: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Runtime kwargs for ``provider``, falling back to the gateway's resolver; ``required``
-        raises ``_ProviderAuthResolutionError`` (controlled response, not a raw 500), not None."""
+        raises ``_ProviderAuthResolutionError`` (controlled response, not a raw 500), not None.
+        Strict runs never use the gateway's fallback resolver."""
         provider_name = _clean_request_string(provider)
         if not provider_name:
             return None
         try:
             return _resolve_request_runtime_agent_kwargs(provider_name, target_model=target_model or None)
         except Exception as exc:
+            if strict_run:
+                raise _ProviderAuthResolutionError(str(exc)) from exc
             with suppress(Exception):
                 from gateway.run import _resolve_runtime_agent_kwargs_for_provider
                 return _resolve_runtime_agent_kwargs_for_provider(provider_name)
@@ -1997,10 +1982,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _apply_provider_runtime(
         self, runtime_kwargs: Dict[str, Any], provider: Optional[str], *,
+        strict_run: bool = False,
         target_model: Optional[str], required: bool = False) -> bool:
         """Resolve ``provider``'s runtime and merge it into ``runtime_kwargs``; True if applied."""
         provider_runtime = self._resolve_provider_runtime(
-            provider, target_model=target_model, required=required)
+            provider, target_model=target_model, required=required, strict_run=strict_run)
         if provider_runtime:
             _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
         return bool(provider_runtime)
@@ -2089,7 +2075,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # global provider's credentials.
                 applied = self._apply_provider_runtime(
                     runtime_kwargs, effective_provider, target_model=effective_model,
-                    required=bool(request_provider) or confirmed_runtime_lock)
+                    required=bool(request_provider) or confirmed_runtime_lock, strict_run=strict_run)
             if not applied and effective_provider and effective_provider != current_provider:
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
@@ -2125,10 +2111,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
             _resolve_gateway_model, _load_gateway_config, GatewayRunner)
         from hermes_cli.tools_config import _get_platform_tools
+        strict_run = strict_controls is not None
         # RuntimeError is caught ONLY here (sole provider-auth raiser); the typed subclass keeps
         # run_conversation() errors distinct.
         try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs = {} if strict_run else _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
         # A fallback-provider runtime carries its own ``model``: pop it (overrides config, and
@@ -2136,7 +2123,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
-        strict_run = strict_controls is not None
         model, session_override, request_model, request_provider = self._select_agent_runtime(
             runtime_kwargs, model,
             requested_model=requested_model, requested_provider=requested_provider, route=route,
@@ -2229,6 +2215,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — hermes-agent plus configured model_routes aliases (alias + resolved
         model only, never credentials). Under /p/<profile>/ the primary id follows that profile."""
+        from agent.image_routing import _lookup_declared_supports_vision
+        from hermes_cli.config import load_config, split_model_config_default
+
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+        model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+        if isinstance(model_cfg, dict):
+            primary_model, default_provider = split_model_config_default(
+                model_cfg.get("default") or model_cfg.get("model")
+            )
+            primary_provider = _clean_request_string(model_cfg.get("provider")) or default_provider
+        else:
+            primary_model, primary_provider = split_model_config_default(model_cfg)
+        primary_vision = _lookup_declared_supports_vision(
+            primary_provider, primary_model, config, requested_provider=primary_provider,
+        )
         now = int(time.time())
         # The middleware already entered the profile scope, so get_active_profile_name() resolves.
         model_name = self._resolve_model_name("") if _api_request_profile.get() else self._model_name
@@ -2241,19 +2245,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "permission": [],
             "root": model_name,
             "parent": None,
+            "capabilities": {"vision": primary_vision is True},
         }]
-        try:
-            from hermes_cli.config import load_config
-            config = load_config()
-        except Exception:
-            config = {}
         for alias, route_cfg in self._model_routes.items():
             if alias == model_name:
                 continue
-            vision_capable = _lookup_supports_vision(
+            vision_capable = _lookup_declared_supports_vision(
                 route_cfg.get("provider") or "",
                 route_cfg.get("model") or alias,
-                config=config,
+                config,
                 requested_provider=route_cfg.get("provider") or "",
             )
             models.append({

@@ -2567,6 +2567,34 @@ class TestModelRoutesModelsEndpoint:
             assert "sk-avatar-secret" not in json.dumps(data)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("supports_vision", [True, False])
+    async def test_primary_model_uses_its_own_declared_capability(self, monkeypatch, supports_vision):
+        config = {
+            "model": {
+                "provider": "custom:gateway", "default": "primary-model",
+                "supports_vision": not supports_vision,
+            },
+            "providers": {"gateway": {"models": {
+                "primary-model": {"supports_vision": supports_vision},
+                "colliding-route": {"supports_vision": not supports_vision},
+            }}},
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        adapter = _make_routing_adapter({
+            "hermes-agent": {
+                "model": "colliding-route", "provider": "custom:gateway",
+                "api_key": "sk-route-private",
+            }
+        })
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.get("/v1/models")
+            assert response.status == 200
+            payload = await response.json()
+        primary = next(row for row in payload["data"] if row["id"] == adapter._model_name)
+        assert primary["capabilities"]["vision"] is supports_vision
+        assert "sk-route-private" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
     async def test_models_endpoint_preserves_virtual_model_when_route_alias_collides(self):
         adapter = _make_routing_adapter(
             {

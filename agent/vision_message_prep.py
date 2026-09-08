@@ -136,17 +136,14 @@ class VisionMessagePrepMixin:
         """Return whether the exact active route explicitly supports native vision."""
         try:
             from hermes_cli.config import load_config
-            from agent.image_routing import _lookup_supports_vision, _supports_vision_override
+            from agent.image_routing import _lookup_declared_supports_vision, _lookup_supports_vision
 
             config = load_config()
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
             if require_configured_model:
-                declared = {
-                    key: config.get(key) for key in ("providers", "custom_providers")
-                } if isinstance(config, dict) else {}
-                return _supports_vision_override(
-                    declared, provider, model, requested_provider=requested_provider,
+                return _lookup_declared_supports_vision(
+                    provider, model, config, requested_provider=requested_provider,
                 ) is True
             return _lookup_supports_vision(
                 provider, model, config, requested_provider=requested_provider or "",

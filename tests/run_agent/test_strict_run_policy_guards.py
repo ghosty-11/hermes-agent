@@ -40,6 +40,8 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.tool_executor import (
     execute_tool_calls_concurrent,
     execute_tool_calls_sequential,
@@ -76,9 +78,9 @@ def _make_agent(**agent_kwargs):
 
     client = _shaped_mock_client()
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI", return_value=client),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=client),
         patch("hermes_logging.setup_logging"),
     ):
         agent = AIAgent(
@@ -172,7 +174,7 @@ def test_strict_run_never_activates_configured_fallback():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
         _isolate_aux_vision(agent),
-        patch("run_agent.OpenAI", return_value=_shaped_mock_client()),
+        patch("agent.process_bootstrap.OpenAI", return_value=_shaped_mock_client()),
         patch("agent.agent_runtime_helpers.time.sleep"),
         patch("agent.model_metadata.get_model_context_length", return_value=200000),
     ):
@@ -227,7 +229,7 @@ def test_strict_no_tools_fabricated_call_runs_zero_handlers_sequential():
     assistant_message = SimpleNamespace(tool_calls=_fabricated_tool_calls(1))
     messages: list = []
 
-    with patch("run_agent.handle_function_call", handler):
+    with patch("model_tools.handle_function_call", handler):
         execute_tool_calls_sequential(
             agent, assistant_message, messages, "task-strict"
         )
@@ -252,7 +254,7 @@ def test_strict_no_tools_fabricated_calls_run_zero_handlers_concurrent():
     assistant_message = SimpleNamespace(tool_calls=_fabricated_tool_calls(3))
     messages: list = []
 
-    with patch("run_agent.handle_function_call", handler):
+    with patch("model_tools.handle_function_call", handler):
         execute_tool_calls_concurrent(
             agent, assistant_message, messages, "task-strict"
         )
@@ -280,7 +282,7 @@ def test_non_strict_fabricated_call_still_reaches_handlers():
     assistant_message = SimpleNamespace(tool_calls=_fabricated_tool_calls(1))
     messages: list = []
 
-    with patch("run_agent.handle_function_call", handler):
+    with patch("model_tools.handle_function_call", handler):
         execute_tool_calls_sequential(
             agent, assistant_message, messages, "task-ordinary"
         )
@@ -320,7 +322,7 @@ def test_strict_image_rejection_4xx_is_terminal_single_call():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
         _isolate_aux_vision(agent),
-        patch("run_agent.OpenAI", return_value=_shaped_mock_client()),
+        patch("agent.process_bootstrap.OpenAI", return_value=_shaped_mock_client()),
         patch("agent.agent_runtime_helpers.time.sleep"),
         patch("agent.model_metadata.get_model_context_length", return_value=200000),
     ):
@@ -378,9 +380,9 @@ def _run_with(agent, responses, user_message="look at my desktop"):
         stack.enter_context(patch.object(agent, "_save_trajectory"))
         stack.enter_context(patch.object(agent, "_cleanup_task_resources"))
         stack.enter_context(_isolate_aux_vision(agent))
-        stack.enter_context(patch("run_agent.OpenAI", return_value=_shaped_mock_client()))
+        stack.enter_context(patch("agent.process_bootstrap.OpenAI", return_value=_shaped_mock_client()))
         stack.enter_context(patch("agent.agent_runtime_helpers.time.sleep"))
-        stack.enter_context(patch("agent.conversation_loop.jittered_backoff", return_value=0.0))
+        stack.enter_context(patch("agent.retry_utils.jittered_backoff", return_value=0.0))
         stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
         result = agent.run_conversation(user_message)
     return result, calls
@@ -400,7 +402,7 @@ def test_strict_no_tools_fabricated_call_ends_turn_without_second_model_round():
     fabricated.choices[0].finish_reason = "tool_calls"
     second_round = _mock_response("SECOND ROUND ANSWER")
 
-    with patch("run_agent.handle_function_call", handler):
+    with patch("model_tools.handle_function_call", handler):
         result, calls = _run_with(agent, [fabricated, second_round])
 
     handler.assert_not_called()
@@ -488,7 +490,7 @@ def test_strict_no_tools_snapshot_rebuild_keeps_tool_surface_empty(monkeypatch):
     compaction commit both route through it) must not re-grant tools to a
     tool_policy:none agent."""
     import model_tools
-    from tools import mcp_tool
+    from tools import mcp_tool_agent
 
     agent = _make_agent()
     agent._hermes_strict_run = True
@@ -499,15 +501,37 @@ def test_strict_no_tools_snapshot_rebuild_keeps_tool_surface_empty(monkeypatch):
     registry_defs = [_tool_def("terminal"), _tool_def("mcp_late_tool")]
     monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: registry_defs)
 
-    added = mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True, preserve_prefix=True)
+    added = mcp_tool_agent.refresh_agent_mcp_tools(agent, quiet_mode=True, preserve_prefix=True)
     assert added == set()
     assert agent.tools == []
     assert agent.valid_tool_names == set()
 
-    added = mcp_tool.refresh_agent_mcp_tools(agent, content_aware=True)
+    added = mcp_tool_agent.refresh_agent_mcp_tools(agent, content_aware=True)
     assert added == set()
     assert agent.tools == []
     assert agent.valid_tool_names == set()
+
+
+@pytest.mark.parametrize("strict_no_tools", [False, True])
+def test_saved_tool_prefix_respects_strict_no_tools(monkeypatch, strict_no_tools):
+    from tools import mcp_tool_agent
+    from tools.registry import registry
+
+    agent = _make_agent()
+    agent._hermes_strict_run = strict_no_tools
+    agent._strict_no_tools = strict_no_tools
+    agent.tools = []
+    agent.valid_tool_names = set()
+    entry = SimpleNamespace(name="terminal", schema=_tool_def("terminal")["function"])
+    monkeypatch.setattr(registry, "get_entry", lambda name: entry)
+    monkeypatch.setattr(registry, "get_all_entries", lambda: [entry])
+
+    restored = mcp_tool_agent.restore_agent_tool_prefix(agent, ["terminal"])
+
+    assert restored is (not strict_no_tools)
+    expected_names = set() if strict_no_tools else {"terminal"}
+    assert agent.valid_tool_names == expected_names
+    assert {tool["function"]["name"] for tool in agent.tools} == expected_names
 
 
 def test_strict_scratchpad_and_reasoning_only_cannot_continue_the_model():

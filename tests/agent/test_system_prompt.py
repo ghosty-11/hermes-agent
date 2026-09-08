@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -216,6 +218,23 @@ def test_shared_project_context_precedes_worktree_bytes(monkeypatch, tmp_path):
         prompts.append(full)
     common = os.path.commonprefix(prompts)
     assert "Shared project instructions." in common
+
+
+@pytest.mark.parametrize("timeless", [False, True])
+def test_unscoped_prompt_ignores_project_context_marker(monkeypatch, tmp_path, timeless):
+    from agent.conversation_loop import _stored_prompt_matches_runtime
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    decoy = "Context files directory: /quoted/profile"
+    (tmp_path / "AGENTS.md").write_text(f"# Project instructions\n\n{decoy}\n")
+    agent = _make_agent(
+        platform="cli", model="test-model", provider="test-provider",
+        _bot_chat_timeless_prompt=timeless,
+    )
+    parts = build_system_prompt_parts(agent)
+    assert decoy in parts["context"]
+    assert _stored_prompt_matches_runtime(agent, "\n\n".join(parts.values()))
 
 
 def test_stored_prompt_cwd_ignores_project_host_decoys(monkeypatch, tmp_path):

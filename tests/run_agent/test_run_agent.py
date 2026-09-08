@@ -6,6 +6,7 @@ are made.
 """
 
 
+import copy
 import io
 import json
 import logging
