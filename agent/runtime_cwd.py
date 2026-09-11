@@ -1,11 +1,10 @@
-"""Single source of truth for agent execution and context-file directories.
+"""Single source of truth for the agent working directory.
 
 `TERMINAL_CWD` is the runtime carrier for the configured working directory (`terminal.cwd`
 is bridged to it once at gateway/cron startup; the local CLI leaves it unset and relies on
 the launch dir). Reading it in one place keeps the system prompt, tool surfaces, and
-context-file discovery agreeing on where the agent executes. Multi-session gateways can pin a
-logical execution cwd via `_SESSION_CWD`; multiplex gateways independently pin
-`_CONTEXT_FILE_CWD` to the routed profile home.
+context-file discovery agreeing on where the agent lives. Multi-session gateways can pin a
+logical cwd via `_SESSION_CWD`.
 """
 
 import logging
@@ -19,7 +18,6 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
-_CONTEXT_FILE_CWD: ContextVar = ContextVar("HERMES_CONTEXT_FILE_CWD", default=_UNSET)
 
 # The package/source root (<root>/agent/runtime_cwd.py). A backend launched from or
 # self-spawned into this tree (desktop default) must never let an os.getcwd() fallback
@@ -44,22 +42,6 @@ def set_session_cwd(cwd: str | None) -> Token:
 
 def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
-
-
-def set_context_file_cwd(cwd: str | None) -> Token:
-    """Pin context-file discovery without changing the execution cwd."""
-    return _CONTEXT_FILE_CWD.set((cwd or "").strip())
-
-
-def reset_context_file_cwd(token: Token) -> None:
-    """Restore the context-file discovery override for a nested scope."""
-    _CONTEXT_FILE_CWD.reset(token)
-
-
-def is_context_file_cwd_scoped() -> bool:
-    """Return whether instruction discovery has an independent profile scope."""
-    value = _CONTEXT_FILE_CWD.get()
-    return value is not _UNSET and bool(str(value).strip())
 
 
 def scope_terminal_cwd() -> str:
@@ -106,19 +88,7 @@ def resolve_agent_cwd() -> Path:
 
 
 def resolve_context_cwd() -> Path | None:
-    """Resolve the authoritative context-file directory for this context."""
-    context_override = _CONTEXT_FILE_CWD.get()
-    if context_override is not _UNSET:
-        raw = str(context_override).strip()
-        if not raw:
-            return None
-        path = Path(raw).expanduser()
-        if not path.is_dir():
-            logger.error(
-                "configured context-file directory does not exist: %s — "
-                "instruction discovery will find nothing (not falling back to "
-                "the execution cwd)",
-                raw,
-            )
-        return path
+    """Configured cwd for context-file discovery, or None (build_context_files_prompt then falls back to the
+    launch dir). An existing configured path is honored verbatim — including the Hermes source tree, a
+    legitimate workspace when developing Hermes; fallback-directory policy lives in the caller."""
     return _resolve_configured_cwd(override_is_final=True)

@@ -27,7 +27,7 @@ from agent.prompt_caching import (
     strip_anthropic_cache_control,
     strip_anthropic_tool_cache_control,
 )
-from agent.runtime_cwd import is_context_file_cwd_scoped, resolve_agent_cwd, resolve_context_cwd
+from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, split_runtime_boundary, stage_surface_switch_note,
 )
@@ -779,7 +779,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
 
-    identity, runtime_marker, runtime = split_runtime_boundary(prompt)
+    _identity, runtime_marker, runtime = split_runtime_boundary(prompt)
 
     def host_info_value(label: str) -> str:
         """New prompts delimit runtime hints; legacy prompts put them before context."""
@@ -804,18 +804,6 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # prompt — so TERMINAL_CWD sessions are not falsely rejected.
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd and stored_cwd != str(resolve_agent_cwd()):
-        return False
-    # This optional field belongs only to the final volatile paragraph, not
-    # similarly labelled project or memory prose earlier in the prompt.
-    context_identity = identity.rsplit("\n\n", 1)[-1] if runtime_marker else identity
-    stored_context_cwd = identity_line_value(context_identity, "Context files directory")
-    current_context_cwd = ""
-    if (
-        is_context_file_cwd_scoped()
-        and getattr(agent, "skip_context_files", False) is not True
-    ):
-        current_context_cwd = str(resolve_context_cwd() or "")
-    if stored_context_cwd != current_context_cwd:
         return False
     # Platform is deliberately NOT an identity field: a surface switch does not invalidate the
     # stored bytes, it only makes their interface section out of date, and that is corrected by
