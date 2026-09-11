@@ -74,8 +74,8 @@ _NESTED_ON = {"gateway": {"multiplex_profiles": True,
 
 class TestSatelliteDeliveryViaPrimaryPreflight:
     def test_knob_on_lets_unconnected_satellite_platform_through(self, satellite_home):
-        """The live case: satellite has no discord credentials of its own, the knob
-        is on in the primary's config — preflight must not block."""
+        """The live case: the satellite profile has no discord credentials of its
+        own, the knob is on in the primary's config — preflight must not block."""
         satellite_home(_NESTED_ON)
         with patch("gateway.config.load_gateway_config",
                    return_value=_gateway_config(set())):
