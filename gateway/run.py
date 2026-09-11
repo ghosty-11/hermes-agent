@@ -1721,14 +1721,13 @@ def _load_profile_secret_scope(profile_home: "Path") -> dict:
 def _profile_runtime_scope(
     profile_home: "Path", prepared_secret_scope: Optional[dict] = None, *,
     hydrate_secrets: bool = True):
-    """Scope profile state, credentials, instructions, and terminal policy for one turn.
+    """Scope profile state, credentials, and terminal policy for one turn.
 
     Every acquired context-local scope is restored in reverse order on entry
     failure or turn exit, including exceptions and cancellation.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import set_secret_scope, reset_secret_scope
-    from agent.runtime_cwd import reset_context_file_cwd, set_context_file_cwd
 
     home_token = set_hermes_home_override(str(profile_home))
     try:
@@ -1742,14 +1741,10 @@ def _profile_runtime_scope(
             secrets = build_profile_secret_scope(Path(profile_home))
         secret_token = set_secret_scope(secrets)
         try:
-            context_cwd_token = set_context_file_cwd(str(profile_home))
-            try:
-                from tools.terminal_scope import install_and_reset_profile_terminal_scope
+            from tools.terminal_scope import install_and_reset_profile_terminal_scope
 
-                with install_and_reset_profile_terminal_scope(Path(profile_home)):
-                    yield
-            finally:
-                reset_context_file_cwd(context_cwd_token)
+            with install_and_reset_profile_terminal_scope(Path(profile_home)):
+                yield
         finally:
             reset_secret_scope(secret_token)
     finally:

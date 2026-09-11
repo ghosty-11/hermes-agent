@@ -88,57 +88,6 @@ class TestProfilePathResolutionUnderMultiplexScope:
         assert b_seen == prof_b / "skills"
 
 
-    def test_context_files_follow_profile_without_changing_execution_cwd(
-        self, tmp_path, monkeypatch
-    ):
-        """Instruction discovery follows the routed profile; execution cwd does not.
-
-        Since upstream #68559 the execution cwd of a routed turn comes from
-        that profile's OWN terminal policy, never from the ambient
-        ``TERMINAL_CWD`` of the launch process — ``_profile_runtime_scope``
-        installs the policy for the turn. So the shared execution workdir is
-        declared in each profile's ``.env`` (the shape this host runs: one
-        shared workdir, six seats), and the ambient value is set to a decoy
-        that must never be resolved.
-        """
-        from agent.prompt_builder import build_context_files_prompt
-        from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
-        from gateway.run import _profile_runtime_scope
-
-        execution_cwd = tmp_path / "shared-workdir"
-        execution_cwd.mkdir()
-        (execution_cwd / "AGENTS.md").write_text(
-            "ROOT_EXECUTION_MARKER", encoding="utf-8"
-        )
-        decoy_cwd = tmp_path / "ambient-decoy"
-        decoy_cwd.mkdir()
-        monkeypatch.setenv("TERMINAL_CWD", str(decoy_cwd))
-
-        profile_names = ("default", "alpha", "beta", "gamma", "delta", "epsilon")
-        profiles = {}
-        for name in profile_names:
-            home = tmp_path / "profiles" / name
-            home.mkdir(parents=True)
-            marker = f"PROFILE_MARKER_{name.upper()}"
-            (home / "AGENTS.md").write_text(marker, encoding="utf-8")
-            (home / ".env").write_text(
-                f"TERMINAL_CWD={execution_cwd}\n", encoding="utf-8"
-            )
-            profiles[name] = (home, marker)
-
-        for name, (home, marker) in profiles.items():
-            with _profile_runtime_scope(home):
-                prompt = build_context_files_prompt(cwd=resolve_context_cwd())
-                assert resolve_agent_cwd() == execution_cwd
-                assert resolve_agent_cwd() != home
-                assert resolve_agent_cwd() != decoy_cwd
-                assert marker in prompt
-                assert "ROOT_EXECUTION_MARKER" not in prompt
-                for other_name, (_, other_marker) in profiles.items():
-                    if other_name != name:
-                        assert other_marker not in prompt
-
-
 def test_turn_scoped_dotenv_reload_does_not_pollute_process_env(tmp_path, monkeypatch):
     """A routed profile reload must stay inside its context-local scope.
 
@@ -185,6 +134,7 @@ def test_turn_scoped_dotenv_reload_does_not_pollute_process_env(tmp_path, monkey
         assert load_hermes_dotenv(hermes_home=get_hermes_home()) == []
         assert "PROFILE_SCOPED_API_KEY" not in os.environ
         assert os.environ["DISCORD_ALLOWED_CHANNELS"] == "all-channels"
+
 
 def test_cold_profile_hydrates_external_source_without_global_env(
     tmp_path, monkeypatch

@@ -25,7 +25,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
 from agent import prompt_builder as _pb
-from agent.runtime_cwd import is_context_file_cwd_scoped, resolve_context_cwd
+from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
 
@@ -453,9 +453,7 @@ def _timestamp_line(agent: Any) -> str:
     if getattr(agent, "_bot_chat_timeless_prompt", False):
         timestamp_line = f"Timezone: {', '.join(_bits)}" if _bits else ""
     trailer = (("Session ID", agent.session_id if agent.pass_session_id else None), ("Model", agent.model),
-               ("Provider", agent.provider), ("Platform", agent.platform),
-               ("Context files directory", str(resolve_context_cwd() or "")
-                if is_context_file_cwd_scoped() and not agent.skip_context_files else None))
+               ("Provider", agent.provider), ("Platform", agent.platform))
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
 
 
