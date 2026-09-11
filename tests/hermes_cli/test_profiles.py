@@ -218,6 +218,20 @@ class TestCreateProfile:
         assert (profile_dir / "skills" / "source-authored" / "SKILL.md").is_file()
         assert not (profile_dir / "skills" / ".usage.json").exists()
         assert not (profile_dir / "skills" / ".usage.json.lock").exists()
+    def test_clone_all_does_not_copy_cron_jobs(self, profile_env):
+        # Cron jobs are scheduled work bound to the source profile + origin channel; a clone
+        # that inherits jobs.json fires every job twice (two gateways, same job ids).
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("model: test")
+        (default_home / "cron").mkdir()
+        (default_home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "abc123def456"}]}))
+        (default_home / "cron" / "output").mkdir()
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert (profile_dir / "cron").is_dir()
+        assert not any((profile_dir / "cron").iterdir())
+        assert yaml.safe_load((profile_dir / "config.yaml").read_text())["model"] == "test"
 
 
 
