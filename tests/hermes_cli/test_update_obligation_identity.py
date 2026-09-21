@@ -56,7 +56,9 @@ def test_every_owed_identity_requires_current_evidence(monkeypatch, bad):
     directory = home / "logs" / "update_receipts"
     directory.mkdir(parents=True)
     if bad == "marker":
-        (home / "fleet_restart_pending").write_text("expected_sha=new\n")
+        # Recorded obligation for an SHA the fleet does not serve: no verified discharge.
+        inventory = json.dumps({"version": 1, "runtimes": [{"kind": "gateway", "profile": "beta"}]})
+        (home / "fleet_restart_pending").write_text(f"expected_sha=future\ninventory={inventory}\n")
     owed = {"kind": "gateway", "profile": "beta", "code_sha": "old"}
     if bad == "unknown-profile":
         owed["profile"] = "unknown"
@@ -102,4 +104,28 @@ def test_non_gateway_runtimes_do_not_block_gateway_reconciliation(monkeypatch):
     rows = [{"profile": "default", "state": "current", "code_sha": "new"}]
     monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: "new")
     monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda: rows)
+    assert not update_cmd_fleet._pending_fleet_restart_needed()
+
+
+@pytest.mark.parametrize("supervisor", ["desktop", "launchd", "systemd"])
+def test_supervised_serve_row_never_vetoes_gateway_discharge(monkeypatch, supervisor):
+    """A host that also runs a supervised ``hermes dashboard``/``serve`` carries that row in every
+    receipt; it must not make gateway coverage unverifiable (#115090). The gateways restarted at
+    the pulled SHA and the fleet has since moved on to a newer checkout: nothing is owed.
+    """
+    home = get_hermes_home()
+    directory = home / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    (directory / "latest.json").write_text(json.dumps({
+        "outcome": "failed",
+        "post_update": {"sha": "pulled"},
+        "gateway_restart": {"restarted_services": ["hermes-gateway"], "incomplete": False},
+        "plan": {"runtimes": [
+            {"kind": "gateway", "profile": "default", "code_sha": "old", "supervisor": "manual"},
+            {"kind": "dashboard", "profile": "default", "code_sha": None, "supervisor": supervisor, "restart_via": "respawn-argv"},
+        ]},
+    }))
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: "new")
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda: [{"profile": "default", "state": "current", "code_sha": "new"}])
+    assert not update_cmd_fleet._update_owes_fleet_restart()
     assert not update_cmd_fleet._pending_fleet_restart_needed()

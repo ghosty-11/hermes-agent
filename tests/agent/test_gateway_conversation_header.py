@@ -33,9 +33,9 @@ def test_main_and_auxiliary_share_the_configured_conversation_scope():
 
 
 def test_provider_name_cannot_send_identity_to_a_different_destination():
-    from agent.opencode_affinity import merge_opencode_session_headers
+    from agent.opencode_affinity import merge_session_affinity_headers
     with patch("hermes_cli.config.get_compatible_custom_providers", return_value=[GATEWAY]):
-        request = merge_opencode_session_headers({}, "gateway", "https://unrelated.example/v1", "conversation-a")
+        request = merge_session_affinity_headers({}, "gateway", "https://unrelated.example/v1", "conversation-a")
     assert "x-litellm-session-id" not in request.get("extra_headers", {})
 
 
