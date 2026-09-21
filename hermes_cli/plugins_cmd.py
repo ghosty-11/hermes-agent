@@ -21,7 +21,7 @@ from hermes_cli.cli_output import line_input
 from hermes_cli.config import cfg_get
 from hermes_cli.plugin_capabilities import _child_dict
 from hermes_cli.secret_prompt import masked_secret_prompt
-from utils import atomic_write_text
+from utils import atomic_write_text, rmtree_readonly
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +538,28 @@ def _git_head_revision(repo: Path, git_exe: str) -> str:
     ).stdout.strip().lower()
 
 
+def _git_resolve_commit(repo: Path, git_exe: str, revision: str) -> str:
+    """The COMMIT a revision names, peeling annotated tags.
+
+    A catalog pin is 40 hex, but that does not make it a commit: a tag object
+    has a sha of its own, and a pin recorded as `git rev-parse <tag>` names the
+    tag object, not the commit it points at. Git detaches at the commit, so
+    comparing HEAD against the tag object's sha refuses a correct checkout
+    (and the catalog installer then cannot install that entry at all). Peeling
+    first keeps the guard — HEAD must still BE that commit — while admitting
+    the pins authors actually publish. Returns `revision` unchanged when it
+    resolves to nothing, so the mismatch guard below still fires.
+    """
+    try:
+        result = _run_plugin_git(
+            git_exe, repo, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}", timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return revision
+    resolved = result.stdout.strip().lower()
+    return resolved if result.returncode == 0 and resolved else revision
+
+
 def _checkout_exact_revision(repo: Path, git_exe: str, revision: str, source_url: str = "") -> None:
     """Fetch and detach at one immutable commit, then verify the resulting HEAD."""
     for verb, args, failure_prefix in (
@@ -550,7 +572,7 @@ def _checkout_exact_revision(repo: Path, git_exe: str, revision: str, source_url
         except subprocess.TimeoutExpired as exc:
             raise PluginOperationError(f"Git {verb} of commit '{revision}' timed out after 60 seconds.") from exc
     actual = _git_head_revision(repo, git_exe)
-    if actual != revision:
+    if actual != _git_resolve_commit(repo, git_exe, revision):
         raise PluginOperationError(
             f"Checked-out revision '{actual}' does not match requested commit '{revision}'.")
 
@@ -687,7 +709,7 @@ def _swap_in_plugin(tmp_target: Path, target: Path, backup: Path, old_metadata: 
         _write_install_metadata(new_metadata)
     except Exception:
         if target.exists():
-            shutil.rmtree(target)
+            rmtree_readonly(target)
         if replaced_existing and backup.exists():
             os.replace(backup, target)
         if old_metadata:
@@ -962,7 +984,7 @@ def _remove_plugin_core(target: Path) -> None:
     """Remove one plugin and its metadata without splitting their state."""
     metadata = _read_install_metadata()
     if target.name not in metadata:
-        shutil.rmtree(target)
+        rmtree_readonly(target)
         return
     updated = {k: v for k, v in metadata.items() if k != target.name}
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.remove-", dir=target.parent))
@@ -978,9 +1000,9 @@ def _remove_plugin_core(target: Path) -> None:
                 f"Plugin metadata update failed and '{target.name}' could not be "
                 f"restored automatically; recovery copy remains at {backup}."
             ) from restore_exc
-        shutil.rmtree(staging, ignore_errors=True)
+        rmtree_readonly(staging, ignore_errors=True)
         raise
-    shutil.rmtree(staging)
+    rmtree_readonly(staging)
 
 
 def cmd_remove(name: str) -> None:

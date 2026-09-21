@@ -2132,13 +2132,22 @@ def _resolve_switch_context_length(agent, snapshot):
         from hermes_cli.config import (
             get_compatible_custom_providers, get_custom_provider_context_length, load_config
         )
-        custom_providers = get_compatible_custom_providers(load_config())
-        intent = get_custom_provider_context_length(
-            model=agent.model, base_url=agent.base_url, custom_providers=custom_providers
-        )
+        from agent.agent_init import config_context_length_for_runtime
+        switch_cfg = load_config()
+        custom_providers = get_compatible_custom_providers(switch_cfg)
+        # The durable ``model.context_length`` pin is re-read from live config (never carried over
+        # blindly, never simply dropped): the destination IS the configured default route -> keep the
+        # ceiling; it is some other route -> the scoping inside returns None. Same precedence as
+        # construction, where the pin outranks custom_providers metadata (#116467).
+        intent = config_context_length_for_runtime(agent, switch_cfg)
+        if intent is None:
+            intent = get_custom_provider_context_length(
+                model=agent.model, base_url=agent.base_url, custom_providers=custom_providers
+            )
     except Exception:
         intent = None
-    agent._config_context_length = intent
+    from agent.agent_init import set_config_context_length
+    set_config_context_length(agent, intent)
     runtime_len = None
     if hasattr(agent, "_ensure_lmstudio_runtime_loaded"):
         try:
@@ -3124,11 +3133,21 @@ def trailing_continue_intent(text: str) -> bool:
 # stalled model whose turn would otherwise report "complete" with zero tool calls (#111761).
 # Tail-only and anchored on the last sentence, so reasoning that merely mentions a plan before
 # stating its answer ("...Let me check. The answer is 42.") still promotes.
+# Thai (unsegmented script, so no \b after the trigger, unlike the English group) shares the same
+# tail shape: a first-person future-action marker immediately followed by more Thai text, often
+# preceded by an em/en dash rather than sentence punctuation (#116495). Trigger glosses, in
+# pattern order: "I will give you" / "I will", "next I('ll)" + one of {start,try,check,fix,send,
+# do,look}, "please let me" + one of {start,try,check,fix,send,do,look}, "I('ll)" + one of
+# {start,try,check,fix,send,do,look,run,fire}.
 _PROMOTED_REASONING_PLAN_TAIL_RE = re.compile(
-    r"(?:^|[.!?:\u3002\uff01\uff1f\n]\s*|\u2026\s*)"
+    r"(?:^|[.!?:\u3002\uff01\uff1f\u2014\u2013\n]\s*|\u2026\s*)"
     r"(?:let(?:['\u2019]s| me)\b|i(?:['\u2019]ll| will| need to| should| am going to|['\u2019]m going to)\b"
-    r"|next[,:]? i\b|now i(?:['\u2019]ll| will| need to)\b|first[,:]? i(?:['\u2019]ll| will| need to)\b)"
-    r"[^.!?\n\u3002\uff01\uff1f]{0,160}[.:\u2026]?\s*$",
+    r"|next[,:]? i\b|now i(?:['\u2019]ll| will| need to)\b|first[,:]? i(?:['\u2019]ll| will| need to)\b"
+    r"|\u0e08\u0e30\u0e43\u0e2b\u0e49\u0e1c\u0e21|\u0e1c\u0e21\u0e08\u0e30"
+    r"|\u0e15\u0e48\u0e2d\u0e44\u0e1b(?:\u0e08\u0e30|\u0e1c\u0e21\u0e08\u0e30)"
+    r"|\u0e02\u0e2d(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39)"
+    r"|\u0e08\u0e30(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39|\u0e23\u0e31\u0e19|\u0e22\u0e34\u0e07))"
+    r"[^.!?\n\u3002\uff01\uff1f]{0,160}(?:[.:\u2026]+)?\s*$",
     re.IGNORECASE,
 )
 
