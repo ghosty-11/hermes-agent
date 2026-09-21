@@ -549,22 +549,6 @@ def apply_custom_provider_extra_headers_to_client_kwargs(
     client_kwargs["default_headers"] = merged
 
 
-def get_custom_provider_session_affinity_header(
-    base_url: str,
-    custom_providers: Optional[List[Dict[str, Any]]] = None,
-    config: Optional[Dict[str, Any]] = None) -> str:
-    """Header NAME declared as ``session_affinity_header`` on the route-matching entry, else "".
-
-    Opt-in per provider (default off): Hermes never ships a session identifier to an endpoint
-    that did not ask for one (#86241).
-    """
-    for entry in _entries_for_route(base_url, custom_providers, config):
-        header = entry.get("session_affinity_header")
-        if isinstance(header, str) and header.strip():
-            return header.strip()
-    return ""
-
-
 def get_custom_provider_context_length(
     model: str,
     base_url: str,
