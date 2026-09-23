@@ -105,7 +105,8 @@ def _prepare_moa_request(agent: Any, api_messages: Any, pending_moa_prepared_req
 
 def assemble_api_request(
     agent: Any, *, messages: Any, current_turn_user_idx: Any, _ext_prefetch_cache: Any,
-    _plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    _plugin_user_context: Any, _ephemeral_user_context: Any = None, moa_config: Any,
+    active_system_prompt: Any,
     original_user_message: Any, pending_moa_prepared_request: Any, request_logger: Any,
 ) -> AssembledRequest:
     """Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
@@ -117,9 +118,14 @@ def assemble_api_request(
     )
     from agent.model_metadata import estimate_messages_tokens_rough
 
+    # Privacy boundary (S03 review finding): MoA turns fan the wire copy out to reference
+    # models plus the aggregator — extra recipients the private-context contract never
+    # authorized. build_api_messages fails closed on the same condition (single owner of
+    # the guard, so every caller inherits it).
     api_messages, effective_system = build_api_messages(
         agent, messages, current_turn_user_idx=current_turn_user_idx,
         ext_prefetch_cache=_ext_prefetch_cache, plugin_user_context=_plugin_user_context,
+        ephemeral_user_context=_ephemeral_user_context,
         moa_config=moa_config, active_system_prompt=active_system_prompt,
     )
 

@@ -29,6 +29,16 @@ from agent.turn_author import parse_turn_author
 
 logger = logging.getLogger(__name__)
 
+# Companion-context seam: ``pre_llm_call`` results may carry an
+# ``ephemeral_context`` string — private, per-turn context that rides ONLY the wire copy of
+# the current user row and is never persisted, exported, summarized or spilled to disk.
+# Plugins feature-detect the seam with this constant and fail closed (withhold private
+# blocks, log a compatibility warning) when it is absent on the installed framework.
+SUPPORTS_EPHEMERAL_CONTEXT = True
+# Shared/public companion zero-retention: replayable plugin ``context`` and native
+# memory prefetch are withheld. Feature-detect independently of the ephemeral seam.
+SUPPORTS_COMPANION_ZERO_RETENTION = True
+
 
 def _str_attr(agent: Any, name: str) -> str:
     """``getattr(agent, name, "") or ""`` — route facts read off partial agents/doubles."""
@@ -451,6 +461,9 @@ class TurnContext:
     current_turn_user_idx: int  # index of the current user turn within ``messages``
     should_review_memory: bool = False  # post-turn memory review should fire
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
+    # Private per-turn context (``pre_llm_call`` ``ephemeral_context``): wire-copy-only,
+    # applied at ``current_turn_user_idx`` on every API pass; never persisted (S03).
+    ephemeral_user_context: str = ""
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
 
@@ -562,6 +575,10 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
     ("_iteration_budget_warning_injected", False),
     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
     ("_pre_verify_nudges", 0),
+    # Per-turn companion state: cleared at turn start
+    # so one turn's origin/withholding reason can't leak into the next turn.
+    ("_turn_origin", None),
+    ("_ephemeral_context_withheld", None),
 )
 
 
@@ -727,15 +744,50 @@ def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
     )
 
 
+def _restricted_companion_posture(agent: Any) -> bool:
+    """Whether this turn withholds replayable plugin observation snapshots.
+
+    Authority is the active profile's trusted ``optmem.speaker_scoped`` flag
+    (boolean or standard truthy strings). A Discord config-read failure fails
+    closed; non-Discord work surfaces stay stock. Nothing the model supplies
+    reaches this check.
+    """
+    platform = str(getattr(agent, "platform", None) or "").strip().lower()
+    is_discord = platform == "discord"
+    try:
+        from hermes_cli.config import load_config
+
+        optmem = load_config().get("optmem")
+    except Exception:
+        return is_discord
+    if not is_discord:
+        return False
+    if not isinstance(optmem, dict):
+        return False
+    return str(optmem.get("speaker_scoped")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: List[Any], conversation_history: Optional[List[Any]],
-) -> str:
-    """Run ``pre_llm_call`` plugins; their context is injected into the user message
-    (never the system prompt). Oversized per-hook context is spilled to disk so a
-    runaway plugin can't inflate every subsequent turn's prompt."""
+    restrict_replayable: bool = False,
+) -> Tuple[str, str]:
+    """Run ``pre_llm_call`` plugins once; returns ``(context, ephemeral_context)``.
+
+    ``context`` (replay-safe) is injected into the user message and persists via the
+    api_content sidecar. ``ephemeral_context`` (private) is collected here once, then rides
+    ONLY the wire copy of the current user row on every API pass — it is never passed to
+    the sidecar stamper, the database, summaries or exports, and oversized ephemeral pieces
+    are NOT spilled to disk (the spill path writes persistent bytes; private bytes must
+    stay in memory). Bound plugins are responsible for their own byte budget.
+    The payload carries the server-created ``turn_origin`` (plan S02) so hooks can scope
+    recall and render origin-typed context; public text cannot set it.
+    ``restrict_replayable`` (default False, so direct callers stay stock) discards generic
+    dict ``context`` and bare-string plugin results before ``str()``, disk spill, sidecar
+    stamp or wire assembly; ephemeral collection is unchanged.
+    """
     if getattr(agent, "_persist_disabled", False):
-        return ""
+        return "", ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -750,6 +802,7 @@ def _collect_pre_llm_call_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            turn_origin=getattr(agent, "_turn_origin", None),
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
@@ -762,7 +815,19 @@ def _collect_pre_llm_call_context(
             _spill_if_oversized = None  # type: ignore[assignment]
             _spill_config_cached = None
         _ctx_parts: list[str] = []
+        _ephemeral_parts: list[str] = []
+        _withheld_replayable = False
         for r in _pre_results:
+            _ephemeral_piece = r.get("ephemeral_context") if isinstance(r, dict) else None
+            if isinstance(_ephemeral_piece, str) and _ephemeral_piece:
+                # No disk spill for private bytes (see docstring).
+                _ephemeral_parts.append(_ephemeral_piece)
+            if restrict_replayable:
+                if (isinstance(r, dict) and "context" in r) or (
+                    isinstance(r, str) and bool(r)
+                ):
+                    _withheld_replayable = True
+                continue
             if isinstance(r, dict) and r.get("context"):
                 _piece = str(r["context"])
             elif isinstance(r, str) and r.strip():
@@ -778,10 +843,15 @@ def _collect_pre_llm_call_context(
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
             _ctx_parts.append(_piece)
-        return "\n\n".join(_ctx_parts)
+        if _withheld_replayable:
+            logger.warning(
+                "replayable plugin context withheld (session=%s)",
+                getattr(agent, "session_id", None) or "none",
+            )
+        return "\n\n".join(_ctx_parts), "\n\n".join(_ephemeral_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
-    return ""
+    return "", ""
 
 
 def _merge_gateway_notes(
@@ -927,6 +997,7 @@ def build_turn_context(
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
     persist_user_display_metadata: Optional[Dict[str, Any]]=None, turn_author: Optional[Dict[str, Any]]=None,
+    turn_origin: Optional[Dict[str, Any]]=None,
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
@@ -1055,17 +1126,34 @@ def build_turn_context(
     conversation_history = compaction.conversation_history
     current_turn_user_idx = compaction.current_turn_user_idx
 
-    plugin_user_context = _collect_pre_llm_call_context(
+    # Server-created turn origin (plan S02): validated fail-closed BEFORE it reaches the
+    # hook payload — a malformed origin is dropped, never partially trusted, so the
+    # response policy can only ever come from trusted gateway state. Lazy import: the
+    # gateway owns the type (agent code must not import gateway modules at module level).
+    try:
+        from gateway.turn_origin import normalize_turn_origin as _normalize_origin
+        _origin = _normalize_origin(turn_origin)
+        agent._turn_origin = _origin.as_dict() if _origin is not None else None
+    except Exception:
+        logger.debug("turn origin normalization unavailable; running without origin", exc_info=True)
+        agent._turn_origin = None
+
+    restrict_replayable = _restricted_companion_posture(agent)
+    plugin_user_context, ephemeral_user_context = _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history,
+        restrict_replayable=restrict_replayable,
     )
     plugin_user_context = _merge_gateway_notes(
         agent, messages, current_turn_user_idx, plugin_user_context
     )
 
     _bind_interrupt_scope(agent, ra)
-    ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
+    ext_prefetch_cache = (
+        "" if restrict_replayable
+        else _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
+    )
 
     # Sidecar skipped for codex_app_server/MoA.
     if (
@@ -1090,7 +1178,9 @@ def build_turn_context(
         conversation_history=conversation_history, active_system_prompt=active_system_prompt,
         effective_task_id=effective_task_id, turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
-        plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
+        plugin_user_context=plugin_user_context,
+        ephemeral_user_context=ephemeral_user_context,
+        ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=compaction.blocked,
     )
 
@@ -1114,9 +1204,25 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
     return _sanitize_model
 
 
+def _append_ephemeral_to_wire_copy(api_msg: Dict[str, Any], ephemeral: str) -> None:
+    """Append private per-turn context to ONE wire copy (never the live dict).
+
+    Text rows get ``content + "\\n\\n" + ephemeral``. Multimodal (list) content gets a NEW
+    text part on a NEW list — the live message's list and its element dicts are never
+    mutated (S03: deep-copy semantics for list-valued content)."""
+    content = api_msg.get("content")
+    if isinstance(content, list):
+        api_msg["content"] = [*content, {"type": "text", "text": ephemeral}]
+    elif isinstance(content, str):
+        api_msg["content"] = f"{content}\n\n{ephemeral}" if content else ephemeral
+    elif content is None:
+        api_msg["content"] = ephemeral
+
+
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    ephemeral_user_context: Any = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Build the wire copy of ``messages`` for one API call plus the effective system
     message. Returns ``(api_messages, effective_system)``.
@@ -1131,6 +1237,25 @@ def build_api_messages(
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
+
+    # Private per-turn context (S03): string only, applied to the wire copy below. A
+    # missing/invalid anchor withholds it entirely (see the current-turn branch).
+    _ephemeral = ephemeral_user_context if isinstance(ephemeral_user_context, str) else ""
+    if _ephemeral and (moa_config or getattr(agent, "provider", None) == "moa"):
+        # MoA turns fan the wire copy out to every configured reference model plus the
+        # aggregator — extra recipients the private-context contract never authorized
+        # (S03 review finding). Fail CLOSED: withhold the private bytes for the whole
+        # request, recorded exactly like the anchor-withhold, rather than widening the
+        # audience. A deployment wanting private recall under MoA needs an explicit
+        # per-recipient authorization seam first.
+        _ephemeral = ""
+        with suppress(Exception):
+            agent._ephemeral_context_withheld = "moa_reference_models_would_receive_private_context"
+        logger.warning(
+            "ephemeral context withheld: MoA reference models/aggregator are additional "
+            "recipients the private-context contract does not cover (session=%s)",
+            getattr(agent, "session_id", None) or "none",
+        )
 
     has_current = isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages)
     current_turn_message = messages[current_turn_user_idx] if has_current else None
@@ -1175,6 +1300,12 @@ def build_api_messages(
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
+            # Private ephemeral context (S03) rides the WIRE copy only, appended AFTER the
+            # replay-safe composition above and BEFORE transport conversion, on every API
+            # pass — identical bytes each pass, at this turn's originating user row, never
+            # after later tool results and never into the api_content sidecar.
+            if _ephemeral:
+                _append_ephemeral_to_wire_copy(api_msg, _ephemeral)
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")
@@ -1208,6 +1339,16 @@ def build_api_messages(
         # 'reasoning_details' is kept here; the chat-completions transport drops it on the
         # wire for every route that does not replay it (OpenRouter/Nous do).
         api_messages.append(api_msg)
+
+    # Missing anchor (compaction found no surviving current user row): WITHHOLD the
+    # private bytes with an explicit local failure state — never fall back to persistent
+    # ``context``, never guess a different user row (S03/V05).
+    if _ephemeral and (current_turn_message is None or current_turn_message.get("role") != "user"):
+        agent._ephemeral_context_withheld = "missing_current_turn_user_row"
+        logger.warning(
+            "ephemeral context withheld: no current-turn user row to anchor it (session=%s)",
+            getattr(agent, "session_id", None) or "none",
+        )
 
     # Final system message = cached prompt + ephemeral additions (API-time only).
     # Plugin/recall context goes into the user message, never the system prompt: the

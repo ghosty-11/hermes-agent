@@ -1713,6 +1713,10 @@ class TurnRunner:
                 kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
             if ctx.persist_user_display_metadata:
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
+            if getattr(ctx, "turn_origin", None) and _accepts_keyword(agent.run_conversation, "turn_origin"):
+                # Server-created TurnOrigin (plan S02): trusted admission metadata —
+                # response policy and origin kind for the turn; never derived from text.
+                kwargs["turn_origin"] = ctx.turn_origin
             if ctx.moa_config is not None:
                 kwargs["moa_config"] = ctx.moa_config
             if persist_user_timestamp_override is not None:

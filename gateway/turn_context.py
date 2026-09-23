@@ -59,6 +59,10 @@ class TurnContext:
     # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
+    # Server-created TurnOrigin (plan S02): {event_id, kind, response_policy} validated at
+    # admission from adapter/gateway state — never from message text. Forwarded to the
+    # agent turn and consumed by shaping and the pre_llm_call payload.
+    turn_origin: Optional[dict] = None
     persist_user_display_metadata: Optional[dict] = None
     user_config: Any = None
     mute_notification_reply: bool = False

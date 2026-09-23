@@ -43,7 +43,7 @@ def test_persist_disabled_fork_skips_session_and_turn_lifecycle_hooks():
         patch("agent.credits_tracker.seed_credits_at_session_start"),
     ):
         _restore_or_build_system_prompt(agent, None, [])
-        context = _collect_pre_llm_call_context(
+        context, _ephemeral = _collect_pre_llm_call_context(
             agent,
             effective_task_id="task-1",
             turn_id="turn-1",
@@ -79,7 +79,7 @@ def test_persisted_agent_still_fires_session_and_turn_lifecycle_hooks():
             [{"context": "plugin context"}] if name == "pre_llm_call" else []
         )
         _restore_or_build_system_prompt(agent, None, [])
-        context = _collect_pre_llm_call_context(
+        context, _ephemeral = _collect_pre_llm_call_context(
             agent,
             effective_task_id="task-1",
             turn_id="turn-1",

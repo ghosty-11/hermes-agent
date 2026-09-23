@@ -1621,6 +1621,12 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    # Post-screening text projection this send actually carried (plan S02/V10): the text
+    # lane sets it to what went out; ``""`` means the text lane ran but carried nothing
+    # (screened/withheld — pair with ``error`` for the reason); ``None`` means this result
+    # has no text projection at all (media/TTS lanes). Adapters may override what the base
+    # fills so the recorded delivery reflects THEIR screening, not the gateway's draft.
+    delivered_text: Optional[str] = None
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -4058,6 +4064,116 @@ class BasePlatformAdapter(ABC):
         record_delivery(tts_result)
         return bool(caption and getattr(tts_result, "success", False))
 
+    def turn_origin_for_event(self, event: MessageEvent) -> Optional[Any]:
+        """Trusted per-turn origin for THIS event, or ``None`` (plan S02).
+
+        The base class vouches for nothing: ``None`` keeps the gateway default — kind
+        direct/scheduled/resume from lifecycle flags, response policy ``required`` — so
+        every stock work surface keeps its existing silence rejection. A companion
+        adapter overrides this with verified event metadata (never parsed text) to
+        declare e.g. ``{"event_id", "kind": "ambient", "response_policy": "discretionary"}``;
+        the gateway validates the return before trusting it."""
+        return None
+
+    @staticmethod
+    def _turn_delivery_outcome(results, *, hint, streamed_text) -> Dict[str, Any]:
+        """Classify a turn's ACTUAL delivery from its receipts (plan S02/V04, V10).
+
+        Precedence: a successful send carrying text -> ``text`` with the post-screening
+        projection; any other successful send with a message id -> ``media``; all-failed
+        -> ``failure`` with the error; no receipts -> the gateway hint (``silence`` /
+        ``streamed`` projection) else ``unknown`` — never an invented success. A
+        successful-but-empty send (``delivered_text == ""`` and no message id) is NO
+        CARRIAGE: its ``error`` reason surfaces as ``reason`` and the disposition falls
+        through to hint/unknown."""
+        message_ids: list = []
+        texts: list = []
+        no_carriage_reason = None
+        any_success = False
+        any_failed = False
+        first_error = None
+        for result in results or []:
+            if result is None:
+                continue
+            if getattr(result, "success", False):
+                any_success = True
+                delivered_text = getattr(result, "delivered_text", None)
+                if isinstance(delivered_text, str) and delivered_text:
+                    texts.append(delivered_text)
+                if getattr(result, "message_id", None):
+                    message_ids.append(str(result.message_id))
+                elif delivered_text == "" and getattr(result, "error", None) and no_carriage_reason is None:
+                    no_carriage_reason = str(result.error)
+            else:
+                any_failed = True
+                if first_error is None:
+                    first_error = str(getattr(result, "error", "") or "") or "send failed"
+        outcome: Dict[str, Any] = {"message_ids": message_ids}
+
+        def _mark_partial_failure(record: Dict[str, Any]) -> Dict[str, Any]:
+            """A succeeded lane must never mask a failed one (review finding): the row
+            reads partial=True with the failed lane's error, so a delivered attachment
+            cannot make a dropped final text look like a clean success."""
+            if any_failed:
+                record["partial"] = True
+                record["error"] = first_error
+            return record
+
+        if texts:
+            outcome["disposition"] = "text"
+            outcome["text"] = texts[-1]
+            return _mark_partial_failure(outcome)
+        if any_success and message_ids:
+            outcome["disposition"] = "media"
+            return _mark_partial_failure(outcome)
+        if any_success:
+            # Success with no text and no ids: nothing was actually carried.
+            if no_carriage_reason:
+                outcome["reason"] = no_carriage_reason
+            outcome["disposition"] = "silence" if hint == "silence" else "unknown"
+            return outcome
+        if results:
+            outcome["disposition"] = "failure"
+            outcome["error"] = first_error
+            return outcome
+        if hint == "silence":
+            outcome["disposition"] = "silence"
+            return outcome
+        if hint == "streamed" and streamed_text:
+            outcome["disposition"] = "text"
+            outcome["text"] = streamed_text
+            return outcome
+        outcome["disposition"] = "unknown"
+        return outcome
+
+    async def _finalize_turn_delivery_record(self, event: MessageEvent, results) -> None:
+        """Record the turn's actual delivery on the assistant row the gateway stamped on
+        the event (``turn_delivery_address``), via the gateway runner's
+        ``record_turn_delivery`` — no adapter SQL, no text-matching row search. Best-effort
+        by design: a missing address/runner/db writes nothing and replay reads an unknown
+        delivery, never a phantom answer."""
+        address = getattr(event, "turn_delivery_address", None)
+        if not isinstance(address, dict):
+            return
+        try:
+            runner = getattr(self, "gateway_runner", None)
+            recorder = getattr(runner, "record_turn_delivery", None)
+            if not callable(recorder):
+                return
+            outcome = self._turn_delivery_outcome(
+                results, hint=address.get("disposition_hint"),
+                streamed_text=address.get("streamed_text"),
+            )
+            recorded = recorder(address, outcome)
+            if recorded:
+                logger.info(
+                    "[%s] Recorded turn delivery (%s) for session %s row %s",
+                    self.name, outcome.get("disposition"), address.get("session_id"),
+                    address.get("row_id"),
+                )
+        except Exception:
+            logger.debug("turn delivery record failed", exc_info=True)
+
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
@@ -4220,6 +4336,12 @@ class BasePlatformAdapter(ABC):
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
+        # Post-screening projection (S02/V10): the text this final send actually carried.
+        # An adapter that screened the content sets its own ``delivered_text`` ("" when it
+        # carried nothing); fill only when the result has no projection of its own.
+        if getattr(result, "delivered_text", None) is None:
+            with contextlib.suppress(Exception):
+                result.delivered_text = text_content
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
@@ -4230,13 +4352,16 @@ class BasePlatformAdapter(ABC):
         _thread_metadata = None
         try:
             _thread_metadata = _thread_metadata_for_event(event)
-            error_detail = str(e)[:300] if str(e) else "no details available"
+            # Technical detail stays in the log (SDK exceptions can embed endpoint URLs with
+            # tokens, filesystem paths, response fragments); the chat gets the exception
+            # class only — the same no-raw-exception policy as the agent-turn error path.
+            logger.error(
+                "[%s] Turn failed; detail withheld from chat: %s", self.name, e, exc_info=e)
             # Only the policy reads bind the routed profile; the send stays in the launch scope
             # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
             with self._media_delivery_scope(event.source):
                 content = None if diagnostic_wake_muted(event) else self.warning_text(
-                    f"Sorry, I encountered an error ({type(e).__name__}).\n{error_detail}\n"
-                    "Try again or use /reset to start a fresh session.",
+                    f"Sorry, I encountered an error ({type(e).__name__}).",
                     "Sorry, I encountered an error.",
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
             if content is None:
@@ -4305,6 +4430,7 @@ class BasePlatformAdapter(ABC):
             if not is_ephemeral_response:
                 local_files, text_content = self.extract_local_files(text_content)
                 local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
+
         history = (await self._bounded_history_media_paths_for_session(session_key)
                    if local_files else None)
         if history:
@@ -4330,51 +4456,17 @@ class BasePlatformAdapter(ABC):
             text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
-    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
-        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
-        would let stale runs fire a fresher run's callbacks."""
-        _post_cb = self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
-        if callable(_post_cb):
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                _post_result = _post_cb()
-                if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
-
-    def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
-        drop: re-queue it if another task already owns the session (drain handoff), else spawn the
-        drain task and leave it the guard. Nothing pending: release the guard only if we still own
-        it."""
-        late_pending = self._pending_messages.pop(session_key, None)
-        current_task = asyncio.current_task()
-        if late_pending is not None:
-            existing_task = self._session_tasks.get(session_key)
-            if existing_task is not None and existing_task is not current_task:
-                # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
-                # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
-                # spawning two concurrent _process_message_background tasks for the same key (#17758
-                # follow-up: prevents the create_task path from racing with itself across the
-                # in-band/finally boundary).
-                self._pending_messages[session_key] = late_pending
-            else:
-                logger.debug(
-                    "[%s] Late-arrival pending message during cleanup — spawning drain task",
-                    self.name)
-                self._spawn_drain_task(late_pending, session_key)
-        elif current_task is not None and self._session_tasks.get(session_key) is current_task:
-            self._cleanup_finished_session_task(session_key, interrupt_event)
-
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        _delivery_results: list = []  # actual SendResults, for the turn-delivery record
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                _delivery_results.append(result)
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4441,6 +4533,10 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+            # Actual-delivery accounting (plan S02/V10): record what REALLY went out on the
+            # assistant row the gateway addressed — success, silence, failure or unknown;
+            # never a phantom answer and never inferred by text search.
+            await self._finalize_turn_delivery_record(event, _delivery_results)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
@@ -4483,6 +4579,43 @@ class BasePlatformAdapter(ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+
+    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
+        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
+        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
+        would let stale runs fire a fresher run's callbacks."""
+        _post_cb = self.pop_post_delivery_callback(
+            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
+        if callable(_post_cb):
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                _post_result = _post_cb()
+                if inspect.isawaitable(_post_result):
+                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+
+    def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
+        """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
+        drop: re-queue it if another task already owns the session (drain handoff), else spawn the
+        drain task and leave it the guard. Nothing pending: release the guard only if we still own
+        it."""
+        late_pending = self._pending_messages.pop(session_key, None)
+        current_task = asyncio.current_task()
+        if late_pending is not None:
+            existing_task = self._session_tasks.get(session_key)
+            if existing_task is not None and existing_task is not current_task:
+                # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
+                # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
+                # spawning two concurrent _process_message_background tasks for the same key (#17758
+                # follow-up: prevents the create_task path from racing with itself across the
+                # in-band/finally boundary).
+                self._pending_messages[session_key] = late_pending
+            else:
+                logger.debug(
+                    "[%s] Late-arrival pending message during cleanup — spawning drain task",
+                    self.name)
+                self._spawn_drain_task(late_pending, session_key)
+        elif current_task is not None and self._session_tasks.get(session_key) is current_task:
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained

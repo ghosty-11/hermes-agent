@@ -6,6 +6,12 @@ FTS5 deduped by lineage, adaptive detail hydrates only the top result),
 SCROLL (``session_id`` + ``around_message_id``; ±window around the anchor),
 READ (``session_id`` alone; whole session or head/tail), BROWSE (no args).
 No LLM calls — every shape returns actual DB messages.
+
+On restricted companion surfaces (verified ambient Discord turn on a
+``optmem.speaker_scoped`` profile) the scope is server-derived: only the current
+conversation and its compaction lineage are reachable, and cross-profile reads
+(``profile=`` / ``@session:<profile>/<id>`` links) are refused BEFORE a foreign
+database is opened. See ``_companion_turn_scope``.
 """
 
 import json
@@ -353,8 +359,13 @@ def _hydrate_hit(db, lineage_root: str, match_info: Dict[str, Any], result_detai
 def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort: Optional[str],
               detail: str, current_session_id: str = None, link_profile: str = None,
               after_ts: Optional[int] = None, before_ts: Optional[int] = None,
-              exclude_session_ids: Optional[List[str]] = None) -> str:
-    """Discovery shape: FTS5 plus adaptive or full result hydration."""
+              exclude_session_ids: Optional[List[str]] = None,
+              lineage_scope: Optional[frozenset] = None) -> str:
+    """Discovery shape: FTS5 plus adaptive or full result hydration.
+
+    ``lineage_scope`` (restricted companion surfaces) drops every hit outside the
+    caller's own conversation lineage BEFORE ranking/dedup, so foreign
+    conversations in the same profile can neither surface nor consume the limit."""
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     excluded_roots = _excluded_lineage_roots(db, exclude_session_ids or [])
     title_result = _title_match_result(db, query, current_lineage_root)
@@ -364,6 +375,8 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
         title_sid, title_root = title_result["session_id"], title_result.get("_lineage_root") or title_result["session_id"]
         title_started = _coerce_started_ts((_get_session_meta(db, title_root) or _get_session_meta(db, title_sid)).get("started_at"))
         if {title_sid, title_root} & excluded_roots or not _in_time_window(title_started, after_ts, before_ts):
+            title_result = None
+        if lineage_scope is not None and title_sid not in lineage_scope:
             title_result = None
     raw_results, err = _loud(lambda: db.search_messages(
         query=query, role_filter=role_filter or ["user", "assistant"],
@@ -394,6 +407,8 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
         if len(seen_sessions) >= limit:
             break
         raw_sid, resolved_sid = r["session_id"], _resolve_lineage(db, r["session_id"])
+        if lineage_scope is not None and raw_sid not in lineage_scope:
+            continue
         if raw_sid in excluded_roots or resolved_sid in excluded_roots:
             continue
         # Skip the current session lineage — UNLESS the hit's transcript has left live context. Three
@@ -573,13 +588,143 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
               "means you've hit that end of the session."), **extra)
 
 
+def _profile_restricted() -> bool:
+    """Whether the ACTIVE profile carries the shared/public companion posture.
+
+    Single authority: the per-profile ``optmem.speaker_scoped`` flag — the same
+    marker the memory plugins read, deployed as a pair with this scope change
+    (the companion-surface scope). A config read failure counts as restricted:
+    scope determination fails closed, never open.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        optmem = load_config().get("optmem")
+    except Exception:
+        return True
+    if not isinstance(optmem, dict):
+        return False
+    return str(optmem.get("speaker_scoped")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _companion_turn_scope() -> Optional[Dict[str, Any]]:
+    """Server-derived companion-turn scope, or ``None`` off the restricted surface.
+
+    Restricted = a Discord turn (server-bound ``HERMES_SESSION_PLATFORM``) on a
+    profile with the shared/public companion posture. ORDER MATTERS: posture and
+    platform decide the surface; the ambient adapter's turn attestation only
+    VERIFIES the speaker. A missing attestation (plugin failed to load, turn
+    binding failed) must never widen a restricted surface back to stock — it
+    yields ``verified: False``, which denies every cross-conversation path.
+    An unreadable session context on a restricted profile also refuses
+    conservatively. Nothing the model supplies reaches this check.
+    """
+    def _unverified() -> Dict[str, Any]:
+        return {"verified": False, "speaker_id": "", "message_id": ""}
+
+    try:
+        from gateway import session_context
+    except Exception:
+        return _unverified() if _profile_restricted() else None
+    try:
+        platform = session_context.get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        return _unverified() if _profile_restricted() else None
+    if platform != "discord":
+        return None  # CLI, cron, nonambient platforms: stock tool, unchanged
+    if not _profile_restricted():
+        return None  # private work profile on Discord: stock tool, unchanged
+    try:
+        message_id = session_context.get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+        user_id = session_context.get_session_env("HERMES_SESSION_USER_ID", "")
+        attestation = getattr(session_context, "_ambient_turn_identity", None)
+        identity = attestation.get(None) if attestation is not None else None
+    except Exception:
+        identity, attestation, message_id, user_id = None, None, "", ""
+    verified = bool(attestation is not None and user_id and message_id
+                    and identity == (message_id, user_id))
+    return {"verified": verified,
+            "speaker_id": user_id if verified else "",
+            "message_id": message_id}
+
+
+def _lineage_scope_ids(db, current_session_id: str) -> frozenset:
+    """The current session plus its compaction ancestors — the conversation's history."""
+    ids: list = []
+    visited: set = set()
+    cur = str(current_session_id or "")
+    while cur and cur not in visited:
+        visited.add(cur)
+        ids.append(cur)
+        meta = _get_session_meta(db, cur)
+        cur = str(meta.get("parent_session_id") or "")
+    return frozenset(ids)
+
+
+def _companion_scope_decision(db, scope: Dict[str, Any], *, profile, session_id,
+                              around_message_id, query, current_session_id):
+    """-> ``(refusal | None, lineage_scope | None)``: the restricted-surface verdict.
+
+    Every refusal happens BEFORE any cross-profile database is opened. Browse
+    is refused on this surface outright; every remaining shape — session
+    reads/scrolls and discovery alike — additionally requires the VERIFIED
+    speaker identity. Missing authorization withholds protected reads
+    entirely: the own-lineage read included, because a server-bound session
+    id bounds the conversation but does not attest the speaker.
+    """
+    if str(profile or "").strip() or (isinstance(session_id, str) and "/" in session_id):
+        return tool_error(
+            "cross-profile session reads (profile= or @session:<profile>/<id> links) "
+            "are not available on this surface", success=False), None
+    if not query or not isinstance(query, str) or not query.strip():
+        if not (isinstance(session_id, str) and session_id.strip()):
+            return tool_error(
+                "browsing other sessions is not available on this surface",
+                success=False), None
+    if not scope.get("verified"):
+        return tool_error(
+            "no verified speaker identity; session history is unavailable on "
+            "this surface", success=False), None
+    if isinstance(session_id, str) and session_id.strip():
+        sid = session_id.strip()
+        if not current_session_id:
+            return tool_error(
+                "no current conversation scope; session reads are unavailable on "
+                "this surface", success=False), None
+        scope_ids = _lineage_scope_ids(db, current_session_id)
+        targets = [sid]
+        if around_message_id is not None:
+            anchor_owner = (_get_message_storage_state(db, around_message_id) or {}).get("session_id")
+            if anchor_owner:
+                targets.append(str(anchor_owner))
+        if any(target not in scope_ids for target in targets):
+            return tool_error(
+                f"session '{sid}' is outside the current conversation's scope on "
+                "this surface", success=False), None
+        return None, None
+    return None, (_lineage_scope_ids(db, current_session_id) if current_session_id
+                  else frozenset())
+
+
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               around_message_id, window, sort, profile, detail, owned_dbs,
               after=None, before=None, exclude_session_ids=None) -> str:
     """Mode dispatch (see module docstring); scroll wins when an anchor is set.
-    Profile DBs opened here are appended to *owned_dbs* for the caller to close."""
+    Profile DBs opened here are appended to *owned_dbs* for the caller to close.
+    On a restricted companion surface the server-derived scope gates every shape
+    BEFORE any cross-profile database is opened."""
+    lineage_scope = None
+    companion_scope = _companion_turn_scope()
+    if companion_scope is not None:
+        refusal, lineage_scope = _companion_scope_decision(
+            db, companion_scope, profile=profile, session_id=session_id,
+            around_message_id=around_message_id, query=query,
+            current_session_id=current_session_id)
+        if refusal is not None:
+            return refusal
     # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
     # split on it and adopt the embedded profile only when none was passed.
+    # (A restricted companion surface already refused slash-bearing ids above.)
     if isinstance(session_id, str) and "/" in session_id:
         emb_profile, _, emb_id = session_id.partition("/")
         if emb_id:
@@ -612,7 +757,8 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
         role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
         detail="full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
         current_session_id=current_session_id, link_profile=profile, after_ts=after_ts, before_ts=before_ts,
-        exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
+        exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids),
+        lineage_scope=lineage_scope)
 
 
 def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=None,
@@ -657,6 +803,9 @@ SESSION_SEARCH_SCHEMA = {
         "`session_id` alone = read a whole session — how you resolve an "
         "`@session:<profile>/<id>` link (split on '/' into profile + id); no "
         "args = browse recent sessions. Results are actual DB messages, no LLM. "
+        "On companion social surfaces the scope is server-derived: only the "
+        "current conversation and its compaction lineage are readable; "
+        "cross-profile reads and browsing other sessions are refused there. "
         "Searches conversation history ONLY — when the user gave a direct "
         "source (URL, file, contact, live system), inspect that first; never "
         "conclude 'not found' from history alone. Use for questions about past "
@@ -771,7 +920,9 @@ SESSION_SEARCH_SCHEMA = {
                     "Optional. Read sessions from another Hermes profile's database "
                     "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
                     "pass the profile segment here with session_id as the id segment. "
-                    "Omit to use the current profile."
+                    "Omit to use the current profile. Not available on companion "
+                    "social surfaces, where history is scoped server-side to the "
+                    "current conversation."
                 ),
             },
         },

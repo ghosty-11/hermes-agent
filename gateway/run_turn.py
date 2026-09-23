@@ -1498,15 +1498,24 @@ class GatewayTurnMixin:
         self, agent_result, source, history, session_entry, session_key,
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
         persist_user_display_kind: Optional[str] = None,
+        turn_origin: Optional[Dict[str, Any]] = None,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
         post-compression session_id propagation. Returns
-        ``(response, _intentional_silence, agent_messages)``."""
+        ``(response, _intentional_silence, agent_messages)``.
+
+        Silence policy (plan S02): a queued (/queue) chain's TERMINAL turn owns the verdict,
+        not the event that opened the chain. Intentional silence stands only where the
+        server-created origin explicitly grants it — a machinery display kind (existing
+        lane) or a ``discretionary`` response policy from a configured companion surface.
+        Work surfaces (root/CLI/API) carry ``required`` by default and keep the
+        fallback reply unchanged; the policy never comes from message text."""
         from gateway.run import (
             _is_gateway_hidden_reasoning_incomplete_turn, _normalize_empty_agent_response,
             _sanitize_gateway_final_response, _should_clear_resume_pending_after_turn,
         )
+        from gateway.turn_origin import turn_origin_allows_silence
         response = agent_result.get("final_response") or ""
         # Hidden-reasoning-only retry exhaustion: the loop's sentinel text doubles as final_response
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
@@ -1516,13 +1525,21 @@ class GatewayTurnMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up may go silent, a human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
-        if _intentional_silence and not is_machinery_display_kind(_silence_kind):
+        _silence_origin = agent_result.get("queued_terminal_turn_origin", turn_origin)
+        if _intentional_silence and not (
+            is_machinery_display_kind(_silence_kind) or turn_origin_allows_silence(_silence_origin)
+        ):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
             )
             _intentional_silence = False
             response = _UNEXPECTED_SILENCE_REPLY
+        if _intentional_silence:
+            # Honored silence is a DELIVERY decision: nothing is sent, and the raw marker
+            # stays persisted for alternation/audit; actual-delivery metadata records the
+            # silence disposition (never a phantom successful answer).
+            response = ""
 
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
@@ -1902,6 +1919,49 @@ class GatewayTurnMixin:
         # trigger a rebuild next turn (destroying prompt caching).
         await self._refresh_agent_cache_message_count(session_key, sid)
 
+    def _hmwa_turn_delivery_address(
+        self, agent_result, *, session_entry, disposition_hint, streamed_text=None,
+    ) -> Optional[Dict[str, Any]]:
+        """Bind the actual-delivery record to the final assistant ROW (its durable ``_row_id``),
+        the exported ``turn_id`` and the session — never "the newest row that happens to
+        match some text" (plan S02/V10). ``None`` when any leg is missing: no record is
+        written and replay reads the absence as an UNKNOWN delivery, never success."""
+        try:
+            session_id = str(getattr(session_entry, "session_id", "") or "")
+            turn_id = str((agent_result or {}).get("turn_id") or "")
+            row_id = next(
+                (m.get("_row_id") for m in reversed((agent_result or {}).get("messages") or [])
+                if isinstance(m, dict) and m.get("role") == "assistant"
+                and isinstance(m.get("_row_id"), int)),
+                None,
+            )
+        except Exception:
+            logger.debug("turn delivery address resolution failed", exc_info=True)
+            return None
+        if not (session_id and turn_id and isinstance(row_id, int)):
+            return None
+        return {
+            "session_id": session_id, "row_id": row_id, "turn_id": turn_id,
+            "disposition_hint": disposition_hint, "streamed_text": streamed_text,
+        }
+
+    def record_turn_delivery(self, address: Dict[str, Any], outcome: Dict[str, Any]) -> bool:
+        """Write one actual-delivery record through ``SessionDB.record_message_delivery``
+        (row-addressed merge into ``display_metadata``; reactions preserved). Best-effort:
+        a missing DB or a refused write never breaks the turn — the absence stays an
+        unknown delivery on replay."""
+        db = getattr(self, "_session_db", None)
+        record = getattr(db, "record_message_delivery", None)
+        if not callable(record):
+            return False
+        try:
+            return bool(record(
+                address.get("session_id"), address.get("row_id"), address.get("turn_id"), outcome))
+        except Exception:
+            logger.debug("record_message_delivery failed for row %s", address.get("row_id"), exc_info=True)
+            return False
+
+
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -1910,6 +1970,23 @@ class GatewayTurnMixin:
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         if diagnostic_wake_muted(event):
             return None
+        # Stamp the row-addressed delivery target BEFORE any send: the adapter's final
+        # delivery lane aggregates the ACTUAL SendResults and records the real outcome on
+        # the assistant row via GatewayRunner.record_turn_delivery (S02/V10). A missing
+        # address leg leaves nothing stamped — replay then reads an unknown delivery,
+        # never success.
+        with suppress(Exception):
+            _hint, _streamed = (
+                ("streamed", response) if agent_result.get("already_sent")
+                else ("silence", None) if _intentional_silence
+                else ("text", None)
+            )
+            _delivery_address = self._hmwa_turn_delivery_address(
+                agent_result, session_entry=session_entry,
+                disposition_hint=_hint, streamed_text=_streamed,
+            )
+            if _delivery_address is not None:
+                event.turn_delivery_address = _delivery_address
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
@@ -2020,6 +2097,32 @@ class GatewayTurnMixin:
         )
         self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
 
+    def _resolve_turn_origin(self, event, source, session_entry=None):
+        """Build this turn's server-created origin (plan S02), from trusted state only.
+
+        An adapter MAY vouch for an origin via ``turn_origin_for_event(event)`` (verified
+        event metadata; companion surfaces use this to declare a ``discretionary`` response
+        policy). A missing/junk adapter return falls back to the gateway default: kind from
+        lifecycle flags (scheduled heartbeat, resume_pending session, else direct), policy
+        ALWAYS ``required`` — public text is never consulted, so work surfaces are
+        unchanged and an unverifiable origin cannot grant silence permission."""
+        from gateway.turn_origin import default_turn_origin, normalize_turn_origin
+        try:
+            adapter = self._delivery_adapter_for(source)
+            origin_fn = getattr(adapter, "turn_origin_for_event", None)
+            candidate = origin_fn(event) if callable(origin_fn) else None
+        except Exception:
+            logger.debug("adapter turn-origin resolution failed; using gateway default", exc_info=True)
+            candidate = None
+        origin = normalize_turn_origin(candidate)
+        if origin is not None:
+            return origin.as_dict()
+        return default_turn_origin(
+            scheduled=bool(getattr(event, "_heartbeat_session_id", None)),
+            resumed=bool(getattr(session_entry, "resume_pending", False)),
+            event_id=str(getattr(event, "message_id", "") or ""),
+        ).as_dict()
+
     @dataclasses.dataclass
     class _PreparedTurn:
         """Inputs to the agent run assembled by ``_hmwa_prepare_turn``."""
@@ -2032,6 +2135,7 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str]
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
+        turn_origin: Optional[Dict[str, Any]] = None
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2123,6 +2227,7 @@ class GatewayTurnMixin:
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
+            turn_origin=self._resolve_turn_origin(event, source, session_entry),
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2183,6 +2288,7 @@ class GatewayTurnMixin:
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                turn_origin=prepared.turn_origin,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2209,7 +2315,9 @@ class GatewayTurnMixin:
                 agent_result, source, history, session_entry, session_key,
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
                 persist_user_display_kind=prepared.persist_user_display_kind,
+                turn_origin=prepared.turn_origin,
             )
+
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
@@ -3680,9 +3788,15 @@ class GatewayTurnMixin:
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
-        # Same silence predicate as the normal path, else this branch leaks the literal marker.
+        # Same silence predicate as the normal path, else this branch leaks the literal marker:
+        # the machinery display-kind lane OR the server-created discretionary origin (the
+        # completion path's two-lane gate — a companion surface must not receive the
+        # silence-fallback sentence here either).
         if self._is_intentional_silence(_delivery_result, first_response):
-            if is_machinery_display_kind(turn_ctx.persist_user_display_kind):
+            from gateway.turn_origin import turn_origin_allows_silence
+            if is_machinery_display_kind(turn_ctx.persist_user_display_kind) or turn_origin_allows_silence(
+                getattr(turn_ctx, "turn_origin", None)
+            ):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -3785,6 +3899,9 @@ class GatewayTurnMixin:
         # Queued Discord turns carry the same routing note as first turns; persist the authored text.
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
+        # The terminal turn's own origin (same trusted resolution as first turns) rides the
+        # result so the outer shaping honors/rejects silence by the TURN THAT ANSWERS.
+        next_turn_origin = None
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
@@ -3814,6 +3931,8 @@ class GatewayTurnMixin:
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)
             next_message_type = getattr(pending_event, "message_type", None)
+            with suppress(Exception):
+                next_turn_origin = self._resolve_turn_origin(pending_event, next_source)
 
         # Clear the prior turn's streaming-TTS completion marker so the recursive turn isn't suppressed.
         # See #60671.
@@ -3862,6 +3981,7 @@ class GatewayTurnMixin:
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 persist_user_display_metadata=diagnostic_metadata(pending_event) or None,
+                turn_origin=next_turn_origin,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -3885,6 +4005,7 @@ class GatewayTurnMixin:
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
                 "queued_terminal_display_kind": next_display_kind,
+                "queued_terminal_turn_origin": next_turn_origin,
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
@@ -4185,6 +4306,7 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
+        turn_origin: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4222,6 +4344,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
+            turn_origin=turn_origin,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

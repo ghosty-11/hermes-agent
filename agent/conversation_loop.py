@@ -1304,6 +1304,9 @@ class _LoopState:
     turn_id: Any
     _should_review_memory: Any
     _plugin_user_context: Any
+    # Private per-turn context (S03): wire-copy-only; fixed for the turn, applied by
+    # assemble_api_request -> build_api_messages on every API pass.
+    _ephemeral_user_context: Any
     _ext_prefetch_cache: Any
     # Turn-scoped state (rebound by the phases).
     messages: Any
@@ -1372,8 +1375,8 @@ class _LoopState:
 # _LoopState fields seeded from TurnContext (same name minus the leading underscore).
 _CTX_FIELDS = frozenset({
     "user_message", "original_user_message", "conversation_history", "effective_task_id", "turn_id",
-    "_should_review_memory", "_plugin_user_context", "_ext_prefetch_cache", "messages",
-    "active_system_prompt", "current_turn_user_idx", "_preflight_compression_blocked",
+    "_should_review_memory", "_plugin_user_context", "_ephemeral_user_context", "_ext_prefetch_cache",
+    "messages", "active_system_prompt", "current_turn_user_idx", "_preflight_compression_blocked",
 })
 # Keyword names each phase helper takes (minus ``agent``), cached per function object.
 _PHASE_PARAMS: Dict[Any, tuple] = {}
@@ -1462,6 +1465,7 @@ def _run_conversation_turn(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    turn_origin: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
@@ -1497,6 +1501,7 @@ def _run_conversation_turn(
             persist_user_display_metadata=persist_user_display_metadata,
             persist_user_platform_id=persist_user_platform_id,
             turn_author=turn_author,
+            turn_origin=turn_origin,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
             sanitize_surrogates=_sanitize_surrogates,
@@ -1629,6 +1634,7 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    turn_origin: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1657,6 +1663,7 @@ def run_conversation(
             persist_user_platform_id=persist_user_platform_id,
             moa_config=moa_config,
             turn_author=turn_author,
+            turn_origin=turn_origin,
         )
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)

@@ -46,10 +46,20 @@ _TURN_LEASE_ROW_SQL = "SELECT holder, expires_at FROM session_turn_leases WHERE 
 _DELETE_COMPRESSION_LOCK_SQL = "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?"
 _DISPLAY_ACTIVE_CLAUSE = " AND (active = 1 OR compacted = 1)"
 _DISPLAY_META_ROW_SQL = "SELECT display_metadata FROM messages WHERE id = ? AND session_id IN ({ids})" + _DISPLAY_ACTIVE_CLAUSE
+# Delivery records address an ASSISTANT row: read the role alongside the metadata so the
+# writer can refuse non-assistant rows without a second query.
+_DELIVERY_META_ROW_SQL = "SELECT display_metadata, role FROM messages WHERE id = ? AND session_id IN ({ids})" + _DISPLAY_ACTIVE_CLAUSE
 _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id"
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
+
+# Actual-delivery records (plan S02/V10): the single ``delivery`` member merged into an
+# assistant row's display_metadata by ``record_message_delivery``. Dispositions are the
+# fixed vocabulary — a missing/crash-interrupted receipt is ``unknown`` or absent, never
+# success.
+DELIVERY_METADATA_KEY = "delivery"
+DELIVERY_DISPOSITIONS = frozenset({"text", "media", "silence", "failure", "unknown"})
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
@@ -433,6 +443,68 @@ class SessionMessagesMixin:
             return []
         row = self._read_one(*self._reaction_row_query(session_id, message_row_id))
         return self._reaction_list(self._decode_display_metadata(row[0])) if row is not None else []
+
+    def record_message_delivery(
+        self, session_id: str, row_id, turn_id: str, outcome: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Record a turn's ACTUAL delivery on the assistant row that produced it (plan S02/V10).
+
+        Row-addressed (``row_id`` must be an assistant row in the session's visible
+        lineage) and turn-bound (``turn_id``): receipts from the SAME turn aggregate
+        idempotently into one ``delivery`` member of the existing ``display_metadata`` —
+        reactions and every other member survive, the row's content is never rewritten —
+        while a record from a DIFFERENT turn is refused, so a later turn can never
+        overwrite the earlier row's delivery. Dispositions are the fixed vocabulary
+        ``text``/``media``/``silence``/``failure``/``unknown``; a missing receipt stays
+        ``unknown`` (or absent = unknown), never success. Returns whether the write landed."""
+        if (
+            not session_id or not isinstance(row_id, int) or not turn_id
+            or not isinstance(turn_id, str) or not isinstance(outcome, dict)
+            or outcome.get("disposition") not in DELIVERY_DISPOSITIONS
+        ):
+            return False
+        lineage = self._resume_lineage_ids(session_id)
+        sql = _DELIVERY_META_ROW_SQL.format(ids=_placeholders(lineage))
+        params = (row_id, *lineage)
+
+        def _do(conn):
+            row = conn.execute(sql, params).fetchone()
+            if row is None:
+                return False
+            # row tuple: (display_metadata, role) — validate the assistant row.
+            meta_raw, role = row[0], row[1]
+            if role != "assistant":
+                return False
+            meta = self._decode_display_metadata(meta_raw) or {}
+            existing = meta.get(DELIVERY_METADATA_KEY)
+            if not isinstance(existing, dict):
+                existing = {}
+            if existing.get("turn_id") not in (None, turn_id):
+                # Turn identity binds the record: a later turn cannot rewrite this row's
+                # delivery (the earlier outcome is history, not a scratchpad).
+                return False
+            delivery = dict(existing)
+            delivery["turn_id"] = turn_id
+            delivery["disposition"] = outcome["disposition"]
+            if "text" in outcome:
+                delivery["text"] = outcome.get("text")
+            if "reason" in outcome:
+                delivery["reason"] = outcome.get("reason")
+            error = outcome.get("error")
+            if error:
+                delivery["error"] = error
+            else:
+                delivery.pop("error", None)
+            ids = [str(m) for m in (delivery.get("message_ids") or [])]
+            for message_id in outcome.get("message_ids") or []:
+                if str(message_id) not in ids:
+                    ids.append(str(message_id))
+            delivery["message_ids"] = ids
+            delivery["at"] = time.time()
+            meta[DELIVERY_METADATA_KEY] = delivery
+            conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta), row_id))
+            return True
+        return self._execute_write(_do)
 
     def _reaction_row_query(self, session_id: str, message_row_id: int) -> Tuple[str, tuple]:
         """A reaction addresses a row the client can SEE, and a display resume materializes the whole
