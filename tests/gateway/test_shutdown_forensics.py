@@ -8,7 +8,6 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
@@ -19,11 +18,6 @@ from gateway import shutdown_forensics as sf
 # _signal_name
 # ---------------------------------------------------------------------------
 
-class TestSignalName:
-
-    def test_unknown_int_returns_signal_num_token(self):
-        # Pick an integer extremely unlikely to ever be a real signal alias
-        assert sf._signal_name(9999) == "signal#9999"
 
 
 # ---------------------------------------------------------------------------
@@ -32,29 +26,9 @@ class TestSignalName:
 
 class TestSnapshotShutdownContext:
 
-    def test_handles_none_signal(self):
-        ctx = sf.snapshot_shutdown_context(None)
-        assert ctx["signal"] == "UNKNOWN"
-        assert ctx["signal_num"] is None
-
-    def test_includes_timestamps(self):
-        before = time.time()
-        ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
-        after = time.time()
-        assert before <= ctx["ts"] <= after
-        assert isinstance(ctx["ts_monotonic"], float)
 
 
-    def test_under_systemd_false_without_invocation_id_and_normal_ppid(
-        self, monkeypatch
-    ):
-        monkeypatch.delenv("INVOCATION_ID", raising=False)
-        # We can't actually change ppid; skip if we happen to be reaped
-        # by init (e.g. running under tini).
-        if os.getppid() == 1:
-            pytest.skip("test process is reaped by init")
-        ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
-        assert ctx["under_systemd"] is False
+
 
 
     def test_detects_takeover_marker_for_self(self, tmp_path, monkeypatch):

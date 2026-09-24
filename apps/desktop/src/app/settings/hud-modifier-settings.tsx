@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
-import { Loader } from '@/components/ui/loader'
+import { ErrorBanner } from '@/components/ui/error-state'
 import { useI18n } from '@/i18n'
 
 import type { HudModifierStatus } from '../../../electron/hud-modifier-types'
 
-import { ListRow, ToggleRow } from './primitives'
-import { useDeepLinkHighlight } from './use-deep-link-highlight'
-
-const isHudModifierSetting = (target: string) => target === 'hud-modifier'
-const hudModifierElementId = () => 'setting-hud-modifier'
+import { ToggleRow } from './primitives'
+import { SETTING_IDS, settingElementId } from './settings-manifest'
 
 export function HudModifierSettings() {
   const { t } = useI18n()
@@ -22,7 +19,6 @@ export function HudModifierSettings() {
   const [error, setError] = useState<string | null>(null)
   const request = useRef(0)
   const revision = useRef(0)
-  useDeepLinkHighlight({ param: 'setting', ready: isHudModifierSetting, elementId: hudModifierElementId })
 
   const refresh = useCallback(
     async (enabled?: boolean) => {
@@ -86,18 +82,17 @@ export function HudModifierSettings() {
     }
   }
 
-  const descriptions: Record<HudModifierStatus['state'], string> = {
-    disabled: '',
-    starting: common.starting,
-    ready: copy.ready,
-    'input-permission': copy.permission,
-    unavailable: copy.unavailable
-  }
+  const unavailableNotice = status?.reason
+    ? { 'missing-helper': copy.missingHelper, 'unsupported-session': copy.unsupportedSession }[status.reason]
+    : copy.unavailable
 
-  const canRetry = error || status?.state === 'input-permission' || status?.state === 'unavailable'
+  const notice =
+    error ??
+    (status?.enabled && status.state === 'input-permission' ? copy.permission : null) ??
+    (status?.enabled && status.state === 'unavailable' ? unavailableNotice : null)
 
   return (
-    <div id={hudModifierElementId()}>
+    <div id={settingElementId(SETTING_IDS.keybinds.hudModifier)}>
       <ToggleRow
         checked={status?.enabled ?? false}
         description={copy.description}
@@ -105,33 +100,25 @@ export function HudModifierSettings() {
         label={copy.title}
         onChange={enabled => void refresh(enabled)}
       />
-      {(busy || error || (status?.enabled && status.state !== 'disabled')) && (
-        <ListRow
-          action={
-            busy ? (
-              <Loader className="size-5" />
-            ) : (
-              <div className="flex flex-wrap items-center gap-2">
-                {status?.state === 'input-permission' && (
-                  <Button onClick={() => void openPermissionSettings()} size="sm" variant="secondary">
-                    {common.openSettings}
-                  </Button>
-                )}
-                {canRetry && (
-                  <Button
-                    onClick={() => void refresh(error ? undefined : status?.enabled)}
-                    size="sm"
-                    variant="secondary"
-                  >
-                    {common.retry}
-                  </Button>
-                )}
-              </div>
-            )
-          }
-          description={<span aria-live="polite">{error ?? descriptions[status?.state ?? 'disabled']}</span>}
-          title={copy.statusTitle}
-        />
+      {notice && (
+        <div className="space-y-2" role="alert">
+          <ErrorBanner>{notice}</ErrorBanner>
+          <div className="flex flex-wrap items-center gap-2">
+            {status?.state === 'input-permission' && (
+              <Button disabled={busy} onClick={() => void openPermissionSettings()} size="sm" variant="secondary">
+                {common.openSettings}
+              </Button>
+            )}
+            <Button
+              disabled={busy}
+              onClick={() => void refresh(error ? undefined : status?.enabled)}
+              size="sm"
+              variant="secondary"
+            >
+              {common.retry}
+            </Button>
+          </div>
+        </div>
       )}
     </div>
   )

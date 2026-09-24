@@ -33,12 +33,23 @@ import {
 import { HudModifierSettings } from './hud-modifier-settings'
 import { SettingsBreadcrumbContext, SettingsContent } from './primitives'
 import { ScreenshotSettings } from './screenshot-settings'
+import { useSettingDeepLink } from './use-setting-deep-link'
 
 interface KeybindSettingsProps {
   subpage?: string
 }
 
 export function KeybindSettings({ subpage }: KeybindSettingsProps = {}) {
+  useSettingDeepLink('keybinds', page => subpage === undefined || page === subpage)
+
+  if (subpage === 'hud-gesture') {
+    return (
+      <SettingsContent>
+        <HudModifierSettings />
+      </SettingsContent>
+    )
+  }
+
   if (subpage === 'screen-capture') {
     return (
       <SettingsContent>
@@ -137,11 +148,6 @@ function ShortcutSettings({ includeScreenshot }: { includeScreenshot: boolean })
         (!isSearching || t.settings.screenshot.enabledTitle.toLowerCase().includes(query.toLowerCase())) && (
           <ScreenshotSettings />
         )}
-
-      {(!isSearching ||
-        `${t.settings.hudModifier.title} ${t.settings.hudModifier.description}`
-          .toLowerCase()
-          .includes(query.toLowerCase())) && <HudModifierSettings />}
 
       <div className="pb-3">
         <SearchField
