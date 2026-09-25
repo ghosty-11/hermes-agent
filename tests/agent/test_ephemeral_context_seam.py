@@ -19,6 +19,7 @@ Contracts under test, against the real prologue + request builder + a real Sessi
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 import threading
 import time
 import types
@@ -28,6 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import agent.turn_context as turn_context_module
+from agent.codex_responses_adapter import _chat_messages_to_responses_input
 from agent.turn_context import TurnContext, build_api_messages, build_turn_context
 from hermes_state import SessionDB
 
@@ -200,6 +202,35 @@ def test_private_only_hook_context_leaves_database_clean(agent_db):
     wire = _wire(agent, ctx)
     assert wire[-1]["content"] == "hello\n\n" + EPHEMERAL
     assert sum(EPHEMERAL in (m.get("content") or "") for m in wire) == 1
+
+
+@pytest.mark.parametrize("issuer", ["codex_backend", "xai_responses"])
+def test_private_current_turn_survives_responses_transport_without_replay(
+        agent_db, issuer):
+    agent, db = agent_db
+    agent.api_mode = "codex_responses"
+    with _hook_results([{"ephemeral_context": EPHEMERAL}]):
+        ctx = _build(agent)
+
+    for _ in range(2):
+        items = _chat_messages_to_responses_input(
+            _wire(agent, ctx), current_issuer_kind=issuer,
+        )
+        users = [item for item in items if item.get("role") == "user"]
+        assert len(users) == 1
+        content = users[0]["content"]
+        wire_text = (
+            "".join(part["text"] for part in content
+                    if part.get("type") == "input_text")
+            if isinstance(content, list) else content
+        )
+        assert wire_text == "hello\n\n" + EPHEMERAL
+        assert json.dumps(items).count("PRIVATE-SENTINEL") == 1
+
+    persisted = db.get_messages_as_conversation(agent.session_id)[-1]
+    assert persisted["content"] == "hello"
+    assert persisted.get("api_content") is None
+
 
 
 def test_ephemeral_bytes_never_reach_api_content_sidecar(agent_db):

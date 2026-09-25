@@ -35,6 +35,21 @@ def test_oneshot_hides_skill_manage_and_skill_authoring_coaching(oneshot, intera
     assert "skill_manage" in interactive_prompt and "offer to save as a skill" in interactive_prompt
 
 
+def test_interactive_read_only_skills_do_not_coach_unavailable_mutation(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    prompt = build_skills_system_prompt(
+        available_tools={"skills_list", "skill_view", "web_search"},
+        skills_dir_override=_skills_dir(tmp_path),
+    )
+    assert "demo-skill" in prompt and "skill_view(name)" in prompt
+    assert "skill_manage" not in prompt
+    assert "terminal" not in prompt
+    assert "offer to save as a skill" not in prompt
+    assert "update it before finishing" not in prompt
+
+
+
 def _skills_dir(tmp_path):
     d = tmp_path / "skills" / "misc" / "demo-skill"
     d.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,6 +61,39 @@ class TestXAIImageGenProvider:
 
         provider = XAIImageGenProvider()
         assert provider.is_available() is True
+
+    def test_availability_never_calls_refresh_capable_resolver(self):
+        from plugins.image_gen import xai as xai_mod
+
+        with patch.object(
+            xai_mod, "resolve_xai_http_credentials",
+            side_effect=AssertionError("availability must not refresh OAuth"),
+        ):
+            assert xai_mod.XAIImageGenProvider().is_available() is True
+
+    def test_availability_fails_closed_when_status_probe_raises(self):
+        """``has_xai_credentials``' secret-scope read can raise (unscoped multiplex read);
+        availability must report False, never propagate or leak key/exception text."""
+        from agent.secret_scope import UnscopedSecretError
+        from plugins.image_gen import xai as xai_mod
+
+        with patch.object(
+            xai_mod, "has_xai_credentials",
+            side_effect=UnscopedSecretError("XAI_API_KEY", "multiplexing active, no scope"),
+        ):
+            assert xai_mod.XAIImageGenProvider().is_available() is False
+
+    def test_is_available_with_pool_only_credentials(self, monkeypatch, tmp_path):
+        """A credential-pool grant (no XAI_API_KEY, no providers singleton) is enough —
+        pool-only multi-account readiness, no network refresh or external request."""
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        (tmp_path / "auth.json").write_text(json.dumps({
+            "credential_pool": {"xai-oauth": [{"access_token": "pool-token"}]},
+        }), encoding="utf-8")
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        assert XAIImageGenProvider().is_available() is True
+
 
 
 
