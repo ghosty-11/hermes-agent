@@ -929,6 +929,15 @@ def handle_function_call(
         if is_connector_name(function_name) and parse_connector_name(function_name) is None:
             return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__<tool>."))
 
+    # Direct legacy calls remain unrestricted unless this call carries explicit scope.
+    # Dynamic connector names and their control tool have their own session gate above.
+    if (enabled_toolsets is not None or disabled_toolsets is not None) and function_name != "manage_connections" and not is_connector_name(function_name):
+        if registry.get_entry(function_name) is not None and function_name not in _select_tool_names(
+                enabled_toolsets, disabled_toolsets, quiet_mode=True):
+            message = f"'{function_name}' is not available in this session."
+            return _emit(tool_error(message), status="blocked", error_type="tool_unavailable",
+                         error_message=message)
+
     original_args = dict(function_args)
     if not skip_tool_request_middleware:
         function_args, original_args, trace = _apply_request_middleware(function_name, function_args, ids, trace)

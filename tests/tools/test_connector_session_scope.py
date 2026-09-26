@@ -73,6 +73,37 @@ def test_connector_scope_controls_schema_discovery_and_execution(monkeypatch, en
         assert remote == []
 
 
+def test_nonconnector_management_dispatch_obeys_session_toolset(monkeypatch):
+    import model_tools
+
+    calls = []
+    monkeypatch.setattr(
+        model_tools.registry, "dispatch",
+        lambda name, args, **kwargs: calls.append(name) or '{"success":true}',
+    )
+    restricted = {"enabled_toolsets": ["file"], "disabled_toolsets": []}
+    advertised = model_tools.get_tool_definitions(
+        **restricted, quiet_mode=True, skip_tool_search_assembly=True,
+    )
+    assert "skill_manage" not in {tool["function"]["name"] for tool in advertised}
+
+    denied = json.loads(model_tools.handle_function_call(
+        "skill_manage", {"action": "list"}, **restricted,
+        skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+        skip_tool_execution_middleware=True,
+    ))
+    assert calls == [], "restricted model call reached the management handler"
+    assert "not available in this session" in denied["error"]
+
+    allowed = json.loads(model_tools.handle_function_call(
+        "skill_manage", {"action": "list"}, enabled_toolsets=["skills"],
+        skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+        skip_tool_execution_middleware=True,
+    ))
+    assert allowed["success"] is True
+    assert calls == ["skill_manage"]
+
+
 def test_ordinary_platform_defaults_grant_connections_without_widening_webhook():
     from hermes_cli.tools_config import _get_platform_tools
     from toolsets import resolve_toolset
