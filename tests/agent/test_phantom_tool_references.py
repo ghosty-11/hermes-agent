@@ -7,8 +7,8 @@ Covers:
   * execution_guidance_text() never names a web tool (guidance is toolset-neutral).
   * The coding operating brief drops the `todo` sentence when the todo tool
     isn't loaded.
-  * ESSENTIAL_SKILLS can't be disabled via config, and the CLI writer strips
-    them from persisted disabled lists.
+  * Essential skills remain protected from sync/deletion, and the CLI writer
+    refuses to introduce a new essential disable.
 """
 
 from pathlib import Path
@@ -39,27 +39,8 @@ class TestCodingBriefTodoGating:
         assert "todo_list" in brief
 
 
-class TestEssentialSkillsUndisableable:
-    def test_agent_side_reader_strips_essential(self, monkeypatch, tmp_path):
-        import agent.skill_utils as su
-        cfg = tmp_path / "config.yaml"
-        cfg.write_text(
-            "skills:\n  disabled:\n    - hermes-agent\n    - some-other-skill\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setattr(su, "get_config_path", lambda: cfg)
-        su._RAW_CONFIG_CACHE.clear()
-        disabled = su.get_disabled_skill_names(platform="cli")
-        assert "hermes-agent" not in disabled
-        assert "some-other-skill" in disabled
 
-    def test_cli_side_reader_strips_essential(self):
-        from hermes_cli.skills_config import get_disabled_skills
-        cfg = {"skills": {"disabled": ["hermes-agent", "other"]}}
-        disabled = get_disabled_skills(cfg)
-        assert "hermes-agent" not in disabled
-        assert "other" in disabled
-
+class TestEssentialSkillProtection:
     def test_cli_side_writer_strips_essential(self, monkeypatch):
         import hermes_cli.skills_config as sc
         saved = {}
@@ -72,7 +53,6 @@ class TestEssentialSkillsUndisableable:
         from tools.skill_manager_guards import _pinned_guard
         msg = _pinned_guard("hermes-agent")
         assert msg is not None
-
 
 class TestEssentialOnlySync:
     def test_opted_out_sync_seeds_only_essential(self, monkeypatch, tmp_path):

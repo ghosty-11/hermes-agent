@@ -26,31 +26,36 @@ def _normalize_skill_names(values) -> Set[str]:
 
 
 def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str]:
-    """Disabled skill names: the global list unioned with the platform list when given (globally
-    disabled stays disabled everywhere; mirrors ``agent.skill_utils.get_disabled_skill_names``)."""
+    """Disabled skill names: the global list unioned with the platform list when given."""
     skills_cfg = config.get("skills") or {}
     if not isinstance(skills_cfg, dict):
         return set()
-    from agent.skill_utils import ESSENTIAL_SKILLS
     disabled = _normalize_skill_names(skills_cfg.get("disabled"))
     if platform is not None:
         platform_disabled = cfg_get(skills_cfg, "platform_disabled", platform)
         if platform_disabled is not None:
-            disabled = disabled | _normalize_skill_names(platform_disabled)
-    return disabled - ESSENTIAL_SKILLS
+            disabled |= _normalize_skill_names(platform_disabled)
+    return disabled
 
 
 def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[str] = None):
-    """Persist disabled skill names to config; essential skills (e.g. ``hermes-agent``) are
-    silently dropped — they cannot be disabled from any surface."""
+    """Persist disabled skill names, refusing new essential disables but preserving an
+    existing essential disable at the same scope unless explicitly removed."""
     from agent.skill_utils import ESSENTIAL_SKILLS
-    disabled = set(disabled) - ESSENTIAL_SKILLS
-    config.setdefault("skills", {})
+    new_disabled = set(disabled)
+    skills_cfg = config.setdefault("skills", {})
+
     if platform is None:
-        config["skills"]["disabled"] = sorted(disabled)
+        existing = _normalize_skill_names(skills_cfg.get("disabled"))
+        skills_cfg["disabled"] = sorted(
+            (new_disabled - ESSENTIAL_SKILLS) | (existing & ESSENTIAL_SKILLS & new_disabled)
+        )
     else:
-        config["skills"].setdefault("platform_disabled", {})
-        config["skills"]["platform_disabled"][platform] = sorted(disabled)
+        platform_disabled = skills_cfg.setdefault("platform_disabled", {})
+        existing = _normalize_skill_names(cfg_get(skills_cfg, "platform_disabled", platform))
+        platform_disabled[platform] = sorted(
+            (new_disabled - ESSENTIAL_SKILLS) | (existing & ESSENTIAL_SKILLS & new_disabled)
+        )
     save_config(config)
 
 

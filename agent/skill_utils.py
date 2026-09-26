@@ -292,8 +292,8 @@ def _home_relative(p: Path) -> Path:
     return p if p.is_absolute() else get_hermes_home() / p
 
 
-# Never disableable: `hermes-agent` is the agent's own operating manual and the
-# system prompt points at it unconditionally.
+# Keep `hermes-agent` protected from sync/deletion; explicit config may hide it
+# from discovery, while default seats still offer it normally.
 ESSENTIAL_SKILLS: frozenset = frozenset({"hermes-agent"})
 
 
@@ -309,7 +309,7 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(resolved_platform) if resolved_platform else None
     if platform_disabled is not None:
         disabled |= _normalize_string_set(platform_disabled)
-    return disabled - ESSENTIAL_SKILLS
+    return disabled
 
 
 def parse_config_string_list(value) -> List[str]:

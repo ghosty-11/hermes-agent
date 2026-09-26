@@ -321,6 +321,33 @@ class TestSkillsList:
         assert result["categories"] == ["linked"]
         assert result["skills"][0]["name"] == "knowledge-brain"
 
+    def test_explicitly_disabled_manual_is_not_offered_to_public_seat(self, tmp_path, monkeypatch):
+        _make_skill(tmp_path, "hermes-agent")
+        config = {"skills": {"disabled": ["hermes-agent"]}}
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_PLATFORM", "discord")
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._skill_search_dirs", return_value=([], [tmp_path], tmp_path)),
+            patch("agent.skill_utils._load_raw_config", side_effect=lambda: config),
+            patch("hermes_cli.config.load_config", side_effect=lambda: config),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            hidden = json.loads(skills_list())
+            denied = json.loads(skill_view("hermes-agent"))
+            config["skills"]["disabled"] = []
+            monkeypatch.setenv("HERMES_PLATFORM", "cli")
+            skills_tool_module._SKILLS_CACHE.clear()
+            visible = json.loads(skills_list())
+            readable = json.loads(skill_view("hermes-agent"))
+        skills_tool_module._SKILLS_CACHE.clear()
+
+        assert "hermes-agent" not in {skill["name"] for skill in hidden["skills"]}
+        assert denied["success"] is False
+        assert "disabled" in denied["error"].lower()
+        assert "hermes-agent" in {skill["name"] for skill in visible["skills"]}
+        assert readable["success"] is True
+
 
 # ---------------------------------------------------------------------------
 # skill_view

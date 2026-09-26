@@ -36,6 +36,16 @@ class TestSaveDisabledSkills:
         assert config["skills"]["disabled"] == ["skill-a", "skill-z"]
         mock_save.assert_called_once()
 
+    @patch("hermes_cli.skills_config.save_config")
+    def test_unrelated_toggle_preserves_existing_explicit_manual_disable(self, mock_save):
+        from hermes_cli.skills_config import save_disabled_skills
+
+        config = {"skills": {"disabled": ["hermes-agent"]}}
+        save_disabled_skills(config, {"hermes-agent", "other"})
+
+        assert config["skills"]["disabled"] == ["hermes-agent", "other"]
+        mock_save.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # _is_skill_disabled
