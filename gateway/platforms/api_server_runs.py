@@ -1219,11 +1219,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             status = "interrupted"
             fields = {"error": "Gateway shutdown interrupted the run."}
             extra = {}
-        self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
+        extra.update(fields)
+        self._set_run_status(run_id, status, last_event=f"run.{status}", **extra)
         with suppress(Exception):
             # A worker can finish before its Future is wrapped, so awaiting it
             # need not yield to already-scheduled commentary/tool callbacks.
-            loop.call_soon(run.put_event, _run_event(run_id, f"run.{status}", **fields, **extra))
+            loop.call_soon(run.put_event, _run_event(run_id, f"run.{status}", **extra))
 
     try:
         # Shutdown landed between admission and the task's first tick: nothing to
@@ -1282,7 +1283,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 runtime=served_runtime, requested_runtime=requested if any(requested.values()) else None,
                 route_source=("model_routes" if run.agent_kwargs.get("route")
                               else "raw_request" if any(requested.values()) else "global"))
-            _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
+            _finish(
+                status, fields, output=result.get("final_response", ""), usage=usage,
+                runtime=run.strict_runtime if run.strict_runtime is not None else served_runtime,
+            )
     except asyncio.CancelledError:
         _finish("cancelled")
         raise

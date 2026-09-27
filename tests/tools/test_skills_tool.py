@@ -470,6 +470,19 @@ class TestSkillView:
             allowed = json.loads(skill_view("active-skill"))
         assert allowed["success"] is True
 
+    def test_viewing_declared_dependencies_never_installs_them(self, tmp_path):
+        """A reader-only seat must not gain package installation via skill_view."""
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("pm.ensure") as install,
+        ):
+            _make_skill(tmp_path, "read-only", frontmatter_extra="deps: [ffmpeg]\n")
+            viewed = json.loads(skill_view("read-only"))
+
+        assert viewed["success"] is True
+        assert "Step 1" in viewed["content"]
+        install.assert_not_called()
+
     def test_view_finds_skill_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"

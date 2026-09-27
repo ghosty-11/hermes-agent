@@ -1557,6 +1557,11 @@ class GatewayTurnMixin:
             _intentional_silence = False
             response = _UNEXPECTED_SILENCE_REPLY
         if _intentional_silence:
+            if _silence_reply_expected is False and not is_machinery_display_kind(_silence_kind):
+                logger.debug(
+                    "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",
+                    _platform_name, source.chat_id or "unknown",
+                )
             # Honored silence is a DELIVERY decision: nothing is sent, and the raw marker
             # stays persisted for alternation/audit; actual-delivery metadata records the
             # silence disposition (never a phantom successful answer). Blank it here so no
