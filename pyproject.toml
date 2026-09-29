@@ -486,6 +486,11 @@ youtube = [
   # at first invocation with ModuleNotFoundError (issue #22243).
   "youtube-transcript-api==1.2.4",
 ]
+# Required by skills/productivity/pdf (pypdf manipulation, reportlab creation,
+# pdfplumber extraction). Select explicitly with
+# `hermes pm install --extra pdf` (see [tool.hermes] opt-in-extras); not in
+# [all] per the policy comment there.
+pdf = ["pypdf==6.15.0", "reportlab==5.0.0", "pdfplumber==0.11.10"]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 # starlette==1.3.1 pinned for CVE-2026-48710 (BadHost) — fastapi pulls Starlette
 # transitively and pre-1.0.1 is the vulnerable range. See the mcp extra above.
@@ -570,8 +575,10 @@ hermes-acp = "acp_adapter.entry:main"
 # Extras that only an explicit selection installs (setup, sync_venv). Bundles
 # build with --all-extras and pass --no-extra for each of these, so their
 # closures never ship. KittenTTS pulls torch, transformers and spaCy through
-# misaki[en]: installed when the user picks it, not preinstalled.
-opt-in-extras = ["kittentts"]
+# misaki[en]: installed when the user picks it, not preinstalled. pdf keeps
+# the productivity skill's document stack out of every bundle; installers
+# that need it select it explicitly (`hermes pm install --extra pdf`).
+opt-in-extras = ["kittentts", "pdf"]
 
 # Per-extra platform gates (settled 2026-09-02): an extra listed here is
 # only installable on platforms matching the marker. pm consults this
@@ -747,6 +754,7 @@ opentelemetry-sdk = false
 packaging = false
 parallel-web = false
 pathspec = false
+pdfplumber = false
 pillow = false
 piper-tts = "2026-09-04T16:47:32Z"
 prompt-toolkit = false
@@ -755,6 +763,7 @@ pvporcupine = false
 pyasn1 = false
 pydantic = false
 pyjwt = false
+pypdf = false
 pytest = false
 pytest-asyncio = false
 python-dotenv = false
@@ -763,6 +772,7 @@ python-olm = false
 python-telegram-bot = false
 pyyaml = false
 qrcode = false
+reportlab = false
 requests = false
 rich = false
 ruamel-yaml = false

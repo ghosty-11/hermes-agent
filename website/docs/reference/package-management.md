@@ -141,6 +141,11 @@ authored project file, PM combines the legacy `pip_dependencies` and
 PM-generated project file does not override those lists. Consent, dependency
 membership, and currency checks use the same declaration reader.
 
+To select a declared extra explicitly, run `hermes pm install --extra pdf`.
+That extra carries the productivity PDF skill's document stack (`pypdf`,
+`reportlab`, `pdfplumber`). PM records the selection with the environment, so
+later syncs keep it across profiles.
+
 PM prepares core requirements, enabled extras, and enabled plugin requirements
 together. It seeds resolution from the existing lock. Compatible transitive
 versions can change, but declared constraints and exact pins remain binding.
@@ -407,13 +412,16 @@ Managed tool names and Python extra names are different interfaces:
 ```bash
 python -m pm.cli install chromium
 python -c "from pm import sync_venv; sync_venv(['anthropic'], explicit=True)"
+hermes pm install --extra pdf
 ```
 
 The first command installs a tool. The second adds a declared runtime extra
-to this installation's existing Python selection. Extras accumulate through PM
-sync. The `dev` and `test` dependency groups belong only to the separate test
-environment, not the selected application venv. After changing extras, reactivate
-before starting another Python process.
+to this installation's existing Python selection. The third is the CLI form
+of the same selection — here the `pdf` extra for the bundled productivity
+PDF skill. Extras accumulate through PM sync. The `dev` and `test` dependency
+groups belong only to the separate test environment, not the selected
+application venv. After changing extras, reactivate before starting another
+Python process.
 
 ### Syncing after you edit pyproject.toml
 

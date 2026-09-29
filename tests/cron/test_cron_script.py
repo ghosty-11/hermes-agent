@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import venv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -330,6 +331,224 @@ class TestRunJobScript:
         assert success is True
         assert "backup done 🎉 日次" == output
 
+
+
+def _activate_committed_dependency_layer(tmp_path, monkeypatch, *, generation="committed"):
+    """Zero-monkeypatch managed runtime, the real-file twin of the fixtures in
+    tests/cron/test_cron_windows_venv_abi.py: ``HERMES_RUNTIME_DIR`` names a store whose
+    ``facts.json`` commits a runnable Python tool (a fresh bare venv — no dependencies of
+    its own, so a child on the store Python without the dependency layer cannot fake an
+    import), and the active home's installs state carries *generation*:
+
+    - ``"committed"``: a recorded generation whose site-packages holds a sentinel module
+      plus an ``editable.pth`` member importable from nowhere else, and a
+      ``.lease-managed`` marker so the native boot lease can pin it.
+    - ``"corrupt"``: a state dir whose ``facts.json`` is unparsable.
+    - ``"missing"``: nothing at all under the install state.
+
+    Returns the committed store Python (the interpreter a managed child must run on).
+    """
+    from pm.environments import install_state_dir
+
+    repo = Path(__file__).resolve().parents[2]
+
+    store = tmp_path / "runtime-store"
+    python_entry = "cpython-managed-stand-in"
+    venv.create(store / python_entry, with_pip=False)
+    store_python = store / python_entry / "bin" / "python3"
+    (store / "facts.json").write_text(
+        json.dumps({"packages": {"python": {"entry": python_entry}}}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
+
+    state_dir = install_state_dir(repo)
+    if generation == "committed":
+        state_dir.mkdir(parents=True, exist_ok=True)
+        gen = state_dir / "environments" / "gen-1"
+        venv_dir = gen / "venv"
+        (state_dir / "facts.json").write_text(
+            json.dumps({"packages": {"venv": {"environment": str(venv_dir)}}}),
+            encoding="utf-8")
+        site_packages = venv_dir / "lib" / (
+            f"python{sys.version_info.major}.{sys.version_info.minor}") / "site-packages"
+        site_packages.mkdir(parents=True)
+        (venv_dir / "pyvenv.cfg").write_text(
+            f"home = {sys.base_prefix}\n"
+            f"version = {sys.version_info.major}.{sys.version_info.minor}\n",
+            encoding="utf-8")
+        (site_packages / "cron_runtime_dependency_sentinel.py").write_text(
+            'VALUE = "committed dependency layer ok"\n', encoding="utf-8")
+        editable_src = tmp_path / "editable-src"
+        editable_src.mkdir()
+        (editable_src / "cron_runtime_editable_member.py").write_text(
+            'VALUE = "editable member ok"\n', encoding="utf-8")
+        # Simulate `pip install -e` into the generation: a .pth file pointing at a
+        # source dir. PYTHONPATH alone cannot activate it; only addsitedir can.
+        (site_packages / "cron_runtime_editable.pth").write_text(
+            f"{editable_src}\n", encoding="utf-8")
+        (gen / ".lease-managed").touch()
+    elif generation == "corrupt":
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "facts.json").write_text('{"packages": ', encoding="utf-8")
+    return SimpleNamespace(store_python=store_python)
+
+
+class TestPosixManagedDependencyLayer:
+    """POSIX cron children must get the managed dependency layer Windows already has.
+
+    Real incident (2026-09-29 post-update): the gateway booted on the managed store
+    Python while the dependencies sat in the committed generation, and scheduled
+    scripts that imported a committed dependency (``yaml``, ``pydantic_core``, …)
+    died with ``ModuleNotFoundError`` — scripts importing nothing from the layer
+    kept working — while the Windows sibling composed the committed overlay.
+    """
+
+    def test_python_script_imports_committed_site_and_pth_members(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron.scheduler_script import _run_job_script
+
+        _activate_committed_dependency_layer(tmp_path, monkeypatch)
+
+        script = cron_env / "scripts" / "committed_layer_probe.py"
+        script.write_text(textwrap.dedent(
+            """\
+            import os
+            import sys
+
+            import cron_runtime_dependency_sentinel as sentinel
+            import cron_runtime_editable_member as editable
+
+            print(sentinel.VALUE)
+            print(editable.VALUE)
+            # The managed runtime must preserve the plain `python script.py`
+            # contract: sys.argv[0] is the script itself (never a `-c`
+            # bootstrap), and the default cwd stays the scripts directory.
+            print("ARGV0=" + os.path.realpath(sys.argv[0]))
+            print("CWD=" + os.path.realpath(os.getcwd()))
+            """
+        ))
+
+        success, output = _run_job_script(str(script))
+
+        assert success is True, output
+        assert output.splitlines() == [
+            "committed dependency layer ok",
+            "editable member ok",
+            "ARGV0=" + os.path.realpath(script),
+            "CWD=" + os.path.realpath(cron_env / "scripts"),
+        ]
+
+    def test_committed_child_leases_its_generation_while_running(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """A running cron child must pin its dependency generation against GC with
+        the boot lease (tests/pm/test_runtime_boot_gc.py proves the collector
+        honors that lease); here the cron child itself must be holding it."""
+        from cron.scheduler_script import _run_job_script
+
+        _activate_committed_dependency_layer(tmp_path, monkeypatch)
+
+        repo = Path(__file__).resolve().parents[2]
+        script = cron_env / "scripts" / "lease_probe.py"
+        script.write_text(textwrap.dedent(
+            f"""\
+            from pathlib import Path
+
+            from hermes_cli.runtime_state import collect_generations, leases_held
+            from pm.environments import selected_venv
+
+            repo = Path({str(repo)!r})
+            generation = selected_venv(repo).parent
+            collect_generations(repo, min_age_seconds=0)
+            held = leases_held(generation) and generation.is_dir()
+            print("LEASED" if held else "UNLEASED")
+            """
+        ))
+
+        success, output = _run_job_script(str(script))
+
+        assert success is True, output
+        assert output == "LEASED"
+
+    def test_corrupt_dependency_facts_fail_as_script_failure_not_crash(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """A corrupt dependency record must come back as an ordinary failed run —
+        the child's activation error, captured and redacted like any script
+        failure — never as an exception out of _run_job_script."""
+        from cron.scheduler_script import _run_job_script
+
+        _activate_committed_dependency_layer(tmp_path, monkeypatch, generation="corrupt")
+
+        script = cron_env / "scripts" / "corrupt_facts_probe.py"
+        script.write_text('print("unreachable")\n')
+
+        success, output = _run_job_script(str(script))
+
+        assert success is False
+        assert "cannot read dependency environment" in output
+
+    def test_managed_child_without_committed_generation_gets_no_inherited_deps(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """With the managed runtime committed but no dependency generation, the
+        child must still BE the managed Python — whose (empty) dependency set
+        honestly fails a layer import — never the parent interpreter whose
+        loaded dependencies would mask the missing layer."""
+        from cron.scheduler_script import _run_job_script
+
+        fixture = _activate_committed_dependency_layer(
+            tmp_path, monkeypatch, generation="missing")
+
+        script = cron_env / "scripts" / "managed_child_probe.py"
+        script.write_text("import os\nimport sys\nprint(os.path.realpath(sys.executable))\n")
+        success, output = _run_job_script(str(script))
+        assert success is True, output
+        assert output == os.path.realpath(str(fixture.store_python))
+
+        dep_script = cron_env / "scripts" / "no_layer_probe.py"
+        dep_script.write_text("import cron_runtime_dependency_sentinel\n")
+        success, output = _run_job_script(str(dep_script))
+        assert success is False
+        assert "ModuleNotFoundError" in output
+
+    def test_sh_script_still_runs_via_bash_with_layer_active(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron.scheduler_script import _run_job_script
+
+        _activate_committed_dependency_layer(tmp_path, monkeypatch)
+
+        script = cron_env / "scripts" / "still_bash.sh"
+        script.write_text('echo "bash=${BASH_VERSION:-missing}"\n')
+
+        success, output = _run_job_script(str(script))
+
+        assert success is True, output
+        assert output.startswith("bash=")
+        assert output != "bash=missing"
+
+    def test_python_child_env_stays_sanitized_with_layer_active(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_BLOCKLIST
+        from cron.scheduler_script import _run_job_script
+
+        _activate_committed_dependency_layer(tmp_path, monkeypatch)
+
+        blocked_var = sorted(_HERMES_PROVIDER_ENV_BLOCKLIST)[0]
+        monkeypatch.setenv(blocked_var, "must_not_leak")
+
+        script = cron_env / "scripts" / "overlay_env_probe.py"
+        script.write_text(
+            f'import os\n'
+            f'print("PRESENT" if os.environ.get({blocked_var!r}) else "ABSENT")\n'
+        )
+
+        success, output = _run_job_script(str(script))
+
+        assert success is True, output
+        assert output == "ABSENT"
 
 
 class TestBuildJobPromptWithScript:

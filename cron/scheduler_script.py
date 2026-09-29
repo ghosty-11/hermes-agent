@@ -1,5 +1,6 @@
-"""Cron pre-run script execution: timeouts, Windows venv bootstrap, process-tree termination,
-and the claim-heartbeat thread that keeps a long script's run claim alive.
+"""Cron pre-run script execution: managed-runtime launch on POSIX, Windows venv bootstrap,
+timeouts, process-tree termination, and the claim-heartbeat thread that keeps a long script's
+run claim alive.
 
 Split out of ``cron.scheduler``. Import names from this module directly (``cron.scheduler`` only
 imports the few it calls itself). Origin-resident helpers and sibling split modules are reached
@@ -163,6 +164,42 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+#: The ``code`` a managed-runtime cron child execs after ``hermes_bootstrap`` has activated
+#: the committed dependency generation: run the script exactly the way ``python script.py``
+#: would — ``sys.argv[0]`` is the script itself, the script's directory is importable, and
+#: the cwd is whatever ``_run_job_script`` set.
+_CRON_SCRIPT_BOOTSTRAP = (
+    "script = sys.argv[1];"
+    "sys.argv = sys.argv[1:];"
+    "sys.path.insert(0, os.path.dirname(os.path.abspath(script)));"
+    "runpy.run_path(script, run_name='__main__')"
+)
+
+
+def _posix_managed_runtime_argv(script_path: str) -> Optional[list[str]]:
+    """Managed-runtime argv for a POSIX cron Python script, or ``None`` when no store Python
+    is committed (the caller falls through to the plain interpreter, preserving legacy and
+    external-owner behavior). The child is ``hermes_cli._launchers.runtime_command``: store
+    Python in isolated mode whose ``hermes_bootstrap`` prologue performs the native
+    committed-generation selection, lease, and ``site.addsitedir`` (so ``.pth`` members
+    activate — PYTHONPATH cannot) before the script runner execs. No parent-side dependency
+    reads: the child owns selection, so nothing here races a generation publish and no
+    corrupt record escapes this process — the child exits nonzero and ``_run_job_script``
+    captures it like any script failure.
+
+    Raises whatever the store resolver raises (RuntimeError/OSError) — the caller converts
+    that into the run's error return.
+    """
+    from hermes_cli._launchers import resolve_store_python, runtime_command
+
+    repo = Path(__file__).resolve().parents[1]
+    managed_python = resolve_store_python(repo)
+    if managed_python is None:
+        return None
+    return runtime_command(
+        repo, [script_path], code=_CRON_SCRIPT_BOOTSTRAP, python=managed_python)
+
+
 def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
     """Best-effort hard stop of a cron script and every child it spawned."""
     if proc.poll() is not None:
@@ -320,7 +357,9 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
 def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
     """``(argv, env_overlay, error)`` for a validated script. Interpreter by extension — the
     shebang is deliberately NOT honoured (small, auditable surface): ``.sh``/``.bash`` → bash,
-    else ``sys.executable`` (Windows uv-venv overlay gets the .pth bootstrap)."""
+    else the managed-runtime launch when a store Python is committed (the child activates the
+    committed generation natively), else ``sys.executable`` (Windows uv-venv overlay gets the
+    .pth bootstrap)."""
     if path.suffix.lower() in {".sh", ".bash"}:
         # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
         _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
@@ -331,6 +370,13 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
                 "or rewrite the script as Python (.py)."
             )
         return [_bash, str(path)], {}, None
+    if sys.platform != "win32":
+        try:
+            managed_argv = _posix_managed_runtime_argv(str(path))
+        except (RuntimeError, OSError) as exc:
+            return None, {}, f"Cannot run Python script {path.name!r}: {exc}"
+        if managed_argv is not None:
+            return managed_argv, {}, None
     python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
     if env_overlay:
         return _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path)), env_overlay, None

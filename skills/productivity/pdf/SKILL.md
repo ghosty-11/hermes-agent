@@ -31,9 +31,9 @@ Create PDFs from structured specs, build and fill AcroForm forms (with layout li
 
 ## Prerequisites
 
-- Python 3.10+ with `pypdf`, `reportlab`, `pdfplumber`:
-  `python -m pip install pypdf reportlab pdfplumber`
-- Optional, for page rasterization (`pdf_page_image.py`, overlay rendering): `python -m pip install pypdfium2`, or poppler's `pdftoppm` on PATH. Scripts fall back pypdfium2 → pdftoppm and report `{"rendered": false, "missing": [...]}` (exit 0) when neither exists.
+- Python 3.10+ with `pypdf`, `reportlab`, `pdfplumber` — install the Hermes `pdf` extra:
+  `hermes pm install --extra pdf` (also provides `pypdfium2`, a `pdfplumber` dependency).
+- Optional, for page rasterization (`pdf_page_image.py`, overlay rendering): `pypdfium2` comes with the `pdf` extra; otherwise use poppler's `pdftoppm` on PATH. Scripts fall back pypdfium2 → pdftoppm and report `{"rendered": false, "missing": [...]}` (exit 0) when neither exists.
 - Each helper script checks imports lazily and prints an install hint if a dependency is missing.
 
 ## How to Run
