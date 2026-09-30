@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -115,6 +116,66 @@ def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     }
 
 
+# Mirrors ``python script.py``: sys.path[0] is the script's directory (only an explicit
+# nonempty ``PYTHONSAFEPATH`` env opts out — the dispatcher's own ``-I`` always sets
+# ``sys.flags.safe_path``, so the flag cannot carry the caller's choice), a real ``__main__``
+# module that outlives the body (atexit/threads can still pickle its classes; a runpy temp
+# module is swapped out when the body returns), plus the live checkout next. The dispatcher
+# prologue's native activation re-exports the dependency ``PYTHONPATH``; the bootstrap pops
+# it before the user script so nothing the script spawns inherits it.
+_POSIX_SCRIPT_BOOTSTRAP = """\
+import importlib.machinery, os, sys, types
+os.environ.pop("PYTHONPATH", None)
+repo, script = sys.argv[1], sys.argv[2]
+sys.argv = [script] + sys.argv[3:]
+if os.environ.get("PYTHONSAFEPATH"):
+    sys.path.insert(0, repo)
+else:
+    sys.path[0:1] = [os.path.dirname(script), repo]
+main = types.ModuleType("__main__")
+main.__file__ = script
+main.__loader__ = importlib.machinery.SourceFileLoader("__main__", script)
+main.__cached__ = None
+main.__builtins__ = __builtins__
+sys.modules["__main__"] = main
+with open(script, "rb") as f:
+    code = compile(f.read(), script, "exec")
+exec(code, main.__dict__)
+"""
+
+
+def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
+    """POSIX managed-store installs run cron ``.py`` scripts through the native launcher:
+    ``runtime_command`` starts the committed store Python in isolated mode, whose
+    ``hermes_bootstrap`` prologue performs the child-side committed-generation selection,
+    lease, and ``site.addsitedir`` (so ``.pth`` members activate — PYTHONPATH cannot) before
+    ``_POSIX_SCRIPT_BOOTSTRAP`` execs the script the way ``python script.py`` would. No
+    parent-side dependency reads: nothing here races a generation publish and no corrupt
+    record escapes this process — the child exits nonzero and ``_run_job_script`` captures
+    it like any script failure.
+
+    No ``PYTHONPATH``: everything the script spawns would inherit it and a foreign
+    interpreter would load the store's compiled extensions (#123440). The launcher persists
+    none and the bootstrap pops the activation re-export. Lazy installs are off for the
+    script's process tree: a script importing ``hermes_bootstrap`` could otherwise complete
+    a source update and ``execv`` itself onto the bare store Python. Without a committed
+    store Python the caller's own interpreter runs the script (legacy and external-owner
+    behavior).
+
+    Raises whatever the store resolver raises (RuntimeError/OSError) — the caller converts
+    that into the run's error return.
+    """
+    from hermes_cli._launchers import resolve_store_python, runtime_command
+
+    repo = Path(__file__).resolve().parents[1]
+    managed_python = resolve_store_python(repo)
+    if managed_python is None:
+        return [sys.executable, str(script)], {}
+    argv = runtime_command(
+        repo, [str(repo), str(script)], code=_POSIX_SCRIPT_BOOTSTRAP, python=managed_python)
+    return argv, {"HERMES_DISABLE_LAZY_INSTALLS": "1"}
+
+
 def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str]]:
     """Hidden, output-capable Python invocation for Windows cron scripts. ``pythonw.exe`` loses
     captured output; uv venv launchers can re-exec the base console python and flash a window
@@ -162,42 +223,6 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
 
     return str(interpreter), env_overlay
-
-
-#: The ``code`` a managed-runtime cron child execs after ``hermes_bootstrap`` has activated
-#: the committed dependency generation: run the script exactly the way ``python script.py``
-#: would — ``sys.argv[0]`` is the script itself, the script's directory is importable, and
-#: the cwd is whatever ``_run_job_script`` set.
-_CRON_SCRIPT_BOOTSTRAP = (
-    "script = sys.argv[1];"
-    "sys.argv = sys.argv[1:];"
-    "sys.path.insert(0, os.path.dirname(os.path.abspath(script)));"
-    "runpy.run_path(script, run_name='__main__')"
-)
-
-
-def _posix_managed_runtime_argv(script_path: str) -> Optional[list[str]]:
-    """Managed-runtime argv for a POSIX cron Python script, or ``None`` when no store Python
-    is committed (the caller falls through to the plain interpreter, preserving legacy and
-    external-owner behavior). The child is ``hermes_cli._launchers.runtime_command``: store
-    Python in isolated mode whose ``hermes_bootstrap`` prologue performs the native
-    committed-generation selection, lease, and ``site.addsitedir`` (so ``.pth`` members
-    activate — PYTHONPATH cannot) before the script runner execs. No parent-side dependency
-    reads: the child owns selection, so nothing here races a generation publish and no
-    corrupt record escapes this process — the child exits nonzero and ``_run_job_script``
-    captures it like any script failure.
-
-    Raises whatever the store resolver raises (RuntimeError/OSError) — the caller converts
-    that into the run's error return.
-    """
-    from hermes_cli._launchers import resolve_store_python, runtime_command
-
-    repo = Path(__file__).resolve().parents[1]
-    managed_python = resolve_store_python(repo)
-    if managed_python is None:
-        return None
-    return runtime_command(
-        repo, [script_path], code=_CRON_SCRIPT_BOOTSTRAP, python=managed_python)
 
 
 def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
@@ -354,12 +379,46 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
     return path, None
 
 
-def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
+def _resolve_cron_interpreter(interpreter: str) -> tuple[Optional[str], Optional[str]]:
+    """``(python_exe, error)`` for a job's ``interpreter`` field. Checked at run time, not create
+    time: a user venv can be rebuilt or moved while the job lives. Bare names are refused — they
+    silently change meaning with PATH. The name (and the symlink target's name) must look like a
+    Python: the lifecycle guard classifies ``.py`` scripts as Python and skips its shell reference
+    walk, so ``interpreter=/bin/bash`` would run an unscanned ``.py`` body as shell. ``pythonw``
+    is refused because it discards captured output (an agent job would go silently quiet)."""
+    from cron.lifecycle_guard import _INTERPRETER_IMAGE_RE
+
+    raw = interpreter.strip()
+    try:
+        resolved = Path(raw).expanduser()
+        if not resolved.is_absolute():
+            return None, (f"Interpreter must be an absolute or ~-prefixed path (got {raw!r}). "
+                          "Bare names like 'python3' are not stable across PATH changes.")
+        mode = resolved.stat().st_mode
+        names = {resolved.name.lower(), resolved.resolve().name.lower()}
+    except FileNotFoundError:
+        return None, f"Interpreter not found: {raw}"
+    except (RuntimeError, OSError) as exc:  # unknown ~user, unreadable parent, symlink loop
+        return None, f"Unable to resolve interpreter path {raw!r}: {exc}"
+    if not stat.S_ISREG(mode):
+        return None, f"Interpreter path is not a file: {resolved}"
+    if sys.platform != "win32" and not mode & 0o111:
+        return None, f"Interpreter is not executable: {resolved}"
+    if not all(_INTERPRETER_IMAGE_RE.match(name) and not name.startswith("pythonw")
+               for name in names):
+        return None, f"Interpreter must be a Python executable (python, python3, python3.12, ...): {resolved}"
+    return str(resolved), None
+
+
+def _script_argv(
+    path: Path, interpreter: Optional[str] = None,
+) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
     """``(argv, env_overlay, error)`` for a validated script. Interpreter by extension — the
     shebang is deliberately NOT honoured (small, auditable surface): ``.sh``/``.bash`` → bash,
-    else the managed-runtime launch when a store Python is committed (the child activates the
-    committed generation natively), else ``sys.executable`` (Windows uv-venv overlay gets the
-    .pth bootstrap)."""
+    else the job's ``interpreter`` when set, else the managed-runtime launch when a store
+    Python is committed (the child selects, leases and .pth-activates the generation itself,
+    then execs the script), else ``sys.executable`` (the POSIX helper's no-store fallback, or
+    the Windows uv-venv overlay .pth bootstrap)."""
     if path.suffix.lower() in {".sh", ".bash"}:
         # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
         _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
@@ -370,13 +429,16 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
                 "or rewrite the script as Python (.py)."
             )
         return [_bash, str(path)], {}, None
+    if isinstance(interpreter, str) and interpreter.strip():
+        # An explicit interpreter owns its dependencies, without managed-store overlays.
+        python_exe, err = _resolve_cron_interpreter(interpreter)
+        return ([python_exe, str(path)] if python_exe else None), {}, err
     if sys.platform != "win32":
         try:
-            managed_argv = _posix_managed_runtime_argv(str(path))
+            posix_argv, posix_overlay = _posix_cron_script_argv(path)
         except (RuntimeError, OSError) as exc:
             return None, {}, f"Cannot run Python script {path.name!r}: {exc}"
-        if managed_argv is not None:
-            return managed_argv, {}, None
+        return posix_argv, posix_overlay, None
     python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
     if env_overlay:
         return _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path)), env_overlay, None
@@ -385,7 +447,7 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
 
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
-    cancel_event: Optional[_CancelEventLike] = None,
+    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -395,17 +457,17 @@ def _run_job_script(
     Args: script_path: Path to the script. Relative paths are resolved against HERMES_HOME/scripts/.
     Absolute and ~-prefixed paths are also validated to ensure they stay within the scripts dir. workdir:
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
-    instead of the scripts-dir parent. See #69396.
+    instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
+    ``.py`` scripts (#8714).
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
     script_timeout = _get_script_timeout()
-    argv, env_overlay, err = _script_argv(path)
-    if argv is None:
-        return False, err
-
     try:
+        argv, env_overlay, err = _script_argv(path, interpreter)
+        if argv is None:
+            return False, err
         from tools.environments.local import build_subprocess_env
         # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
         # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
@@ -427,10 +489,11 @@ def _run_job_script(
                 "encoding": "utf-8",
                 "errors": "replace"}
         # The process env is the LAUNCH profile's. For a job owned by a routed profile, drop that
-        # profile's .env residue from the base first (no-op for the launch profile's own jobs);
-        # the sanitizer then overlays the names the owning profile declares in
-        # terminal.env_passthrough from its own secret scope (#114209). The factory snapshots the
-        # process env itself — no raw copy at the spawn site (test_subprocess_env_guard).
+        # profile's .env residue from the base first (no-op for the launch profile's own jobs), then
+        # overlay the routed profile's own scope (which never enters os.environ under multiplex
+        # semantics) before the sanitizer, which also overlays the names the owning profile declares
+        # in terminal.env_passthrough from that scope (#114209). The factory snapshots the process
+        # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
@@ -511,11 +574,15 @@ def _run_job_script_with_claim_heartbeat(
     the stale-claim TTL; without a heartbeat another scheduler would re-dispatch the one-shot.
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
+    def run() -> tuple[bool, str]:
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                               interpreter=job.get("interpreter"))
+
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return run()
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -533,10 +600,10 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return run()
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return run()
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.

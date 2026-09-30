@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.run_turn import GatewayTurnMixin, _UNEXPECTED_SILENCE_REPLY
+from gateway.run_turn import GatewayTurnMixin
 from gateway.turn_origin import (
     RESPONSE_POLICY_DISCRETIONARY,
     RESPONSE_POLICY_REQUIRED,
@@ -166,7 +166,7 @@ class TestShapingPolicy:
             turn_origin={"event_id": "e", "kind": "direct", "response_policy": "required"},
         )
         assert silent is False
-        assert response == _UNEXPECTED_SILENCE_REPLY
+        assert "[SILENT]" not in response
 
     @pytest.mark.asyncio
     async def test_absent_origin_keeps_the_rejection_fallback(self):
@@ -175,7 +175,8 @@ class TestShapingPolicy:
             runner, {"final_response": "NO_REPLY", "messages": [], "api_calls": 1},
             persist_user_display_kind=None,
         )
-        assert silent is False and response == _UNEXPECTED_SILENCE_REPLY
+        assert silent is False
+        assert "NO_REPLY" not in response
 
     @pytest.mark.asyncio
     async def test_discretionary_origin_honors_intentional_silence(self):
@@ -224,7 +225,8 @@ class TestShapingPolicy:
             persist_user_display_kind=None,
             turn_origin={"event_id": "e1", "kind": "ambient", "response_policy": "discretionary"},
         )
-        assert silent is False and response == _UNEXPECTED_SILENCE_REPLY
+        assert silent is False
+        assert "[SILENT]" not in response
 
     @pytest.mark.asyncio
     async def test_queued_terminal_discretionary_honors_silence(self):
@@ -259,7 +261,7 @@ class TestQueuedFirstResponseSilencePolicy:
     def _turn_ctx(self, origin):
         return SimpleNamespace(
             mute_notification_reply=False, session_key="sk:queued", stream_consumer_holder=[None],
-            persist_user_display_kind=None, turn_origin=origin, source=_source(),
+            persist_user_display_kind=None, turn_origin=origin, source=_source(), reply_expected=None,
             _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,
             run_generation=0)
 
@@ -296,4 +298,5 @@ class TestQueuedFirstResponseSilencePolicy:
             self._turn_ctx({"event_id": "e", "kind": "direct", "response_policy": "required"}),
             None, None, {"final_response": "[SILENT]", "messages": []}, None,
         )
-        assert sent == [_UNEXPECTED_SILENCE_REPLY]
+        assert len(sent) == 1
+        assert "[SILENT]" not in sent[0]

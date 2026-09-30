@@ -29,6 +29,7 @@ class TurnFacadeMixin:
         turn_author: Optional[Dict[str, Any]] = None,
         turn_origin: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
+        title_user_message: Optional[str]=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -153,6 +154,7 @@ class TurnFacadeMixin:
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
                         turn_author=turn_author,
                         turn_origin=turn_origin,
+                        title_user_message=title_user_message,
                     )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;

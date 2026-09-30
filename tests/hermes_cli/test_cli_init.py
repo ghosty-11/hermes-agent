@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from agent.i18n import t
 
 
 
@@ -145,7 +146,13 @@ class TestToolsetValidationWarning:
         assert "Unknown toolsets: ghost_set" in capsys.readouterr().out
 
     def test_multiple_invalid_names_trigger_single_discovery_pass(self, capsys):
-        """Discovery runs once for the whole invalid list, not once per name."""
+        """Discovery runs once for the whole invalid list, not once per name.
+
+        The nowait probe above is patched to a stale empty set: it already has its
+        own discovery fallback, and this test pins the re-validation pass that
+        covers the in-flight stale-cache start (#91757) — one pass per list from
+        this trigger, whatever the other entry point did.
+        """
         import toolsets as toolsets_mod
         import hermes_cli.plugins as plugins_mod
 
@@ -153,6 +160,7 @@ class TestToolsetValidationWarning:
             return name == "hermes-cli"
 
         with patch.object(toolsets_mod, "validate_toolset", side_effect=_fake_validate), \
+             patch.object(plugins_mod, "get_plugin_toolset_keys_nowait", side_effect=lambda: set()), \
              patch.object(plugins_mod, "discover_plugins", side_effect=lambda: None) as discover:
             _make_cli(toolsets=["hermes-cli", "ghost_set", "phantom_set"])
 
@@ -430,7 +438,7 @@ class TestHistoryDisplay:
         cli._handle_resume_command("/resume")
         output = capsys.readouterr().out
 
-        assert "Recent sessions" in output
+        assert t("cli.session.recent_header") in output
         assert "Checking Running Hermes Agent" in output
 
 
@@ -461,7 +469,7 @@ class TestHistoryDisplay:
         output = capsys.readouterr().out
 
         assert "Unknown command" not in output
-        assert "Recent sessions" in output
+        assert t("cli.session.recent_header") in output
         assert "Checking Running Hermes Agent" in output
         assert "20260401_201329_d85961" in output
 

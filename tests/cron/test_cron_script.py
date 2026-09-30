@@ -98,6 +98,34 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("make_interpreter, expected", [
+        (lambda d: "python3", "absolute or ~-prefixed"),
+        (lambda d: str(d / "missing" / "python3"), "not found"),
+        (lambda d: str(d), "not a file"),
+        (lambda d: (d / "python3").write_text("") or str(d / "python3"), "not executable"),
+        (lambda d: "/bin/bash", "must be a Python executable"),
+        (lambda d: (d / "python").symlink_to("/bin/bash") or str(d / "python"),
+         "must be a Python executable"),
+        (lambda d: (d / "pythonw").symlink_to(sys.executable) or str(d / "pythonw"),
+         "must be a Python executable"),
+    ], ids=["bare-name", "missing", "directory", "not-executable", "bash",
+            "python-symlink-to-bash", "pythonw"])
+    def test_configured_interpreter_is_refused_unless_a_python_path(
+        self, cron_env, tmp_path, make_interpreter, expected
+    ):
+        """#70500: a bad job ``interpreter`` fails the run with a clear message instead of
+        raising — and never runs a ``.py`` body under a non-Python image, which would let an
+        unscanned script execute as shell."""
+        from cron.scheduler_script import _run_job_script
+
+        script = cron_env / "scripts" / "job.py"
+        script.write_text('print("ran")\n')
+
+        success, output = _run_job_script(str(script), interpreter=make_interpreter(tmp_path))
+        assert success is False
+        assert expected in output
+
     def test_script_stdout_non_utf8_decoded_lossily(self, cron_env):
         """A stray non-UTF-8 byte in script stdout must not fail the run (#105582).
 
@@ -306,8 +334,54 @@ class TestRunJobScript:
         )
         assert argv == [sys.executable, str(script)]
 
+    @pytest.mark.platforms("posix")
+    def test_posix_managed_store_script_runs_on_venv_with_live_checkout(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """#123044/#123440: on a POSIX managed-store install a cron ``.py`` script imports the
+        selected venv's packages, resolves Hermes from the LIVE checkout ahead of the venv's
+        workspace snapshot, keeps ``python script.py`` path and ``__main__`` semantics, and
+        leaves no ``PYTHONPATH`` for its own children to inherit."""
+        from cron import scheduler_script
+        from cron.scheduler_script import _run_job_script
+        from pm.environments import selected_venv, site_packages
 
+        _activate_committed_dependency_layer(tmp_path, monkeypatch)
 
+        # A stale workspace snapshot carried by the generation's site-packages, as a .pth
+        # member: the live checkout must still win the `hermes_constants` import.
+        repo = Path(scheduler_script.__file__).resolve().parents[1]
+        snapshot = tmp_path / "workspace-snapshot"
+        snapshot.mkdir()
+        (snapshot / "hermes_constants.py").write_text("STALE = True\n", encoding="utf-8")
+        generation_site = site_packages(selected_venv(repo))
+        (generation_site / "snapshot.pth").write_text(f"{snapshot}\n", encoding="utf-8")
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text(
+            "import atexit, os, pickle, sys\n"
+            "import cron_runtime_dependency_sentinel as sentinel\n"
+            "import cron_runtime_editable_member as editable\n"
+            "import hermes_constants\n"
+            "class Probe: pass\n"
+            "atexit.register(lambda: print('pickled', bool(pickle.dumps(Probe()))))\n"
+            "print(sentinel.VALUE)\n"
+            "print(editable.VALUE)\n"
+            "print(hermes_constants.__file__)\n"
+            "print(sys.path[0])\n"
+            "print('PYTHONPATH=' + (os.environ.get('PYTHONPATH') or ''))\n",
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script("probe.py")
+        assert success is True, output
+        value, editable_value, constants_file, path0, pythonpath, pickled = output.splitlines()
+        assert value == "committed dependency layer ok"
+        assert editable_value == "editable member ok"
+        assert Path(constants_file).resolve() == repo / "hermes_constants.py"
+        assert Path(path0).resolve() == script.parent.resolve()
+        assert pythonpath == "PYTHONPATH="
+        assert pickled == "pickled True"  # __main__ outlives the body, as in a plain run
 
     def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
         """Emoji in script stdout must reach the caller intact (#42384).
@@ -469,6 +543,39 @@ class TestPosixManagedDependencyLayer:
 
         assert success is True, output
         assert output == "LEASED"
+
+    def test_managed_script_main_outlives_body_without_exporting_dependency_path(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """Exit handlers retain script classes; foreign children inherit no managed PYTHONPATH."""
+        from cron.scheduler_script import _run_job_script
+
+        _activate_committed_dependency_layer(tmp_path, monkeypatch)
+        script = cron_env / "scripts" / "main_lifetime_probe.py"
+        script.write_text(textwrap.dedent(
+            """\
+            import atexit
+            import os
+            import pickle
+            import subprocess
+            import sys
+
+            class Probe:
+                pass
+
+            atexit.register(lambda: print("pickled", isinstance(pickle.loads(pickle.dumps(Probe())), Probe)))
+            child = subprocess.run(
+                [sys.executable, "-c", "import os; print('PYTHONPATH=' + os.environ.get('PYTHONPATH', ''))"],
+                check=True, capture_output=True, text=True,
+            )
+            print(child.stdout.strip())
+            """
+        ))
+
+        success, output = _run_job_script(str(script))
+
+        assert success is True, output
+        assert output.splitlines() == ["PYTHONPATH=", "pickled True"]
 
     def test_corrupt_dependency_facts_fail_as_script_failure_not_crash(
         self, cron_env, tmp_path, monkeypatch
