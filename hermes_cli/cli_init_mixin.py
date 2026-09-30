@@ -236,16 +236,10 @@ class CLIInitMixin:
                 # here before discovery on a cold start). Re-validate after a
                 # one-time discovery pass before declaring anything unknown —
                 # mirror of the TUI gateway's approach (tui_gateway/server.py).
-                # The nowait probe above already blocks-and-discovers when
-                # nothing is in flight, so this pass runs only while the
-                # registry is still undiscovered (the in-flight stale-cache
-                # start #91757 exists for): one discovery per launch, from
-                # either entry point.
                 try:
-                    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+                    from hermes_cli.plugins import discover_plugins
 
-                    if not get_plugin_manager()._discovered:
-                        discover_plugins()
+                    discover_plugins()
                     invalid = [t for t in invalid if not validate_toolset(t)]
                 except Exception:
                     # A plugin that raises during import must not masquerade

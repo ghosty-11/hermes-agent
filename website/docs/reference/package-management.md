@@ -124,6 +124,13 @@ environment before third-party imports. Processes retain their existing imports
 until they restart. Garbage collection preserves selected generations and
 lease-managed generations with live readers.
 
+On POSIX managed installations, scheduled Python scripts select and lease the
+dependency generation through the native launcher. Scripts retain their own
+`__main__` module through exit handlers and resolve Hermes from the live checkout.
+The dependency `PYTHONPATH` is removed before script execution so a foreign
+interpreter launched by the script does not inherit managed compiled extensions.
+An explicit job interpreter owns its dependencies and bypasses this launcher.
+
 Downloads share a lock per partial URL. A failed or paused transfer cannot
 publish a partial destination, and garbage collection cannot delete a live
 transfer's files. Resume reuses ranges only when their recorded length,

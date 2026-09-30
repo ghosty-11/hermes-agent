@@ -145,28 +145,25 @@ class TestToolsetValidationWarning:
 
         assert "Unknown toolsets: ghost_set" in capsys.readouterr().out
 
-    def test_multiple_invalid_names_trigger_single_discovery_pass(self, capsys):
-        """Discovery runs once for the whole invalid list, not once per name.
-
-        The nowait probe above is patched to a stale empty set: it already has its
-        own discovery fallback, and this test pins the re-validation pass that
-        covers the in-flight stale-cache start (#91757) — one pass per list from
-        this trigger, whatever the other entry point did.
-        """
+    def test_cached_toolsets_wait_for_inflight_discovery_before_warning(self, capsys):
+        """The discovery reentrancy flag can be set before a plugin registers its toolset."""
         import toolsets as toolsets_mod
         import hermes_cli.plugins as plugins_mod
 
-        def _fake_validate(name):
-            return name == "hermes-cli"
+        discovered = {"finished": False}
 
-        with patch.object(toolsets_mod, "validate_toolset", side_effect=_fake_validate), \
-             patch.object(plugins_mod, "get_plugin_toolset_keys_nowait", side_effect=lambda: set()), \
-             patch.object(plugins_mod, "discover_plugins", side_effect=lambda: None) as discover:
-            _make_cli(toolsets=["hermes-cli", "ghost_set", "phantom_set"])
+        def _validate(name):
+            return name == "hermes-cli" or discovered["finished"]
 
-        discover.assert_called_once()
-        out = capsys.readouterr().out
-        assert "Unknown toolsets: ghost_set, phantom_set" in out
+        with patch.object(toolsets_mod, "validate_toolset", side_effect=_validate), \
+             patch.object(plugins_mod, "get_plugin_toolset_keys_nowait", return_value=set()), \
+             patch.object(plugins_mod, "get_plugin_manager",
+                          return_value=SimpleNamespace(_discovered=True)), \
+             patch.object(plugins_mod, "discover_plugins",
+                          side_effect=lambda: discovered.__setitem__("finished", True)):
+            _make_cli(toolsets=["hermes-cli", "cad_compare"])
+
+        assert "cad_compare" not in capsys.readouterr().out
 
 
 class TestFallbackChainInit:
