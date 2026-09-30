@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.run_turn import GatewayTurnMixin
+from gateway.run_turn import GatewayTurnMixin, _unexpected_silence_reply
 from gateway.turn_origin import (
     RESPONSE_POLICY_DISCRETIONARY,
     RESPONSE_POLICY_REQUIRED,
@@ -166,7 +166,7 @@ class TestShapingPolicy:
             turn_origin={"event_id": "e", "kind": "direct", "response_policy": "required"},
         )
         assert silent is False
-        assert "[SILENT]" not in response
+        assert response == _unexpected_silence_reply()
 
     @pytest.mark.asyncio
     async def test_absent_origin_keeps_the_rejection_fallback(self):
@@ -176,7 +176,7 @@ class TestShapingPolicy:
             persist_user_display_kind=None,
         )
         assert silent is False
-        assert "NO_REPLY" not in response
+        assert response == _unexpected_silence_reply()
 
     @pytest.mark.asyncio
     async def test_discretionary_origin_honors_intentional_silence(self):
@@ -226,7 +226,7 @@ class TestShapingPolicy:
             turn_origin={"event_id": "e1", "kind": "ambient", "response_policy": "discretionary"},
         )
         assert silent is False
-        assert "[SILENT]" not in response
+        assert response == _unexpected_silence_reply()
 
     @pytest.mark.asyncio
     async def test_queued_terminal_discretionary_honors_silence(self):
@@ -298,5 +298,4 @@ class TestQueuedFirstResponseSilencePolicy:
             self._turn_ctx({"event_id": "e", "kind": "direct", "response_policy": "required"}),
             None, None, {"final_response": "[SILENT]", "messages": []}, None,
         )
-        assert len(sent) == 1
-        assert "[SILENT]" not in sent[0]
+        assert sent == [_unexpected_silence_reply()]

@@ -157,6 +157,8 @@ class TestToolsetValidationWarning:
 
         with patch.object(toolsets_mod, "validate_toolset", side_effect=_validate), \
              patch.object(plugins_mod, "get_plugin_toolset_keys_nowait", return_value=set()), \
+             patch.object(plugins_mod, "_background_discovery_thread",
+                          new=SimpleNamespace(is_alive=lambda: True)), \
              patch.object(plugins_mod, "get_plugin_manager",
                           return_value=SimpleNamespace(_discovered=True)), \
              patch.object(plugins_mod, "discover_plugins",
