@@ -370,6 +370,11 @@
     "kind": "bare_which"
   },
   {
+    "path": "hermes_cli/source_build.py",
+    "symbol": "validate_offline_products",
+    "kind": "bare_which"
+  },
+  {
     "path": "hermes_cli/stdio.py",
     "symbol": "_default_windows_editor",
     "kind": "bare_which"

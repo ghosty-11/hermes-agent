@@ -139,6 +139,10 @@ async def test_complete_preview_survives_long_flood_fallback_failure(monkeypatch
     consumer._last_sent_text = "Final answer"
     consumer._already_sent = True
     consumer._fallback_final_send = True
+    consumer._retain_delivery_remainder(
+        "Final answer", SendResult(success=True, message_id="preview-1",
+                                   delivered_text="Final answer"),
+        attempted_content="Final answer")
 
     await consumer._send_fallback_final("Final answer")
 
@@ -245,6 +249,10 @@ async def test_flood_capped_resend_keeps_single_bubble_reply_first(monkeypatch):
     consumer._last_sent_text = "Final answer"
     consumer._already_sent = True
     consumer._fallback_final_send = True
+    consumer._retain_delivery_remainder(
+        "Final answer", SendResult(success=True, message_id="preview-1",
+                                   delivered_text="Final answer"),
+        attempted_content="Final answer")
 
     await consumer._send_fallback_final("Final answer")
 

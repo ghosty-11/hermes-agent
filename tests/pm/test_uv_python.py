@@ -40,8 +40,8 @@ def installed_uv(tmp_path, monkeypatch):
     facts = Facts(store / "facts.json")
     facts.record("uv", "test", entry.name, {}, store, target=target, artifacts=[digest])
     monkeypatch.setattr(paths, "lockfile_path", lambda: lock.path)
-    monkeypatch.setattr(paths, "store_root", lambda: store)
-    monkeypatch.setattr(paths, "writable_store_root", lambda: store)
+    monkeypatch.setattr(paths, "store_root", lambda project_root=None: store)
+    monkeypatch.setattr(paths, "writable_store_root", lambda project_root=None: store)
     monkeypatch.setitem(registry._packages, "uv", Uv())
     return tmp_path, binary, facts, target, digest
 
@@ -190,7 +190,7 @@ def test_bundled_uv_uses_a_verified_writable_python_without_changing_runtime(ins
     ensure = importlib.import_module("pm.install")
     shipped = uv_binary.parent.parent
     writable = root / "writable-tools"
-    monkeypatch.setattr(paths, "writable_store_root", lambda: writable)
+    monkeypatch.setattr(paths, "writable_store_root", lambda project_root=None: writable)
     (shipped.parent / "manifest.json").write_text("{}", encoding="utf-8")
 
     class FixturePython(Python):

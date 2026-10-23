@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from hermes_cli import config as _config
 from hermes_cli import managed_scope
+from hermes_cli.config_primitives import _env_ref_lookup, _expand_env_vars, _normalize_root_model_keys
 from hermes_cli.config_read_errors import _warn_config_parse_failure
 from utils import fast_safe_load
 
@@ -31,9 +32,9 @@ _EFFECTIVE_CACHE: Dict[str, Tuple[Any, ...]] = {}
 
 
 def _effective(raw: Dict[str, Any]) -> Dict[str, Any]:
-    expanded = _config._expand_env_vars(raw)
+    expanded = _expand_env_vars(raw)
     merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
-    return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
+    return _normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 
 def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> Dict[str, Any]:
@@ -67,7 +68,7 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         user_sig, cache_sig = _config._load_config_cache_sig(config_path)
         cached = _EFFECTIVE_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:8] == cache_sig:
-            if all(_config._env_ref_lookup(k) == v for k, v in cached[9].items()):
+            if all(_env_ref_lookup(k) == v for k, v in cached[9].items()):
                 return copy.deepcopy(cached[8])
 
         raw: Dict[str, Any] = {}

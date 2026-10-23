@@ -8,6 +8,7 @@ import pytest
 
 from agent.think_scrubber import THINK_TAG_NAMES
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.platforms.base import SendResult
 
 
 
@@ -350,7 +351,7 @@ class TestSegmentBreakOnToolBoundary:
             SimpleNamespace(success=True, message_id="msg_3"),
         ]
         adapter.send = AsyncMock(side_effect=send_results)
-        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=False, error="flood_control:6"))
+        adapter.edit_message = AsyncMock(return_value=SendResult(success=False, error="flood_control:6"))
         adapter.MAX_MESSAGE_LENGTH = 4096
 
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
@@ -369,7 +370,9 @@ class TestSegmentBreakOnToolBoundary:
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         # The undelivered "world" tail must reach the user, and the next
         # segment must not duplicate "Hello" that was already visible.
-        assert sent_texts == ["Hello ▉", "world", "Next segment"]
+        # Contract: the flushed tail is the exact unseen suffix (owned-byte accounting,
+        # see test_stream_delivery_handoff::test_ambiguous_segment_tail_remains_owned...).
+        assert sent_texts == ["Hello ▉", " world", "Next segment"]
 
     @pytest.mark.asyncio
     async def test_segment_break_after_mid_stream_edit_failure_preserves_tail(self):
@@ -391,9 +394,9 @@ class TestSegmentBreakOnToolBoundary:
         # — simulating Telegram's "edit once then get rate-limited" pattern.
         edit_results = [
             SimpleNamespace(success=True),   # "Hello world ▉"  — succeeds
-            SimpleNamespace(success=False, error="flood_control:6.0"),  # "Hello world more ▉" — flood triggered
-            SimpleNamespace(success=False, error="flood_control:6.0"),  # finalize edit at segment break
-            SimpleNamespace(success=False, error="flood_control:6.0"),  # cursor-strip attempt
+            SendResult(success=False, error="flood_control:6.0"),  # "Hello world more ▉" — flood triggered
+            SendResult(success=False, error="flood_control:6.0"),  # finalize edit at segment break
+            SendResult(success=False, error="flood_control:6.0"),  # cursor-strip attempt
         ]
         adapter.edit_message = AsyncMock(side_effect=edit_results + [edit_results[-1]] * 10)
         adapter.MAX_MESSAGE_LENGTH = 4096
@@ -586,7 +589,7 @@ class TestFinalResponseDeliveryGuard:
         """A failed first send disables edits: a preview sent after it could never be updated and
         would stay on screen truncated next to the final. Only the complete reply reaches the chat."""
         delivered = []
-        results = iter([SimpleNamespace(success=False, error="timeout")])
+        results = iter([SendResult(success=False, error="timeout")])
 
         async def send(**kw):
             result = next(results, None) or SimpleNamespace(success=True, message_id=f"m{len(delivered) + 1}")
@@ -610,7 +613,12 @@ class TestFinalResponseDeliveryGuard:
         consumer.finish()
         await asyncio.wait_for(task, timeout=10)
 
-        assert delivered == ["preview never landed and more streamed text then the end."]
+        # A timeout may have reached the platform: retain the owed final without replaying it inline.
+        assert delivered == []
+        assert adapter.send.await_count == 1
+        handoff = consumer.delivery_handoff_for_final("preview never landed and more streamed text then the end.")
+        assert handoff is not None and handoff.ambiguous
+        assert handoff.owed == "preview never landed and more streamed text then the end."
 
 
 class TestFinalContentDeliveredGuard:
@@ -1098,6 +1106,7 @@ class TestCursorStrippingOnFallback:
         )
         consumer._message_id = "msg-1"
         consumer._last_sent_text = "Hello world ▉"
+        consumer._last_sent_cursor_appended = True
         consumer._fallback_final_send = False
 
         await consumer._send_fallback_final("Hello world")

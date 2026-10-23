@@ -636,8 +636,8 @@ def check_discord_requirements() -> bool:
     if DISCORD_AVAILABLE:
         return True
     try:
-        from pm import ensure_import as _lazy_ensure
-        _lazy_ensure("discord")
+        from pm.platform_requirements import ensure_platform_dependencies
+        ensure_platform_dependencies("discord", _Path(__file__).with_name("plugin.yaml"))
     except Exception:
         return False
     try:
@@ -3067,6 +3067,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             result = SendResult(success=False, error="Refusing to send empty message")
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
+        message_ids = []
+        delivered_chunks = []
+        chunks = []
         try:
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -3089,7 +3092,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             chunks = self._cap_split_chunks(
                 self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
             )
-            message_ids = []
             reference = self._reply_reference_for_send(reply_to, channel)
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
@@ -3109,6 +3111,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                delivered_chunks.append(chunk)
             # Track the last sent message for history backfill (skips the full history scan).
             if message_ids:
                 _target_id = thread_id or chat_id
@@ -3122,17 +3125,34 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                delivered_text="\n".join(delivered_chunks),
+                raw_response={"message_ids": message_ids,
+                              "acknowledged_chunks": tuple(delivered_chunks)}
             )
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             if _is_discord_transport_error(e):
-                # Connection-shaped failure: runtime-retryable marker so the reconnect sweep can replay it.
                 result = SendResult(success=False, error="send_path_degraded", retryable=True)
             else:
                 result = SendResult(success=False, error=str(e))
-            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
+            ambiguous = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or self._is_timeout_error(str(e))
+            if chunks:
+                remainder = "\n".join(chunks[len(message_ids):])
+                result.raw_response = {
+                    "message_ids": message_ids,
+                    "acknowledged_chunks": tuple(delivered_chunks),
+                    "remaining_content": remainder,
+                    "model_remaining_content": remainder,
+                    "attachment_remaining_content": "",
+                    "delivery_ambiguous": ambiguous,
+                }
+            if message_ids:
+                result.message_id = message_ids[0]
+                result.delivered_text = "\n".join(delivered_chunks)
+                result.raw_response["partial_overflow"] = len(message_ids) < len(chunks)
+            return await self._record_response_async(
+                reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
 
     @staticmethod
     def _forum_thread_parts(thread: Any) -> tuple:
@@ -3145,8 +3165,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return thread_channel, thread_id, starter_msg, message_id
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
-        """Create a forum thread post with the message as starter (forum channels reject direct
-        sends; name from the first line). Chunk failures land in ``raw_response['warnings']``."""
+        """Create a forum starter and report failed follow-ups as warnings, not
+        replayable remainders addressed to the forum parent."""
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
         thread_name = _derive_forum_thread_name(content)
@@ -3158,19 +3178,24 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
         thread_channel, thread_id, starter_msg, message_id = self._forum_thread_parts(thread)
         message_ids = [message_id]
+        acknowledged_chunks = [starter_content]
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
                 msg = await thread_channel.send(content=chunk)
                 message_ids.append(str(msg.id))
+                acknowledged_chunks.append(chunk)
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
-        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id,
+                                        "acknowledged_chunks": tuple(acknowledged_chunks)}
         if warnings:
             raw_response["warnings"] = warnings
-        return SendResult(success=True, message_id=message_ids[0], raw_response=raw_response)
+        return SendResult(success=True, message_id=message_ids[0],
+                          error=warnings[0] if warnings else None,
+                          delivered_text="\n".join(acknowledged_chunks), raw_response=raw_response)
 
     async def _forum_post_file(
         self, forum_channel: Any, *, thread_name: Optional[str] = None, content: str = "",
@@ -3278,15 +3303,21 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         return SendResult(success=True, message_id=message_id)
                     await msg.edit(content=truncated)
                     self._last_overflow_preview[_preview_key] = truncated
+                    formatted = truncated
                 else:
                     raise
-            result = SendResult(success=True, message_id=message_id)
+            result = SendResult(success=True, message_id=message_id, delivered_text=formatted)
             if finalize:
                 await self._record_response_async((metadata or {}).get("reply_to_message_id"), result, content, True)
             return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=str(e), raw_response={
+                "delivery_ambiguous": isinstance(e, asyncio.TimeoutError) or self._is_timeout_error(str(e)),
+                "remaining_content": content,
+                "model_remaining_content": content,
+                "attachment_remaining_content": "",
+            })
 
     @staticmethod
     def _is_reply_reference_rejected(err: Exception) -> bool:
@@ -3309,22 +3340,27 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self, channel: Any, msg: Any, message_id: str, content: str,
     ) -> SendResult:
         """Deliver an oversized final edit: edit ``message_id`` with chunk 1, send chunks 2..N as
-        replies to the previous. Returns ``message_id=<last-id>`` + ``continuation_message_ids``.
-        A continuation failure still reports success plus ``partial_overflow`` so the consumer
-        delivers the tail; only a first-chunk edit failure returns ``success=False``."""
+        replies to the previous. A failed continuation reports only acknowledged chunks and
+        the exact remainder so the final-delivery bracket can recover without duplicating the head."""
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
         if len(chunks) <= 1:
             # Defensive: pre-flight should guarantee >1 chunk; otherwise edit normally.
             await msg.edit(content=chunks[0] if chunks else formatted)
-            return SendResult(success=True, message_id=message_id)
+            return SendResult(success=True, message_id=message_id,
+                              delivered_text=chunks[0] if chunks else formatted)
         try:
             await msg.edit(content=chunks[0])
         except Exception as e:
             logger.error(
                 "[%s] Overflow split: first-chunk edit failed: %s", self.name, e, exc_info=True,
             )
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=str(e), raw_response={
+                "delivery_ambiguous": isinstance(e, asyncio.TimeoutError) or self._is_timeout_error(str(e)),
+                "remaining_content": "\n".join(chunks),
+                "model_remaining_content": "\n".join(chunks),
+                "attachment_remaining_content": "",
+            })
         continuation_ids: list[str] = []
         delivered = 1
         prev_msg = msg
@@ -3341,6 +3377,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             try:
                 sent = await channel.send(content=chunk, reference=reference)
             except Exception as send_err:
+                if isinstance(send_err, asyncio.TimeoutError) or self._is_timeout_error(str(send_err)):
+                    # Discord may have accepted an unacknowledged continuation. Do not
+                    # retry or claim that chunk is certainly still owed.
+                    return SendResult(
+                        success=False, error=str(send_err),
+                        message_id=continuation_ids[-1] if continuation_ids else message_id,
+                        delivered_text="\n".join(chunks[:delivered]),
+                        continuation_message_ids=tuple(continuation_ids),
+                        raw_response={"partial_overflow": True,
+                                      "delivery_ambiguous": True,
+                                      "remaining_content": "\n".join(chunks[delivered:]),
+                                      "model_remaining_content": "\n".join(chunks[delivered:]),
+                                      "attachment_remaining_content": "",
+                                      "message_ids": (message_id, *continuation_ids),
+                                      "acknowledged_chunks": tuple(chunks[:delivered])},
+                    )
                 # Drop the reply anchor and retry once: deleted anchor (10008) / system message (50035).
                 logger.warning(
                     "[%s] Overflow continuation send failed (%s); retrying without reply reference",
@@ -3354,14 +3406,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         self.name, delivered, len(chunks), retry_err,
                     )
                     last_id = continuation_ids[-1] if continuation_ids else message_id
+                    unresolved = isinstance(retry_err, asyncio.TimeoutError) or self._is_timeout_error(str(retry_err))
+                    remaining = {"remaining_content": "\n".join(chunks[delivered:]),
+                                 "model_remaining_content": "\n".join(chunks[delivered:]),
+                                 "attachment_remaining_content": ""}
                     return SendResult(
-                        success=True,
+                        success=False, error=str(retry_err),
                         message_id=last_id,
+                        delivered_text="\n".join(chunks[:delivered]),
                         continuation_message_ids=tuple(continuation_ids),
                         raw_response={
                             "partial_overflow": True, "delivered_chunks": delivered,
                             "total_chunks": len(chunks), "last_message_id": last_id,
-                            "continuation_message_ids": tuple(continuation_ids),
+                            "message_ids": (message_id, *continuation_ids),
+                            "acknowledged_chunks": tuple(chunks[:delivered]),
+                            "delivery_ambiguous": unresolved,
+                            **remaining,
                         },
                     )
             new_id = str(sent.id)
@@ -3377,6 +3437,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         )
         return SendResult(
             success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids),
+            delivered_text="\n".join(chunks),
+            raw_response={"message_ids": (message_id, *continuation_ids),
+                          "acknowledged_chunks": tuple(chunks)},
         )
 
     async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:

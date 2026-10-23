@@ -75,7 +75,8 @@ def provider_has_credentials(provider: str) -> bool:
     """Whether *provider* can be switched to without the user typing a key: env/.env key, auth
     store login, or a usable credential-pool entry. ``custom``/``custom:*`` targets only come out
     of the ladder when the user declared them in config, so they count as authenticated."""
-    from hermes_cli.auth import get_auth_status, has_usable_secret
+    from hermes_cli.auth import get_auth_status
+    from hermes_cli.secret_validation import has_usable_secret
     from hermes_cli.config import get_env_value_prefer_dotenv
 
     pid = (provider or "").strip().lower()

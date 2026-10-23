@@ -1,12 +1,7 @@
-"""Regression: ensure_matrix_deps() fresh-dependency rebind must not NameError.
+"""Regression: a fresh Matrix dependency install rebinds its type globals.
 
-sdk-bindings-review.md #43: ``_import()`` referenced ``PaginationDirection`` /
-``SyncToken`` that were never imported, and ``pm.extras.ensure_and_bind`` catches
-only ImportError — so a fresh install (missing packages) crashed adapter creation
-instead of rebinding the type globals or returning False with the install hint.
-
-Tests run through the real ``ensure_and_bind`` boundary with the install seam
-(``pm.extras.ensure_import``) no-op'd — no network, no live Matrix.
+The package-manager install seam is isolated; post-install imports run through
+the adapter's real binding path without a network transaction.
 """
 import sys
 import types
@@ -31,10 +26,11 @@ def _fake_mautrix_types():
 @pytest.fixture
 def fresh_dependency_boundary(monkeypatch):
     """Exercise the real importer after PM admits the SDK."""
-    monkeypatch.setattr(pm_extras, "ensure_import", lambda *a, **kw: None)
+    import pm
+    monkeypatch.setattr(pm, "ensure_import", lambda *a, **kw: None)
     monkeypatch.delenv("MATRIX_E2EE_MODE", raising=False)
     monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
-    # ensure_and_bind writes module globals; isolate even successful rebinding.
+    # Isolate the adapter's module globals after successful rebinding.
     for name in ("EventType", "UserID", "RoomID", "EventID", "ContentURI", "RoomCreatePreset", "PresenceState", "TrustState"):
         monkeypatch.setattr(matrix_adapter, name, getattr(matrix_adapter, name))
     fake_types = _fake_mautrix_types()
@@ -55,9 +51,7 @@ def test_fresh_install_rebinds_type_globals_without_nameerror(fresh_dependency_b
 def test_failed_install_returns_false_with_hint_and_never_raises(
     fresh_dependency_boundary, caplog
 ):
-    # Same fresh state but the post-install import genuinely fails (no mautrix):
-    # must return False with the install hint — and, per the bug class, must not
-    # leak anything other than ImportError out of ensure_and_bind.
+    # A failed post-install import returns False with the install hint.
     with patch.dict(sys.modules, {"mautrix": None, "mautrix.types": None}):
         with caplog.at_level("WARNING", logger="plugins.platforms.matrix.adapter"):
             assert matrix_adapter.ensure_matrix_deps() is False

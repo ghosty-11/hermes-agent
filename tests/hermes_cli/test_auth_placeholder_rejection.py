@@ -12,7 +12,8 @@ Regression for the placeholder shapes; the pooled-key case covers the sibling re
 
 import pytest
 
-from hermes_cli.auth import has_usable_secret, AuthError
+from hermes_cli.auth import AuthError
+from hermes_cli.secret_validation import has_usable_secret
 
 
 @pytest.mark.parametrize("value, usable", [

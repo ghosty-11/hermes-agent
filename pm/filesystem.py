@@ -80,3 +80,14 @@ def durable_write_bytes(path: Path, data: bytes) -> None:
                 os.close(directory)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def durable_unlink(path: Path) -> None:
+    """Durably drop a completed local-update obligation."""
+    path.unlink()
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)

@@ -55,7 +55,7 @@ def test_bundle_stages_git_tree_and_runs_native_children_before_manifest(tmp_pat
     source = Path(__file__).resolve().parents[2]
     shutil.copytree(source / "pm", repo / "pm", ignore=shutil.ignore_patterns("__pycache__"))
     (repo / "hermes_cli").mkdir()
-    for name in ("__init__.py", "runtime_state.py"):
+    for name in ("__init__.py", "runtime_state.py", "_early_recovery.py"):
         shutil.copy2(source / "hermes_cli" / name, repo / "hermes_cli" / name)
     shutil.copy2(source / "hermes_constants.py", repo / "hermes_constants.py")
     wheels = repo / "wheels"
@@ -279,10 +279,14 @@ def test_bundle_stages_git_tree_and_runs_native_children_before_manifest(tmp_pat
         assert run.returncode == 7, run.stderr
         assert run.stdout.strip() == "1.0"
         from pm import runtime as runtime_api, paths
+        from pm.writer_claim import child_spawn, writer_claim
         with monkeypatch.context() as patch:
             patch.setattr(paths, "repo_root", lambda: moved / "hermes-agent")
-            run = subprocess.run(runtime_api.runtime_command(moved / "hermes-agent/pm/launch.py", ["status"]),
-                                 cwd=tmp_path, env=runtime_api.runtime_environment(), capture_output=True, text=True, timeout=30)
+            with writer_claim(install=moved / "hermes-agent"):
+                environment = runtime_api.runtime_environment()
+                with child_spawn(environment) as spawn:
+                    run = subprocess.run(runtime_api.runtime_command(moved / "hermes-agent/pm/launch.py", ["status"]),
+                                         cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30, **spawn)
         assert run.returncode == 0, run.stderr
         assert "no pm sync receipt" in run.stdout
     finally:

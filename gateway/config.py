@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
-from hermes_cli.config import get_hermes_home
+from hermes_constants import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
@@ -214,6 +214,12 @@ def _bundled_platform_manifest_name(plugin_dir: Path) -> Optional[str]:
         return None
 
 
+def normalize_platform_name(value: str, aliases: dict[str, str] | None = None) -> str:
+    """Canonical spelling used by runtime Platform lookup and passive inventory."""
+    normalized = value.strip().lower()
+    return (aliases or {}).get(normalized, normalized)
+
+
 class Platform(Enum):
     """Supported messaging platforms. Plugin platforms are dynamic members created on
     demand by ``_missing_`` and cached so ``Platform("irc") is Platform("irc")`` holds."""
@@ -247,7 +253,7 @@ class Platform(Enum):
         """Accept unknown names only for bundled or runtime-registered plugin adapters (no enum pollution)."""
         if not isinstance(value, str) or not value.strip():
             return None
-        value = value.strip().lower()
+        value = normalize_platform_name(value)
         if value in cls._value2member_map_:
             return cls._value2member_map_[value]
         global _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
@@ -282,7 +288,8 @@ class Platform(Enum):
         manifest ``name:`` keys that differ from their directory (alias -> directory name). Aliases
         never shadow a directory name, so the directory stays the canonical platform value."""
         try:
-            platforms_dir = Path(__file__).parent.parent / "plugins" / "platforms"
+            from hermes_cli.plugins import get_bundled_plugins_dir
+            platforms_dir = get_bundled_plugins_dir() / "platforms"
             dirs = [
                 child for child in (platforms_dir.iterdir() if platforms_dir.is_dir() else ())
                 if child.is_dir() and (child / "__init__.py").exists()
@@ -543,15 +550,10 @@ class StreamingConfig:
 
 
 def _has_usable_api_server_key(key: object) -> bool:
-    """True when API_SERVER_KEY is strong enough for the adapter to start (mirrors the
-    ``has_usable_secret(min_length=16)`` guard in ``gateway/platforms/api_server.py``)."""
-    if not key:
-        return False
-    try:
-        from hermes_cli.auth import has_usable_secret
-        return has_usable_secret(key, min_length=16)
-    except ImportError:
-        return len(str(key).strip()) >= 16
+    """Use the same placeholder-aware minimum as the API server adapter."""
+    from hermes_cli.secret_validation import has_usable_secret
+
+    return has_usable_secret(key, min_length=16)
 
 
 def _needs_extra(*keys: str) -> Callable[[PlatformConfig], bool]:
@@ -657,13 +659,20 @@ class GatewayConfig:
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
 
-    def get_connected_platforms(self) -> List[Platform]:
-        """Enabled + configured platforms, sorted by value so the rendered "Connected
-        Platforms" prompt block is byte-stable (a reorder busts the prompt cache)."""
-        connected = [p for p, c in self.platforms.items() if c.enabled and self._is_platform_connected(p, c)]
+    def get_connected_platforms(self, *, strict: bool = False) -> List[Platform]:
+        """Enabled + configured platforms, sorted for stable prompt assembly."""
+        connected: List[Platform] = []
+        for platform, config in self.platforms.items():
+            if config.enabled and (
+                self._is_platform_connected(platform, config, strict=True) if strict
+                else self._is_platform_connected(platform, config)
+            ):
+                connected.append(platform)
         return sorted(connected, key=lambda p: str(p.value))
 
-    def _is_platform_connected(self, platform: Platform, config: PlatformConfig) -> bool:
+    def _is_platform_connected(
+        self, platform: Platform, config: PlatformConfig, *, strict: bool = False,
+    ) -> bool:
         checker = _PLATFORM_CONNECTED_CHECKERS.get(platform)
         # Weixin needs token AND account_id, so it must bypass the generic token branch.
         if platform == Platform.WEIXIN:
@@ -673,32 +682,23 @@ class GatewayConfig:
         if checker is not None:
             return checker(config)
 
-        # Plugin platforms; force (idempotent) discovery for directly-constructed configs.
+        # Plugin platforms; direct configs need an idempotent discovery pass.
         try:
             from gateway.platform_registry import platform_registry
-            with contextlib.suppress(Exception):
-                # Iterate built-in platforms plus any registered plugin platforms so plugin authors get the
-                # same shared-key bridging (#24836).
-                # Registry-driven enable for plugin platforms. Built-ins have explicit blocks above. A
-                # plugin platform is enabled when its credentials are configured (``is_connected``) and its
-                # dependencies are either present (passive ``check_fn``) or installable on demand
-                # (``ensure_deps_fn``, run later by ``create_adapter()`` — never here). Plugins that need to
-                # seed ``PlatformConfig.extra`` from env vars (e.g. Google Chat's project_id /
-                # subscription_name) can supply ``env_enablement_fn`` on their PlatformEntry — called here
-                # BEFORE adapter construction. Enablement gate (#31116): when a plugin registers
-                # ``is_connected`` (the "has the user actually configured credentials for this?" check), we
-                # MUST consult it before flipping ``enabled = True``. Otherwise ``check_fn`` alone — a
-                # passive "is the SDK importable?" probe — silently enables platforms the user never opted
-                # into, and the gateway then tries to connect to Discord / Teams / Google Chat with no token
-                # and emits noisy retry-forever errors. ``_platform_status`` was already fixed for the same
-                # bug class in commit 7849a3d73; this is the runtime counterpart.
+            if strict:
                 from hermes_cli.plugins import discover_plugins
                 discover_plugins()
+            else:
+                with contextlib.suppress(Exception):
+                    from hermes_cli.plugins import discover_plugins
+                    discover_plugins()
             entry = platform_registry.get(platform.value)
             if entry:
                 check = entry.is_connected if entry.is_connected is not None else entry.validate_config
                 return True if check is None else check(config)
         except Exception:
+            if strict:
+                raise
             pass  # Registry not yet initialised during early import
         return False
 
@@ -837,28 +837,28 @@ class GatewayConfig:
         return "public" if choice is None else choice
 
 
-def load_gateway_config() -> GatewayConfig:
-    """Load gateway configuration. Priority: env > ~/.hermes/config.yaml > legacy gateway.json > defaults."""
+def load_gateway_config(*, strict: bool = False, suppress_env_bridges: bool = False) -> GatewayConfig:
+    """Load gateway configuration; strict inspection refuses failed source layers."""
     from gateway import config_loader
+    from gateway.platforms._shared import suppress_yaml_env_bridges
 
     _home = get_hermes_home()
-    gw_data = config_loader.load_legacy_gateway_json(_home)
-    try:
-        config_loader.load_yaml_layer(_home, gw_data)
-    except Exception as e:
-        logger.warning(
-            # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
-            # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.
-            # Mattermost config bridge moved into plugins/platforms/mattermost/
-            # adapter.py::_apply_yaml_config — see #25443 (apply_yaml_config_fn).
-            # Matrix settings → env vars: migrated to the matrix plugin's apply_yaml_config_fn hook
-            # (plugins/platforms/matrix/adapter.py). #41112 / #3823.
-            # Feishu settings → env vars: migrated to the feishu plugin's apply_yaml_config_fn hook
-            # (plugins/platforms/feishu/adapter.py). #41112 / #3823.
-            "Failed to process config.yaml — falling back to .env / gateway.json values. "
-            "Check %s for syntax errors. Error: %s",
-            _home / "config.yaml", e,
-        )
+    gw_data = (config_loader.load_legacy_gateway_json(_home, strict=True) if strict
+               else config_loader.load_legacy_gateway_json(_home))
+    with suppress_yaml_env_bridges() if suppress_env_bridges else contextlib.nullcontext():
+        try:
+            if strict:
+                config_loader.load_yaml_layer(_home, gw_data, strict=True)
+            else:
+                config_loader.load_yaml_layer(_home, gw_data)
+        except Exception as e:
+            if strict:
+                raise
+            logger.warning(
+                "Failed to process config.yaml — falling back to .env / gateway.json values. "
+                "Check %s for syntax errors. Error: %s",
+                _home / "config.yaml", e,
+            )
 
     config = GatewayConfig.from_dict(gw_data)
     _apply_env_overrides(config)
@@ -868,13 +868,8 @@ def load_gateway_config() -> GatewayConfig:
 
 def _validate_gateway_config(config: "GatewayConfig") -> None:
     """Validate and sanitize a loaded GatewayConfig in place (after all sources are merged)."""
-    try:
-        # Reject known-weak placeholder tokens. Ported from openclaw/openclaw#64586: users who copy
-        # .env.example without changing placeholder values get a clear startup error instead of a confusing
-        # "auth failed" from the platform API.
-        from hermes_cli.auth import has_usable_secret
-    except ImportError:
-        has_usable_secret = None
+    # Reject copied placeholders before an adapter tries to connect.
+    from hermes_cli.secret_validation import has_usable_secret
 
     token_platforms = [
         (p, c, PLATFORM_TOKEN_ENV_NAMES[p]) for p, c in config.platforms.items()
@@ -883,8 +878,6 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
     for platform, pconfig, env_name in token_platforms:  # an empty token won't connect; say so
         if not pconfig.token.strip():
             logger.warning("%s is enabled but %s is empty. The adapter will likely fail to connect.", platform.value, env_name)
-    if has_usable_secret is None:
-        return
     for platform, pconfig, env_name in token_platforms:  # reject placeholder tokens (copied .env.example)
         token = pconfig.token
         if token.strip() and not has_usable_secret(token, min_length=4):

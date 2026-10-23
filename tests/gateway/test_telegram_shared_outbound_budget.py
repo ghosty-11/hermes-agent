@@ -60,6 +60,7 @@ async def test_skipped_interim_edit_leaves_visible_prefix_untouched():
     consumer._message_id = "900"
     consumer._already_sent = True
     consumer._flood_strikes = 1
+    consumer._stream_ledger = "The answer"
 
     assert await consumer._edit_existing("The answer▌", finalize=False, is_turn_final=False)
     assert consumer._last_sent_text == "The answer▌"

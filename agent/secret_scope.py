@@ -348,7 +348,7 @@ def _parse_env_text(text: str) -> Dict[str, str]:
     return secrets
 
 
-def load_env_file(env_path: Path) -> Dict[str, str]:
+def load_env_file(env_path: Path, *, strict: bool = False) -> Dict[str, str]:
     """THE ``.env`` tokenizer: every reader (profile scope, ``hermes_cli.config.load_env``, the dashboard
     scrub, skill secret capture, managed .env, setup prompts) parses through here so no two boundaries
     disagree on which keys/values a file defines. Dict only — never touches ``os.environ``. ``export``
@@ -361,6 +361,10 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     external secrets over it).
     """
     key = str(env_path)
+    if strict:
+        from hermes_cli.config_paths import strict_file_present
+        if not strict_file_present(env_path):
+            return {}
     try:
         with open(env_path, "rb") as handle:
             fingerprint = file_signature(os.fstat(handle.fileno()))
@@ -376,6 +380,8 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     except OSError:
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
         invalidate_env_file_cache(env_path)
+        if strict:
+            raise
         return {}
 
     secrets = _parse_env_text(_decode_env_bytes(raw))
@@ -388,17 +394,24 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     return secrets
 
 
-def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+def build_profile_secret_scope(hermes_home: Path, *, strict: bool = False,
+                               include_external: bool = True,
+                               authoritative_external: bool = False) -> Dict[str, str]:
     """Build a profile's secret mapping from ``<home>/.env`` plus its external
     secret sources. Global vars are NOT copied in — ``get_secret`` reads those
     from ``os.environ`` — so the scope holds only profile secrets."""
-    secrets = load_env_file(Path(hermes_home) / ".env")
-    try:
-        from hermes_cli.env_loader import get_secret_source_values
-        external_secrets = get_secret_source_values(Path(hermes_home))
-    except Exception:
-        external_secrets = {}
-    secrets.update((k, v) for k, v in external_secrets.items() if not _is_global_env(k))
+    env_path = Path(hermes_home) / ".env"
+    secrets = load_env_file(env_path, strict=True) if strict else load_env_file(env_path)
+    if include_external:
+        try:
+            from hermes_cli.env_loader import get_authoritative_secret_source_values, get_secret_source_values
+            external_secrets = (get_authoritative_secret_source_values(Path(hermes_home))
+                                if authoritative_external else get_secret_source_values(Path(hermes_home)))
+        except Exception:
+            if strict:
+                raise
+            external_secrets = {}
+        secrets.update((k, v) for k, v in external_secrets.items() if not _is_global_env(k))
     # The DEFAULT profile's config.yaml allow_all_users grant lives only in os.environ (bridged by
     # gateway.config_loader); scoped gate readers under multiplex never fall to os.environ, so seed it
     # into that profile's own mapping. A secondary never inherits it (#80099 class).
@@ -415,7 +428,8 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     # once, not restored by each consumer.
     from hermes_cli.managed_scope import load_managed_env  # fail-open: {} when no managed scope
 
-    secrets.update((k, v) for k, v in load_managed_env().items() if not _is_global_env(k))
+    managed = load_managed_env(strict=True) if strict else load_managed_env()
+    secrets.update((k, v) for k, v in managed.items() if not _is_global_env(k))
     return secrets
 
 

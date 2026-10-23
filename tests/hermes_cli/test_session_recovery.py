@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -668,6 +670,114 @@ def _insert_delivery_obligations(path: Path, rows: list[tuple[object, ...]]) -> 
         conn.close()
 
 
+def _insert_legacy_delivery_obligation(path: Path, *, content: str) -> None:
+    """An older gateway store has no original_content column at all."""
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        conn.execute(
+            """CREATE TABLE delivery_obligations (
+                obligation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
+                platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT,
+                content TEXT NOT NULL, state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL, owner_pid INTEGER,
+                owner_started_at INTEGER, last_error TEXT, adapter_profile TEXT
+            )"""
+        )
+        now = time.time()
+        conn.execute(
+            """INSERT INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, content, state,
+                created_at, updated_at, owner_pid, adapter_profile)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy", "agent:main:slack:channel:C1", "slack", "C1", content,
+             "attempting", now, now, 999999999, "default"),
+        )
+    finally:
+        conn.close()
+
+
+def _assert_legacy_remainder_survives_reopen(output: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from gateway import delivery_ledger as dl
+
+    original = "visible prose\nunlanded link"
+    monkeypatch.setattr(dl, "_db_path", lambda: output)
+    with closing(dl._connect()) as conn:
+        row = conn.execute(
+            "SELECT content, original_content FROM delivery_obligations WHERE obligation_id='legacy'"
+        ).fetchone()
+    assert row == (original, None)
+    dl.record_crash_left_reply(
+        obligation_id="crash:before-narrowing", session_key="agent:main:slack:channel:C1",
+        platform="slack", chat_id="C1", thread_id=None, content=original,
+        since=time.time() - 60,
+    )
+    with closing(dl._connect()) as conn:
+        assert conn.execute(
+            "SELECT obligation_id FROM delivery_obligations"
+        ).fetchall() == [("legacy",)]
+    dl.mark_failed("legacy", "send_path_degraded", remaining_content="unlanded link")
+    dl.record_crash_left_reply(
+        obligation_id="crash:other-id", session_key="agent:main:slack:channel:C1",
+        platform="slack", chat_id="C1", thread_id=None, content=original,
+        since=time.time() - 60,
+    )
+    conn = sqlite3.connect(str(output))
+    try:
+        rows = conn.execute(
+            "SELECT obligation_id, content, original_content FROM delivery_obligations"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [("legacy", "unlanded link", original)]
+    assert [row["content"] for row in dl.sweep_recoverable(now=time.time())] == ["unlanded link"]
+
+
+@pytest.mark.parametrize("allow_partial", [False, True])
+def test_recovery_copies_legacy_delivery_and_preserves_remainder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allow_partial: bool,
+) -> None:
+    source = tmp_path / "legacy.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    _insert_legacy_delivery_obligation(source, content="visible prose\nunlanded link")
+
+    report = recover_session_database(source, output, work_dir=tmp_path, allow_partial=allow_partial)
+    assert report["copy"]["delivery_obligations"]["copied_rows"] == 1
+    assert report["verified"] is True
+    _assert_legacy_remainder_survives_reopen(output, monkeypatch)
+
+
+def test_recovery_preserves_populated_original_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import delivery_ledger as dl
+
+    source = tmp_path / "state.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    monkeypatch.setattr(dl, "_db_path", lambda: source)
+    dl.record_obligation(
+        obligation_id="current", session_key="agent:main:slack:channel:C1",
+        platform="slack", chat_id="C1", thread_id=None,
+        content="visible prose\nunlanded link",
+    )
+    dl.mark_failed("current", "send_path_degraded", remaining_content="unlanded link")
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+    assert report["verified"] is True
+    monkeypatch.setattr(dl, "_db_path", lambda: output)
+    dl.mark_failed("current", "send_path_degraded", remaining_content="last fragment")
+    conn = sqlite3.connect(str(output))
+    try:
+        row = conn.execute(
+            "SELECT content, original_content FROM delivery_obligations WHERE obligation_id='current'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("last fragment", "visible prose\nunlanded link")
+
+
 def test_recovery_copies_delivery_obligations(tmp_path: Path) -> None:
     """Owed replies must survive salvage — #100313 lost 6 obligation rows."""
 
@@ -854,6 +964,27 @@ def test_lost_and_found_direct_copy_creates_lazy_delivery_ledger(tmp_path: Path)
         lf_conn.close()
         dest.close()
     assert rows == [("ob-1", "pending", None), ("ob-2", "failed", "boom")]
+
+
+def test_lost_and_found_direct_copy_preserves_legacy_delivery_remainder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli.session_lost_and_found import _copy_direct_tables
+
+    recovered_source = tmp_path / "lost_and_found.db"
+    output = tmp_path / "rebuilt.db"
+    _insert_legacy_delivery_obligation(recovered_source, content="visible prose\nunlanded link")
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(recovered_source), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        copied = _copy_direct_tables(lf_conn, dest)
+        assert copied["delivery_obligations"] == 1
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    _assert_legacy_remainder_survives_reopen(output, monkeypatch)
 
 
 

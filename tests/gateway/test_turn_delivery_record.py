@@ -156,54 +156,13 @@ class TestTurnDeliveryOutcome:
         assert outcome["error"] == "edit overflow lost the tail"
 
 class TestGatewayRecorder:
-    def test_record_turn_delivery_writes_through_session_db(self):
-        recorded = []
-
-        class _DB:
-            def record_message_delivery(self, *args):
-                recorded.append(args)
-                return True
-
-        runner = _Runner(session_db=_DB())
-        addr = {"session_id": "s", "row_id": 5, "turn_id": "t", "disposition_hint": "text"}
-        outcome = {"disposition": "text", "text": "x", "message_ids": ["m"]}
-        assert runner.record_turn_delivery(addr, outcome) is True
-        assert recorded == [("s", 5, "t", outcome)]
-
-    def test_record_turn_delivery_without_db_is_a_silent_noop(self):
+    @pytest.mark.asyncio
+    async def test_record_turn_delivery_without_db_is_a_silent_noop(self):
         runner = _Runner(session_db=None)
-        assert runner.record_turn_delivery(
+        assert await runner.record_turn_delivery(
             {"session_id": "s", "row_id": 5, "turn_id": "t", "disposition_hint": "text"},
             {"disposition": "unknown"}) is False
 
-
-class TestAdapterFinalizer:
-    @pytest.mark.asyncio
-    async def test_finalizer_forwards_outcome_on_the_stamped_address(self):
-        adapter = _Adapter.__new__(_Adapter)
-        forwarded = []
-        adapter.gateway_runner = SimpleNamespace(
-            record_turn_delivery=lambda addr, outcome: forwarded.append((addr, outcome)) or True)
-        event = SimpleNamespace(
-            turn_delivery_address={"session_id": "s", "row_id": 5, "turn_id": "t",
-                                   "disposition_hint": "text"})
-        await adapter._finalize_turn_delivery_record(
-            event, [SendResult(success=True, message_id="m-1", delivered_text="sent text")])
-        addr, outcome = forwarded[0]
-        assert addr["row_id"] == 5
-        assert outcome["disposition"] == "text" and outcome["text"] == "sent text"
-
-    @pytest.mark.asyncio
-    async def test_finalizer_without_address_or_runner_does_nothing(self):
-        adapter = _Adapter.__new__(_Adapter)
-        # No gateway_runner, no address: must not raise, must not invent a record.
-        await adapter._finalize_turn_delivery_record(
-            SimpleNamespace(), [SendResult(success=True, message_id="m")])
-        adapter.gateway_runner = SimpleNamespace()
-        await adapter._finalize_turn_delivery_record(
-            SimpleNamespace(turn_delivery_address={"session_id": "s", "row_id": 1,
-                                                   "turn_id": "t", "disposition_hint": "text"}),
-            [])
 
 
 class TestProcessMessageBackgroundRuntimeLane:
@@ -328,3 +287,64 @@ class TestNotifyTurnErrorSanitized:
         assert sent and "ConnectionError" in sent[0]
         assert "sk-secret-123" not in sent[0]
         assert "api.example.com" not in sent[0]
+
+
+class TestStockDiscordDeliveryConsumers:
+    def _adapter(self, tmp_path, monkeypatch, fail_on):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = DiscordAdapter(PlatformConfig(
+            enabled=True, reply_to_mode="off",
+            extra={"missed_message_backfill": {"enabled": False}}))
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+        attempts = 0
+        visible = []
+
+        async def send(*, content, reference=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == fail_on:
+                raise ValueError("Bad Request: can't parse entities")
+            visible.append(content)
+            return SimpleNamespace(id=f"landed-{len(visible)}")
+
+        async def resolve(_chat_id):
+            return SimpleNamespace(id=501, guild=None, send=send)
+
+        adapter._resolve_channel = resolve
+        return adapter, visible
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("partial", [False, True])
+    async def test_real_stock_finalizer_records_acknowledged_chunks(
+        self, tmp_path, monkeypatch, partial,
+    ):
+        adapter, visible = self._adapter(tmp_path, monkeypatch, 2 if partial else None)
+        receipt = await adapter.send("501", "A" * 2000 + "\n" + "B" * 90)
+        records = []
+        adapter.gateway_runner = SimpleNamespace(
+            record_turn_delivery=lambda _address, outcome: records.append(outcome) or True)
+        event = SimpleNamespace(
+            turn_delivery_address={"session_id": "fixture", "row_id": 1, "turn_id": "turn"})
+        await adapter._finalize_turn_delivery_record(event, [receipt])
+        outcome = records[0]
+        assert outcome["disposition"] == "text"
+        assert outcome["text"] == "\n".join(visible)
+        assert outcome["message_ids"] == (
+            ["landed-1"] if partial else ["landed-1", "landed-2"])
+        assert bool(outcome.get("partial")) is partial
+        if partial:
+            assert outcome["error"] == "Bad Request: can't parse entities"
+
+    @pytest.mark.asyncio
+    async def test_plain_fallback_preserves_attachment_beyond_3500_characters(
+        self, tmp_path, monkeypatch,
+    ):
+        adapter, visible = self._adapter(tmp_path, monkeypatch, 1)
+        attachment = "https://example.com/owed.gif"
+        result = await adapter._send_with_retry(
+            "501", "A" * 3600 + "\n" + attachment, max_retries=0)
+        assert result.success
+        assert attachment in "\n".join(visible)

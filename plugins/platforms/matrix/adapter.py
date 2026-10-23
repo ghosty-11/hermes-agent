@@ -730,19 +730,13 @@ def check_matrix_requirements() -> bool:
 
 
 def ensure_matrix_deps() -> bool:
-    """ACTIVE deps-only installer (registry ``ensure_deps_fn``); rebinds the type globals. Installs the
-    whole ``platform.matrix`` group when ANY declared package is missing — short-circuiting on
-    ``import mautrix`` left asyncpg/aiosqlite uninstalled forever.
+    """Install every declared Matrix package if missing and rebind SDK types.
 
-    Lazy-installs the full ``platform.matrix`` feature group via
-    ``pm.extras.ensure_and_bind`` whenever any of the declared
-    packages (mautrix, Markdown, aiosqlite, asyncpg, aiohttp-socks) is
-    missing — not just mautrix itself.  Previously this short-circuited on
-    ``import mautrix``, which left the other four packages uninstalled
-    forever and broke E2EE connect with ``No module named 'asyncpg'``
-    (#31116).  Rebinds module-level type globals on success.
+    A partial install (mautrix without asyncpg/aiosqlite) is not sufficient for
+    encrypted rooms. Keep the E2EE mode checks after the dependency rebind.
     """
     from pm import extras
+    from pm.platform_requirements import ensure_platform_dependencies, required_platform_extras
 
     def _import():
         from mautrix.types import (
@@ -758,14 +752,29 @@ def ensure_matrix_deps() -> bool:
             "UserID": UserID,
         }
 
-    # A complete install (module-level imports already bound the types) needs no sync; only a
-    # partial one goes through ensure_and_bind, which rebinds after the install.
-    if extras.missing("matrix") and not extras.ensure_and_bind("matrix", _import, globals()):
+    # A complete install (module-level imports already bound the types) needs no sync;
+    # only a partial one rebinds after installing all declared dependencies.
+    try:
+        missing = any(extras.missing(extra) for extra in required_platform_extras(
+            "matrix", Path(__file__).with_name("plugin.yaml")))
+        if missing:
+            ensure_platform_dependencies("matrix", Path(__file__).with_name("plugin.yaml"))
+    except Exception as exc:
         logger.warning(
             "Matrix: required packages not installed or need a restart. "
-            "Run `hermes pm install`, then restart Hermes."
+            "Run `hermes pm install`, then restart Hermes. %s", exc
         )
         return False
+    if missing:
+        try:
+            bindings = _import()
+        except ImportError as exc:
+            logger.warning(
+                "Matrix: required packages not installed or need a restart. "
+                "Run `hermes pm install`, then restart Hermes. %s", exc
+            )
+            return False
+        globals().update(bindings)
     e2ee_mode = _resolve_e2ee_mode()
     if e2ee_mode == "required" and not _check_e2ee_deps():
         logger.error(
@@ -3203,14 +3212,12 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
 
 
 def _is_connected(config) -> bool:
-    """Connected = homeserver + token (or password). Reads via hermes_cli.gateway.get_env_value so
-    setup-status callers that patch it see the same value; PlatformConfig extras are honored."""
-    extra = getattr(config, "extra", {}) or {}
+    """Use the shared credential gate with the setup surface's scoped lookup."""
     import hermes_cli.gateway as gateway_mod
-    homeserver = extra.get("homeserver") or gateway_mod.get_env_value("MATRIX_HOMESERVER") or ""
-    token = (getattr(config, "token", None) or gateway_mod.get_env_value("MATRIX_ACCESS_TOKEN")
-             or gateway_mod.get_env_value("MATRIX_PASSWORD") or "")
-    return bool(str(homeserver).strip() and str(token).strip())
+    from gateway.platform_configuration import matrix_connected
+
+    return matrix_connected(getattr(config, "extra", {}) or {}, gateway_mod.get_env_value,
+                            token=getattr(config, "token", None))
 
 
 

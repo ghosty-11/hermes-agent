@@ -61,7 +61,8 @@ _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 def _cfg_auxiliary(*keys: str, default=None):
     """``auxiliary.<keys...>`` from config.yaml; ``default`` when config is unavailable."""
     try:
-        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config import load_config
+        from hermes_cli.config_primitives import cfg_get
         return cfg_get(load_config(), "auxiliary", *keys, default=default)
     except Exception:
         return default

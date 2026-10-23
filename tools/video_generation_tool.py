@@ -72,7 +72,8 @@ VIDEO_GENERATE_SCHEMA: Dict[str, Any] = {
 def _read_video_gen_key(key: str) -> Optional[str]:
     """Return the stripped ``video_gen.<key>`` string from config.yaml, or None."""
     try:
-        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config import load_config
+        from hermes_cli.config_primitives import cfg_get
         value = cfg_get(load_config(), "video_gen", key)
     except Exception as exc:
         logger.debug("Could not read video_gen config: %s", exc)

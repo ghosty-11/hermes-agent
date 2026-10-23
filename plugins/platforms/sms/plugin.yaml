@@ -1,6 +1,10 @@
 name: sms-platform
 label: SMS (Twilio)
 kind: platform
+platform_dependencies:
+  sms:
+    extras: []
+    env: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]
 version: 1.0.0
 description: >
   SMS gateway adapter for Hermes Agent via Twilio. Sends and receives SMS

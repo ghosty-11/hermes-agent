@@ -22,7 +22,7 @@ import hermes_yaml as yaml
 
 from hermes_constants import get_hermes_home
 from utils import atomic_write_text, is_truthy_value
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from agent.skill_utils import (
     extract_skill_description,
     is_skill_description_truncated_for_prompt,

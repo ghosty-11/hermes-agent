@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tup
 from urllib.parse import urlparse
 
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir
+from hermes_cli import secret_validation
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
@@ -281,43 +282,6 @@ def get_anthropic_key() -> str:
     return next((v for v in (get_env_value_prefer_dotenv(var) or "" for var in env_vars) if v), "")
 
 
-# ── Secret validation ───────────────────────────────────────────────────────────────────────────────
-
-_PLACEHOLDER_SECRET_VALUES = {
-    "*", "**", "***", "changeme", "your_api_key", "your_api_key_here", "your-api-key",
-    "placeholder", "example", "dummy", "null", "none"}
-
-
-# The two placeholder shapes this repo ships itself, in ``.env.example`` (four providers) and in
-# the quickstart / MCP / skill references (``ghp_xxx``, ``hf_xxx``, ``sk-xxxxxxxx``). Both are
-# copied verbatim by users, so both must read as "not configured" rather than as a credential.
-_PLACEHOLDER_KEY_PREFIXES = ("sk-", "ghp_", "hf_")
-
-
-def _is_placeholder_shape(value: str) -> bool:
-    """True for the placeholder shapes shipped in .env.example and the docs."""
-    lowered = value.lower()
-    if lowered.startswith("your_") and lowered.endswith("_here"):
-        return True
-    for prefix in _PLACEHOLDER_KEY_PREFIXES:
-        if lowered.startswith(prefix):
-            tail = lowered[len(prefix):]
-            if tail and all(c == "x" for c in tail):
-                return True
-    stripped = lowered.replace(" ", "").replace("-", "").replace("_", "")
-    return bool(stripped) and all(c == "x" for c in stripped)
-
-
-def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
-    """Return True when a configured secret looks usable, not empty/placeholder."""
-    if not isinstance(value, str):
-        return False
-    cleaned = value.strip()
-    return (len(cleaned) >= min_length
-            and cleaned.lower() not in _PLACEHOLDER_SECRET_VALUES
-            and not _is_placeholder_shape(cleaned))
-
-
 # Known API-key prefixes per provider. Only listed providers get prefix validation; everyone else
 # is fail-open. Keeps an obviously malformed key in .env (truncated paste, wrong provider's key)
 # from silently shadowing a valid credential-pool entry and producing opaque 401s.
@@ -345,7 +309,7 @@ def _usable_declared_secret(provider_id: str, value: Any, source: str) -> Option
     prefix mismatch, so it never shadows a later credential source) otherwise. Providers without a
     declared prefix are fail-open."""
     val = str(value or "").strip()
-    if not has_usable_secret(val):
+    if not secret_validation.has_usable_secret(val):
         return None
     prefixes = KNOWN_PROVIDER_KEY_PREFIXES.get(provider_id)
     if prefixes and not _matches_key_prefix(provider_id, val):
@@ -1284,7 +1248,7 @@ def _env_secret(name: str) -> bool:
     shell must not hide a real key in ``.env`` (#77007).
     """
     from hermes_cli.config import get_env_value_prefer_dotenv
-    return has_usable_secret(get_env_value_prefer_dotenv(name) or "")
+    return secret_validation.has_usable_secret(get_env_value_prefer_dotenv(name) or "")
 
 
 def _explicit_env_credentials_present(normalized: str) -> bool:
@@ -1523,12 +1487,12 @@ def _openrouter_auto_detected(scoped_key_env: Callable[[str], str]) -> bool:
     """True when an OpenRouter credential exists via env key or the credential pool (a key added via
     `hermes auth add openrouter` has no env var; without the pool check it is invisible to
     auto-detection and requests go out with no Authorization header)."""
-    if has_usable_secret(scoped_key_env("OPENROUTER_API_KEY")):
+    if secret_validation.has_usable_secret(scoped_key_env("OPENROUTER_API_KEY")):
         return True
     # OPENAI_API_KEY counts only when it holds an OpenRouter-shaped key (legacy home); a real OpenAI
     # key falls through to the ``openai-api`` registry row instead of being shipped to OpenRouter.
     legacy_key = scoped_key_env("OPENAI_API_KEY")
-    if has_usable_secret(legacy_key) and looks_like_openrouter_key(legacy_key):
+    if secret_validation.has_usable_secret(legacy_key) and looks_like_openrouter_key(legacy_key):
         return True
     try:
         # Auto-detect an OpenRouter credential added via `hermes auth add openrouter` (manual pool entry, no
@@ -1615,7 +1579,7 @@ def _env_key_auto_detected(
         if pconfig.auth_type != "api_key" or pid in _NO_AUTO_DETECT_PROVIDERS:
             continue
         for env_var in pconfig.api_key_env_vars:
-            if has_usable_secret(scoped_key_env(env_var)):
+            if secret_validation.has_usable_secret(scoped_key_env(env_var)):
                 if oauth_active and oauth_active != pid:
                     logger.warning(
                         # An exported API key now wins over a logged-in OAuth provider (the #29285 fix).
@@ -2260,7 +2224,7 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
         api_key = get_env_value_prefer_dotenv("AZURE_FOUNDRY_API_KEY") or ""
     except Exception:
         api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
-    info["logged_in"] = has_usable_secret(api_key)
+    info["logged_in"] = secret_validation.has_usable_secret(api_key)
     return info
 
 

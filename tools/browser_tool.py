@@ -22,7 +22,8 @@ from pathlib import Path
 from agent.redact import redact_cdp_url
 from hermes_constants import get_hermes_home, hermes_home_key
 from utils import env_int
-from hermes_cli.config import DEFAULT_CONFIG, cfg_get
+from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.observability.shared_metrics_loop import record_browser_call
 
 

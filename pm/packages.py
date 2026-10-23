@@ -390,7 +390,7 @@ class Venv(StatePackage):
         return h.hexdigest()
 
     def apply(self, extras: list[str], *, plugin_dirs=None, repair: bool = False, explicit: bool = False,
-              skip_invalid_secondary: bool = False) -> dict:
+              skip_invalid_secondary: bool = False, offline: bool = False) -> dict:
         """Prepare one complete environment; the caller commits its selection.
 
         ``skip_invalid_secondary`` is the update's contract: an unreadable secondary profile
@@ -406,8 +406,9 @@ class Venv(StatePackage):
         project = self.project_root()
         generation = install_state_dir(project) / "environments" / uuid.uuid4().hex
         candidate = generation / "venv"
-        environment = managed_environment(candidate, env=source_build_environment(project),
-                                          explicit=explicit or repair, output=sys.stderr)
+        env = source_build_environment(project)
+        environment = managed_environment(candidate, env=env,
+                                          explicit=explicit or repair, offline=offline, output=sys.stderr)
         if not repair:
             # Inspection may skip a broken secondary profile, but publishing a replacement
             # graph must not silently evict its recorded members (including passed candidates).
@@ -592,18 +593,18 @@ class Npm(BinaryPackage):
         # there turns its removal into a tree delete that fails on Windows
         # while Defender still holds the fresh copy (WinError 145). Cleanup
         # of this throwaway cache must never fail the install.
+        from pm.writer_claim import child_spawn
         with tempfile.TemporaryDirectory(prefix="hermes-npm-cache-", ignore_cleanup_errors=True) as cache:
-            proc = subprocess.run(
-                [
-                    str(node_bin), str(bundled_cli), "install", "--global",
-                    "--prefix", str(staged), "--offline", "--ignore-scripts",
-                    "--no-audit", "--no-fund", str(archive),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=900,
-                env=npm_env(Path(cache)),
-            )
+            environment = npm_env(Path(cache))
+            with child_spawn(environment) as spawn:
+                proc = subprocess.run(
+                    [
+                        str(node_bin), str(bundled_cli), "install", "--global",
+                        "--prefix", str(staged), "--offline", "--ignore-scripts",
+                        "--no-audit", "--no-fund", str(archive),
+                    ],
+                    capture_output=True, text=True, timeout=900, env=environment, **spawn,
+                )
         if proc.returncode != 0:
             raise InstallError(
                 self.name, f"self-install exited {proc.returncode}: {proc.stderr[-400:]}"

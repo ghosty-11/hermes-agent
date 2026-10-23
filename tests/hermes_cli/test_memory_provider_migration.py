@@ -57,6 +57,15 @@ def test_provider_unknown_to_catalog_is_reported_not_installed(home, monkeypatch
     assert mig.migrate_home(home, install=lambda n: pytest.fail("must not install"), say=said.append) is None
     assert "not in the plugin catalog" in said[0] and "memory.provider" in said[0]
 
+def test_offline_migration_requires_locally_resolvable_provider_without_catalog(home, monkeypatch):
+    monkeypatch.setattr(mig, "catalog_source", lambda name: pytest.fail("catalog must not be read offline"))
+    with pytest.raises(RuntimeError, match="unavailable locally"):
+        mig.migrate_home(home, install=lambda name: pytest.fail("must not install"), offline=True)
+
+    (home / "plugins" / "honcho").mkdir(parents=True)
+    assert mig.migrate_home(home, install=lambda name: pytest.fail("must not install"), offline=True) is None
+
+
 
 def test_startup_recovery_attempts_each_profile_home(tmp_path, monkeypatch):
     """One multiplexed process can start agents for two homes missing the same provider."""

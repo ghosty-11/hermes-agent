@@ -23,21 +23,27 @@ _PRE_HANDOFF_PURGE_PROTECTED = {"hermes_cli", "hermes_cli.main", "hermes_cli.her
 @pytest.fixture
 def pre_handoff_purge():
     """Evict what a pre-hand-off updater evicts after the pull; restore the original graph after."""
-    saved: dict = {"utils": sys.modules.get("utils")}
+    original = dict(sys.modules)
 
     def _purge() -> None:
         for name in list(sys.modules):
             if name in _PRE_HANDOFF_PURGE_PROTECTED or name.startswith("hermes_cli.update_"):
                 continue
             if name.split(".", 1)[0] in _PRE_HANDOFF_PURGE_PREFIXES:
-                module = sys.modules.pop(name, None)
-                if module is not None:
-                    saved[name] = module
+                sys.modules.pop(name, None)
 
     yield _purge
-    for name, module in saved.items():
-        if module is not None:
-            sys.modules[name] = module
+    # Fresh imports also rebind attributes on surviving parent packages; restore the whole
+    # graph so ``from pkg import child`` and ``sys.modules["pkg.child"]`` agree again.
+    sys.modules.clear()
+    sys.modules.update(original)
+    for name, module in original.items():
+        parent, _, child = name.rpartition(".")
+        if parent and parent in original:
+            try:
+                setattr(original[parent], child, module)
+            except Exception:
+                pass
 
 
 @pytest.mark.parametrize("consumer", ["hermes_cli.config", "hermes_cli.managed_scope"])

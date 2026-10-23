@@ -8,9 +8,9 @@ Contracts:
   content is never rewritten.
 - The row must be an assistant row of the addressed session; anything else (user row,
   foreign session, missing row, non-int id) is refused without writing.
-- The turn identity binds the record: a SECOND turn may not overwrite the first turn's
-  delivery; receipts within the SAME turn aggregate idempotently (message ids union,
-  disposition may refine unknown -> text, no duplicate delivery member).
+- The turn identity binds the record: a SECOND turn may not overwrite the first;
+  repeated receipts in a lane deduplicate IDs, and text resolution replaces only
+  text IDs/errors while independent media and legacy-unknown outcomes survive.
 - Dispositions are the fixed vocabulary text/media/silence/failure/unknown.
 """
 
@@ -142,6 +142,57 @@ def test_failure_outcome_keeps_error_and_silence_keeps_absence(db, session):
     assert delivery2["disposition"] == "silence"
     assert "error" not in delivery2 or delivery2.get("error") in (None, "")
 
+def test_text_recovery_preserves_independent_media_ack_and_failure(db, session):
+    key, rows = session
+    address = (key, rows[1], "turn-1")
+    db.record_message_delivery(*address, {
+        "lane": "text", "disposition": "text", "text": "acknowledged head",
+        "message_ids": ["head"], "partial": True, "error": "reply tail refused",
+    })
+    db.record_message_delivery(*address, {
+        "lane": "media", "disposition": "media", "message_ids": ["attachment"],
+        "error": "other attachment refused", "partial": True,
+    })
+    outstanding = _row_meta(db, key, rows[1])["delivery"]
+    assert outstanding["message_ids"] == ["head", "attachment"]
+    assert outstanding["error"] == "reply tail refused"
+    db.record_message_delivery(*address, {
+        "lane": "text", "disposition": "text", "text": "acknowledged head\nrecovered tail",
+        "message_ids": ["head", "tail"], "resolved": True,
+    })
+    resolved = _row_meta(db, key, rows[1])["delivery"]
+    assert resolved["text"] == "acknowledged head\nrecovered tail"
+    assert resolved["message_ids"] == ["head", "attachment", "tail"]
+    assert resolved["error"] == "other attachment refused" and resolved["partial"]
+    assert resolved["lanes"]["text"]["message_ids"] == ["head", "tail"]
+    assert resolved["lanes"]["media"]["message_ids"] == ["attachment"]
+
+
+def test_legacy_flat_row_keeps_unattributed_ack_and_error_on_text_resolution(db, session):
+    key, rows = session
+    address = (key, rows[1], "turn-1")
+    db.record_message_delivery(*address, {
+        "disposition": "text", "text": "old", "message_ids": ["old-id"],
+        "error": "old delivery error", "partial": True,
+    })
+    # Simulate a row written before per-lane provenance was introduced.
+    def remove_lane_provenance(conn):
+        row = conn.execute(
+            "SELECT display_metadata FROM messages WHERE id=?", (rows[1],)).fetchone()
+        meta = db._decode_display_metadata(row[0])
+        meta["delivery"].pop("lanes")
+        conn.execute("UPDATE messages SET display_metadata=? WHERE id=?",
+                     (db._encode_display_metadata(meta), rows[1]))
+
+    db._execute_write(remove_lane_provenance)
+    db.record_message_delivery(*address, {
+        "lane": "text", "disposition": "text", "text": "new",
+        "message_ids": ["new-id"], "resolved": True,
+    })
+    delivery = _row_meta(db, key, rows[1])["delivery"]
+    assert delivery["text"] == "new"
+    assert delivery["message_ids"] == ["old-id", "new-id"]
+    assert delivery["error"] == "old delivery error"
 
 def test_delivery_survives_reopen_and_compaction_addressing(db, tmp_path, session):
     key, rows = session

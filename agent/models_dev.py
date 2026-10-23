@@ -202,7 +202,8 @@ _UNKNOWN_CATALOG_PROVIDER_WARNED: set = set()  # (provider, alias) warned once p
 def _cfg_get(*keys: str, default: Any, config: Optional[Dict[str, Any]] = None) -> Any:
     """``cfg_get`` over the read-only config; *default* on any failure."""
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_primitives import cfg_get
         return cfg_get(config if config is not None else load_config_readonly(), *keys, default=default)
     except Exception:
         return default

@@ -65,7 +65,8 @@ def auto_apply_enabled(config_get: Callable = None) -> bool:
 
 def _default_config_get(section: str, key: str):
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_primitives import cfg_get
 
         return cfg_get(load_config_readonly(), section, key, default=None)
     except Exception:

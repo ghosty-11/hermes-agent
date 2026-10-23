@@ -8,12 +8,13 @@ import subprocess
 import textwrap
 
 import pytest
+from pm.writer_claim import child_spawn, writer_claim
 
 from tests.pm._fixtures import isolated_python as isolated_python
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_worker_children_get_eof_while_control_pipe_stays_open(tmp_path, isolated_python, streaming):
+def test_worker_children_get_eof_while_control_pipe_stays_open(tmp_path, isolated_python, streaming, monkeypatch):
     root = Path(__file__).resolve().parents[2]
     # Inject an operation, not a process mock: main owns the real protocol reader
     # and the Python engine launches an actual child with inherited standard IO.
@@ -47,23 +48,29 @@ def test_worker_children_get_eof_while_control_pipe_stays_open(tmp_path, isolate
         "arguments": {"cache": str(tmp_path)}, "callbacks": [], "packages": [],
         "context": {"repo": str(root), "lockfile": str(root / "pm/lock.json")},
     }
-    env = {**os.environ, "HERMES_HOME": str(tmp_path / "home"),
-           "HERMES_RUNTIME_DIR": str(tmp_path / "tools")}
-    with (tmp_path / "diagnostics.log").open("w+") as diagnostics:
-        with subprocess.Popen([str(isolated_python), "-I", "-c", script],
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=diagnostics, text=True, env=env) as process:
-            assert process.stdin is not None and process.stdout is not None
-            try:
-                process.stdin.write(json.dumps(request) + "\n")
-                process.stdin.flush()
-                # communicate() would close stdin and erase the bug's precondition.
-                process.wait(timeout=30)
-                response = json.loads(process.stdout.read())
-                diagnostics.seek(0)
-                assert response.get("result") == "child completed", (response, diagnostics.read())
-                assert process.returncode == 0
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
+    install = tmp_path / "install"
+    install.mkdir()
+    with monkeypatch.context() as scoped:
+        scoped.setenv("HERMES_HOME", str(tmp_path / "home"))
+        scoped.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
+        with writer_claim(install=install), (tmp_path / "diagnostics.log").open("w+") as diagnostics:
+            env = dict(os.environ)
+            with child_spawn(env) as spawn:
+                process = subprocess.Popen([str(isolated_python), "-I", "-c", script],
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           stderr=diagnostics, text=True, env=env, **spawn)
+            with process:
+                assert process.stdin is not None and process.stdout is not None
+                try:
+                    process.stdin.write(json.dumps(request) + "\n")
+                    process.stdin.flush()
+                    # communicate() would close stdin and erase the bug's precondition.
+                    process.wait(timeout=30)
+                    response = json.loads(process.stdout.read())
+                    diagnostics.seek(0)
+                    assert response.get("result") == "child completed", (response, diagnostics.read())
+                    assert process.returncode == 0
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)

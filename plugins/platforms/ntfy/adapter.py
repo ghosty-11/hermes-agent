@@ -106,12 +106,13 @@ def check_requirements() -> bool:
 
 def validate_config(config) -> bool:
     """True when a topic is configured (config.yaml ``extra`` or env)."""
-    return bool(_extra_or_secret(getattr(config, "extra", {}) or {}, "topic", "NTFY_TOPIC"))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("ntfy", getattr(config, "extra", {}) or {}, _get_scoped_secret)
 
 
 def is_connected(config) -> bool:
     """Check whether ntfy is configured (env or config.yaml)."""
-    return bool(_get_scoped_secret("NTFY_TOPIC") or (getattr(config, "extra", {}) or {}).get("topic", ""))
+    return validate_config(config)
 
 
 class NtfyAdapter(BasePlatformAdapter):

@@ -82,7 +82,8 @@ def test_doctor_fix_publishes_and_reads_the_pm_browser(browser_store, monkeypatc
     assert doctor_tools._check_agent_browser(False) is False
     assert requests == []
     assert doctor_tools._check_agent_browser(True) is True
-    assert requests == [("ensure", {"name": "agent-browser", "explicit": True})]
+    # PM ensure requests carry explicit online mode.
+    assert requests == [("ensure", {"name": "agent-browser", "explicit": True, "offline": False})]
 
 
 def test_missing_browser_refuses_lazy_install_even_with_npx(browser_store, monkeypatch, tmp_path):
@@ -127,7 +128,8 @@ def test_execution_acquires_missing_browser_through_pm(browser_store, monkeypatc
     result = install._find_agent_browser()
     installed = pm.installed_package("agent-browser")
     assert installed is not None and result == str(installed.binary)
-    assert requests == [("ensure", {"name": "agent-browser", "explicit": False})]
+    # PM ensure requests carry explicit online mode.
+    assert requests == [("ensure", {"name": "agent-browser", "explicit": False, "offline": False})]
     assert install._chromium_installed()
 
 
@@ -311,7 +313,8 @@ def test_chromium_autoinstall_is_one_shot(browser_store, monkeypatch, fails):
     monkeypatch.setattr(pm.client, "_request", request)
     assert install._maybe_autoinstall_chromium() is (not fails)
     assert install._maybe_autoinstall_chromium() is (not fails)
-    assert calls == [("ensure", {"name": "chromium", "explicit": False})]
+    # PM ensure requests carry explicit online mode.
+    assert calls == [("ensure", {"name": "chromium", "explicit": False, "offline": False})]
 
 
 @pytest.mark.parametrize("policy", ["docker", "disabled", "termux", "override"])

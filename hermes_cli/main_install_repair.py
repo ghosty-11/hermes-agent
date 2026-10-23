@@ -227,13 +227,93 @@ def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
             pass  # still locked or in use — try again next run
 
 
-def _configured_features_missing_deps() -> list[tuple[str, str, str]]:
+def configured_update_extras(project_root: Path, *, strict: bool = False,
+                             environment_root: Path | None = None) -> list[str]:
+    """Read source declarations and the chosen install's dependency metadata without activation."""
+    from agent.secret_scope import (
+        build_profile_secret_scope, get_secret, reset_secret_scope, set_secret_scope,
+        reset_multiplex_context, set_multiplex_context,
+    )
+    from gateway.config_loader import read_yaml_layers, load_legacy_gateway_json
+    from hermes_constants import (
+        get_routing_process_hermes_home, reset_hermes_home_override, set_hermes_home_override,
+    )
+    from gateway.platform_configuration import multiplex_for_passive_inspection
+    from pm.extras import extra_supported, passive_importable, selected_import_paths
+    from pm.features import declared_extras
+    from pm.platform_requirements import configured_platform_requirements
+    from pm.plugins_state import dependency_homes
+
+    import functools
+
+    selected_paths = selected_import_paths(
+        project_root if environment_root is None else environment_root) if strict else ()
+    probe = functools.partial(passive_importable, search_paths=selected_paths) if strict else None
+    declared = set(declared_extras(project_root))
+    required: set[str] = set()
+    for home in dependency_homes():
+        home_token = set_hermes_home_override(home)
+        secret_token = None
+        multiplex_token = None
+        try:
+            secrets = build_profile_secret_scope(
+                home, strict=strict, include_external=True, authoritative_external=strict)
+            secret_token = set_secret_scope(secrets, profile_home=str(home))
+            if home.resolve() != get_routing_process_hermes_home().resolve():
+                multiplex_token = set_multiplex_context(True)
+            config = read_yaml_layers(home, strict=strict)
+            legacy = load_legacy_gateway_json(home, strict=strict)
+            routed = home.resolve() != get_routing_process_hermes_home().resolve()
+            mode = multiplex_for_passive_inspection(config, legacy, get_secret)
+            platforms = configured_platform_requirements(
+                config, get_secret, legacy=legacy, home=home, source_root=project_root,
+                selected_paths=selected_paths if strict else None,
+                multiplex_active=mode if mode is not None else strict,
+                routed=routed)
+            for platform, requirement in platforms.items():
+                for name in requirement.extras:
+                    if name not in declared:
+                        raise ValueError(f"Configured platform {platform} needs undeclared extra {name}")
+                    if not extra_supported(name, **({"strict": True, "importable": probe,
+                                                    "source_root": project_root} if strict else {})):
+                        raise RuntimeError(f"Configured extra {name} is unsupported on this host")
+                    required.add(name)
+            if config.get("mcp_servers") or legacy.get("mcp_servers"):
+                if "mcp" not in declared:
+                    raise ValueError("Configured MCP servers require the mcp extra")
+                required.add("mcp")
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Cannot inspect configured dependencies for {home}") from exc
+            logger.debug("Configured dependencies for %s skipped: %s", home, exc)
+        finally:
+            if multiplex_token is not None:
+                reset_multiplex_context(multiplex_token)
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+    return sorted(required)
+
+
+
+
+def _configured_features_missing_deps(*, offline: bool = False,
+                                     project_root: Path | None = None) -> list[tuple[str, str, str]]:
     """Check configured platforms/MCP in the fresh, selected update-build child.
 
     PM preserves recorded extras atomically, but configuration can reference an
     unselected SDK. Never call this in the updater's stale import graph (#10651).
     Rows are ``(label, hint, candidate extra)``: a platform's SDK is the extra named after it.
     """
+    if offline:
+        from pm.extras import install_hint, passive_available, selected_import_paths
+        from pm.paths import repo_root
+
+        root = project_root or repo_root()
+        paths = selected_import_paths(root)
+        return [(name, ", ".join(install_hint(name)), name)
+                for name in configured_update_extras(root, strict=True)
+                if not passive_available(name, search_paths=paths, source_root=root)]
     missing: list[tuple[str, str, str]] = []
     try:
         from gateway.config import load_gateway_config
@@ -249,20 +329,27 @@ def _configured_features_missing_deps() -> list[tuple[str, str, str]]:
     try:
         import importlib.util
         from hermes_cli.config import load_config_readonly
-
-        if (load_config_readonly().get("mcp_servers") or {}) and importlib.util.find_spec("mcp") is None:
+        config = load_config_readonly()
+        if config.get("mcp_servers") and importlib.util.find_spec("mcp") is None:
             missing.append(("MCP servers", "Run `hermes pm install` to install MCP support.", "mcp"))
     except Exception as exc:
         logger.debug("configured-MCP dependency check skipped: %s", exc)
     return missing
 
 
-def _install_configured_features_missing_deps(project_root: Path) -> None:
+def _install_configured_features_missing_deps(project_root: Path, *, offline: bool = False) -> None:
     """Add the extras configured features need to the dependency environment (#124228).
 
     Recorded extras never follow config, so an enabled platform whose SDK is not
     selected would come up without its adapter after the gateway restart.
     """
+    if offline:
+        missing = _configured_features_missing_deps(offline=True, project_root=project_root)
+        if missing:
+            raise RuntimeError(
+                "Offline completion lacks configured feature dependencies in the selected Python: "
+                + ", ".join(label for label, _hint, _name in missing))
+        return
     import pm
     from pm.extras import extra_supported
     from pm.features import declared_extras
@@ -275,8 +362,9 @@ def _install_configured_features_missing_deps(project_root: Path) -> None:
                      if (extra := name.replace("_", "-")) in declared and extra_supported(extra)})
     if extras:
         try:
-            pm.sync_venv(extras, explicit=True, project_root=project_root, evict_incompatible_plugins=True)
-        except Exception as exc:  # noqa: BLE001 — a feature install never fails the update; warn below
+            pm.sync_venv(extras, explicit=True, project_root=project_root,
+                         evict_incompatible_plugins=True)
+        except Exception as exc:
             print(f"  ⚠ Could not install {', '.join(extras)} for configured features: {exc}")
         else:
             missing = [row for row in missing if row[2].replace("_", "-") not in extras]

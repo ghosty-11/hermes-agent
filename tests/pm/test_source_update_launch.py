@@ -269,28 +269,93 @@ def test_launch_without_marker_publishes_then_skips_and_rebuilds_on_lock_change(
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("marker_present", [True, False])
+def test_joined_child_never_finishes_tail_without_live_marker(source_launch, tmp_path, marker_present):
+    import time
+    from hermes_cli.update_lock import update_marker_path
+    from pm.writer_claim import child_spawn, writer_claim
+
+    root, store_python, command = source_launch
+    pending = venv_sync.completion_pending_path(root)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.touch()
+    marker = update_marker_path()
+    if marker_present:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"0\n{int(time.time())}\n", encoding="utf-8")
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
+        "from pathlib import Path\n"
+        "from hermes_cli import venv_sync\n"
+        "from pm import client, paths\n"
+        f"client.runtime_command = lambda *args, **kwargs: {command!r}\n"
+        f"paths.lockfile_path = lambda: Path({str(paths.lockfile_path())!r})\n"
+        f"root = Path({str(root)!r})\n"
+        "assert sys.stdin.readline() == 'go\\n'\n"
+        "print(venv_sync.prepare_launch(root, []))\n"
+        "print(venv_sync.prepare_launch(root, []))\n"
+    )
+    with writer_claim(install=root):
+        environment = dict(os.environ)
+        with child_spawn(environment) as spawn:
+            process = subprocess.Popen([sys.executable, "-I", "-B", "-c", script],
+                                       env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, **spawn)
+    # The originating updater has released its claims; the child retains them.
+    stdout, stderr = process.communicate("go\n", timeout=60)
+    assert process.returncode == 0, stderr
+    assert stdout.splitlines() == [str(store_python)] * 2
+    assert pm.venv_is_current(project_root=root)
+    assert pending.is_file()
+    assert not (tmp_path / "completion-calls").exists()
+    if not marker_present:
+        assert not marker.exists(), "joined child published itself as marker owner"
+
+
+@pytest.mark.platforms("posix")
 def test_process_spawned_by_the_update_commits_dependencies_but_not_the_tail(source_launch, tmp_path):
     """A process an update spawns before its dependencies are current (its restarted gateway)
     must not boot on a tree built for another interpreter; it syncs, but leaves the tail alone."""
     import time
     from hermes_cli.update_lock import update_marker_path
     from pm.environments import committed_venv
+    from pm.writer_claim import child_spawn, writer_claim
 
-    root, store_python, _ = source_launch
+    root, store_python, command = source_launch
     marker = update_marker_path()
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"{os.getppid()}\n{int(time.time())}\n", encoding="utf-8")  # the updater is our ancestor
+    marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
     assert committed_venv(root) is None
 
-    assert venv_sync.prepare_launch(root, []) == store_python
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r})\n"
+        "from pathlib import Path\n"
+        "from hermes_cli import venv_sync\n"
+        "from pm import client, paths\n"
+        f"client.runtime_command = lambda *args, **kwargs: {command!r}\n"
+        f"paths.lockfile_path = lambda: Path({str(paths.lockfile_path())!r})\n"
+        "from pm.environments import runtime_facts_path\n"
+        f"print(venv_sync.prepare_launch(Path({str(root)!r}), []))\n"
+        f"before = runtime_facts_path(Path({str(root)!r})).read_bytes()\n"
+        f"receipts = set(Path({str(tmp_path / 'home' / 'logs' / 'update_receipts')!r}).glob('pm_*.json'))\n"
+        f"print(venv_sync.prepare_launch(Path({str(root)!r}), []))\n"
+        f"assert runtime_facts_path(Path({str(root)!r})).read_bytes() == before\n"
+        f"assert set(Path({str(tmp_path / 'home' / 'logs' / 'update_receipts')!r}).glob('pm_*.json')) == receipts\n"
+    )
+    with writer_claim(install=root):
+        environment = dict(os.environ)
+        with child_spawn(environment) as spawn:
+            result = subprocess.run([sys.executable, "-I", "-B", "-c", script],
+                                    env=environment, capture_output=True, text=True,
+                                    timeout=60, **spawn)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(store_python)] * 2
     assert committed_venv(root) == Path(_fact(root)["environment"])
     assert not (tmp_path / "completion-calls").exists(), "the tail is the updater's, not its child's"
     assert not venv_sync.completion_pending_path(root).exists()
 
-    facts_bytes, receipts = runtime_facts_path(root).read_bytes(), _receipts(tmp_path)
-    venv_sync.prepare_launch(root, [])
-    assert runtime_facts_path(root).read_bytes() == facts_bytes
-    assert _receipts(tmp_path) == receipts, "a committed child synced again under the updater's claim"
 
 
 @pytest.mark.platforms("posix")

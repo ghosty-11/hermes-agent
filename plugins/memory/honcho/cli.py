@@ -11,7 +11,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from plugins.memory.honcho.client import _first_parsed, _host_block, profile_host_key, resolve_active_host, resolve_config_path, HOST
 from plugins.memory.honcho.session_peers import sanitize_peer_id
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from utils import read_json_or_empty
 
 RULE = "─" * 40

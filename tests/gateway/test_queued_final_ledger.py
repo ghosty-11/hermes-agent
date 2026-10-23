@@ -14,9 +14,9 @@ recorded before the send, the send goes through the adapter's retrying transport
 the result finalizes the row. The obligation id is keyed on the raw inbound message id
 exactly as the normal lane keys it; the reply anchor is only the reply target and is
 None wherever replies are not used (Telegram forum topics), so it cannot identify the
-turn. The reply is marked notify-worthy like every other final. The reconcile-by-edit
-path is unchanged. Adapters without the base contract and sends without a session key
-keep the plain send.
+turn. Reconciliation edits are reduced into the same turn receipt before deciding
+whether any safe remainder can be sent. Adapters without the base contract and sends
+without a session key keep the plain send.
 """
 
 from __future__ import annotations
@@ -337,3 +337,300 @@ async def test_ephemeral_delete_targets_the_adapter_that_sent_the_final(tmp_path
 
     sender._schedule_ephemeral_delete.assert_called_once_with(CHAT, "900", 30)
     replacement._schedule_ephemeral_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queued_stream_handoff_preserves_gif_and_original_identity():
+    from contextlib import closing
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+    adapter = _telegram_adapter()
+    gif = "https://example.com/owed.gif"
+    visible = []
+    first = True
+
+    async def transport(chat_id, content, **kwargs):
+        nonlocal first
+        if first:
+            first = False
+            visible.append("Hello")
+            return SendResult(
+                success=False, message_id="landed-prose", delivered_text="Hello",
+                error="send_path_degraded", retryable=True,
+                raw_response={"partial_overflow": True, "remaining_content": gif,
+                              "message_ids": ["landed-prose"]})
+        visible.append(content)
+        return SendResult(success=True, message_id="landed-tail", delivered_text=content)
+
+    adapter.send = transport
+    consumer = GatewayStreamConsumer(
+        adapter, CHAT, StreamConsumerConfig(cursor=""), initial_reply_to_id=INBOUND_ID)
+    await consumer._send_fallback_final("Hello")
+    await _deliver(adapter, text="Hello", stream_consumer=consumer)
+    assert visible == ["Hello", gif]
+    with closing(dl._connect()) as conn:
+        rows = conn.execute(
+            "SELECT content,original_content,state FROM delivery_obligations").fetchall()
+    assert rows == [(gif, "Hello", "delivered")]
+
+
+@pytest.mark.asyncio
+async def test_queued_partial_rebases_owed_tail_without_ordinary_replay():
+    from contextlib import closing
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+    adapter = _telegram_adapter()
+    gif = "https://example.com/owed.gif"
+    final = "Hello"
+    visible = []
+
+    async def transport(chat_id, content, **kwargs):
+        visible.append(content)
+        if len(visible) == 1:
+            return SendResult(success=False, error="offline", delivered_text=final,
+                              raw_response={"partial_overflow": True, "remaining_content": gif + "\nA\nB",
+                                            "message_ids": ["head"]})
+        if len(visible) == 2:
+            return SendResult(success=False, error="flood_control:120", retry_after=120,
+                              delivered_text=gif + "\nA", raw_response={
+                                  "partial_overflow": True, "remaining_content": "B",
+                                  "message_ids": ["gif-and-a"]})
+        return SendResult(success=True, message_id="tail", delivered_text=content)
+
+    adapter.send = transport
+    consumer = GatewayStreamConsumer(adapter, CHAT, StreamConsumerConfig(cursor=""))
+    await consumer._send_fallback_final(final)
+    consumer._message_id = "head"  # the acknowledged head is still editable
+    consumer._turn_split_delivery = False
+    from gateway.run import GatewayRunner
+    queued_results = []
+
+    def record(receipt):
+        queued_results.append(receipt)
+        consumer.accept_final_delivery_result(final, receipt)
+
+    delivered = await GatewayRunner._deliver_queued_first_response(
+        _runner(), final, _source(), adapter, stream_consumer=consumer,
+        session_key=SESSION_KEY, inbound_message_id=INBOUND_ID, deliver_media=False,
+        record_delivery=record)
+    assert not delivered
+    assert len(queued_results) == 1
+    assert queued_results[0].delivered_text == "Hello\n" + gif + "\nA"
+    assert consumer.delivery_handoff_for_final(final).result.raw_response["remaining_content"] == "B"
+    assert consumer.delivery_handoff_for_final("Hello plus").result.raw_response["remaining_content"] == " plus\nB"
+    assert adapter.edit_message.await_count == 0
+    assert visible == [final, gif + "\nA\nB"]
+    with closing(dl._connect()) as conn:
+        rows = conn.execute(
+            "SELECT content,original_content,state FROM delivery_obligations").fetchall()
+    assert rows == [("B", final, "failed")]
+
+
+@pytest.mark.asyncio
+async def test_queued_handoff_on_plain_adapter_sends_only_owed_content():
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    adapter = _plain_adapter()
+    consumer = GatewayStreamConsumer(adapter, CHAT)
+    consumer._retain_delivery_remainder("Hello", SendResult(
+        success=False, error="offline", raw_response={"remaining_content": "owed"}))
+    from gateway.run import GatewayRunner
+    await GatewayRunner._deliver_queued_first_response(
+        _runner(), "Hello", _source(), adapter, stream_consumer=consumer,
+        deliver_media=False, record_delivery=lambda receipt:
+        consumer.accept_final_delivery_result("Hello", receipt))
+    adapter.send.assert_awaited_once_with(CHAT, "owed", metadata=None)
+    owner = consumer.delivery_handoff_for_final("Hello")
+    assert owner.complete
+    assert owner.result.raw_response["remaining_content"] == ""
+    assert owner.result.raw_response["message_ids"] == ["p1"]
+    assert owner.result.delivered_text == "owed"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_first_reply_is_durable_before_successful_recursive_followup(tmp_path):
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from hermes_state import SessionDB
+
+    first, second = "First answer", "Second answer"
+    url = "https://example.test/owed.gif"
+    wire = []
+    adapter = _telegram_adapter()
+
+    async def transport(chat_id, content, **kwargs):
+        wire.append(content)
+        if len(wire) == 1:
+            return SendResult(success=False, error="unknown ack", raw_response={
+                "delivery_ambiguous": True, "remaining_content": first + "\n" + url})
+        return SendResult(success=True, message_id="second-id", delivered_text=content)
+
+    adapter.send = transport
+    adapter.send_typing = AsyncMock()
+    consumer = GatewayStreamConsumer(adapter, CHAT, StreamConsumerConfig(cursor=""))
+    consumer._stream_ledger = first
+    await consumer._first_send(first, finalize=False)
+    db = SessionDB(db_path=tmp_path / "chain.db")
+    try:
+        sid = db.create_session("chain", "test")
+        db.append_message(sid, "user", "first question")
+        db.append_message(sid, "assistant", first)
+        first_row = db.get_messages_as_conversation(sid, include_row_ids=True)[-1]["_row_id"]
+        first_result = {"final_response": first, "turn_id": "first-turn",
+                        "messages": [{"role": "assistant", "content": first, "_row_id": first_row}]}
+        runner = _runner()
+        runner._session_db = db
+        runner._MAX_INTERRUPT_DEPTH = 8
+        runner._pop_post_delivery_callback = lambda *_args: None
+        runner._delivery_adapter_for = lambda source: adapter
+        runner._refresh_agent_cache_message_count = AsyncMock()
+        adapter.gateway_runner = runner
+        ctx = SimpleNamespace(
+            mute_notification_reply=False, session_key=SESSION_KEY, session_id=sid,
+            source=_source(), stream_consumer_holder=[consumer],
+            _status_thread_metadata={}, event_message_id=INBOUND_ID,
+            inbound_message_id=INBOUND_ID, run_generation=1, _interrupt_depth=0,
+            history=[], context_prompt=None, channel_prompt=None, result_holder=[first_result])
+
+        async def successful_followup(**kwargs):
+            # The first turn cannot rely on a handoff attached to the return value:
+            # recursion replaces that value with the second turn's result.
+            first_delivery = db.get_messages_as_conversation(sid)[-1]["display_metadata"]["delivery"]
+            assert first_delivery["disposition"] == "failure"
+            assert first_delivery["error"]
+            assert first_delivery["message_ids"] == []
+            with dl._connect() as conn:
+                first_obligation = conn.execute(
+                    "SELECT obligation_id,content,original_content,state FROM delivery_obligations"
+                ).fetchone()
+            assert tuple(first_obligation) == (
+                dl.compute_obligation_id(SESSION_KEY, INBOUND_ID, first),
+                first + "\n" + url, first, "failed")
+            assert wire == [first]
+
+            db.append_message(sid, "user", "follow-up")
+            db.append_message(sid, "assistant", second)
+            second_row = db.get_messages_as_conversation(sid, include_row_ids=True)[-1]["_row_id"]
+            event = MessageEvent(text="follow-up", source=_source(),
+                                 message_id="next-inbound", ledger_message_id="next-inbound")
+            event.turn_delivery_address = {
+                "session_id": sid, "row_id": second_row, "turn_id": "second-turn",
+                "disposition_hint": "text"}
+            receipt, _ = await adapter.send_final_ledgered(
+                event, SESSION_KEY, second, {}, reply_to=None)
+            await adapter._finalize_turn_delivery_record(event, [receipt])
+            return {"final_response": second, "turn_id": "second-turn",
+                    "messages": [{"role": "assistant", "content": second, "_row_id": second_row}],
+                    "queued_terminal_inbound_id": "next-inbound"}
+
+        runner._run_agent = successful_followup
+        merged = await runner._run_agent_queued_followup(
+            ctx, adapter, "follow-up", None, first_result, first_result, None)
+        assert merged["final_response"] == second
+        assert wire == [first, second]
+        deliveries = [
+            message["display_metadata"]["delivery"]
+            for message in db.get_messages_as_conversation(sid) if message["role"] == "assistant"]
+        assert deliveries[0]["disposition"] == "failure"
+        assert deliveries[0]["error"]
+        assert deliveries[0]["message_ids"] == []
+        assert deliveries[1]["text"] == second
+        assert deliveries[1]["message_ids"] == ["second-id"]
+        with dl._connect() as conn:
+            rows = conn.execute(
+                "SELECT obligation_id,content,original_content,state FROM delivery_obligations"
+            ).fetchall()
+        assert {tuple(row) for row in rows} == {
+            (dl.compute_obligation_id(SESSION_KEY, INBOUND_ID, first),
+             first + "\n" + url, first, "failed"),
+            (dl.compute_obligation_id(SESSION_KEY, "next-inbound", second),
+             second, second, "delivered"),
+        }
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_raised_timeout_keeps_head_and_one_original_bracket_before_recursion(
+    tmp_path,
+):
+    from gateway.run import GatewayRunner
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    head, final = "Acknowledged head", "Acknowledged head with tail"
+    tail = final[len(head):]
+    wire = []
+    adapter = _telegram_adapter()
+
+    async def transport(chat_id, content, **kwargs):
+        wire.append(content)
+        if content == head:
+            return SendResult(success=True, message_id="head-id", delivered_text=head)
+        assert content == tail
+        # The server accepted the tail, but no acknowledgement reached this process.
+        raise TimeoutError()
+
+    adapter.send = transport
+    consumer = GatewayStreamConsumer(adapter, CHAT, StreamConsumerConfig(cursor=""))
+    assert await consumer._first_send(head, finalize=False)
+    db = SessionDB(db_path=tmp_path / "queued-raised.db")
+    try:
+        sid = db.create_session("queued-raised", "test")
+        db.append_message(sid, "user", "question")
+        db.append_message(sid, "assistant", final)
+        row_id = db.get_messages_as_conversation(sid, include_row_ids=True)[-1]["_row_id"]
+        result = {"final_response": final, "turn_id": "queued-raised",
+                  "messages": [{"role": "assistant", "content": final, "_row_id": row_id}]}
+        runner = _runner()
+        runner._session_db = AsyncSessionDB(db)
+        runner._pop_post_delivery_callback = lambda *_args: None
+        runner._delivery_adapter_for = lambda source: adapter
+        adapter.gateway_runner = runner
+        ctx = SimpleNamespace(
+            mute_notification_reply=False, session_key=SESSION_KEY, session_id=sid,
+            source=_source(), stream_consumer_holder=[consumer],
+            _status_thread_metadata={}, event_message_id=INBOUND_ID,
+            inbound_message_id=INBOUND_ID, run_generation=1)
+        await runner._run_agent_deliver_first_response(ctx, adapter, result, result, None)
+        assert wire == [head, tail]
+        delivery = db.get_messages_as_conversation(sid)[-1]["display_metadata"]["delivery"]
+        assert delivery["text"] == head
+        assert delivery["message_ids"] == ["head-id"]
+        assert delivery["partial"] and delivery["error"]
+        with dl._connect() as conn:
+            original = conn.execute(
+                "SELECT obligation_id,content,original_content,state,attempts,last_error "
+                "FROM delivery_obligations").fetchall()
+        # ``attempts`` is the redelivery budget spent by sweeps; the first in-process
+        # bracket never spends it, uncertain or not.
+        assert [tuple(row[:5]) for row in original] == [(
+            dl.compute_obligation_id(SESSION_KEY, INBOUND_ID, final),
+            tail, final, "failed", 0)]
+        assert original[0][5]
+        # Recursive dispatch is allowed to replace the first result, not its durable row.
+        async def followup(**kwargs):
+            first = db.get_messages_as_conversation(sid)[-1]["display_metadata"]["delivery"]
+            assert first["message_ids"] == ["head-id"] and first["error"]
+            return {"final_response": "second turn"}
+
+        runner._run_agent = followup
+        runner._MAX_INTERRUPT_DEPTH = 8
+        runner._refresh_agent_cache_message_count = AsyncMock()
+        ctx._interrupt_depth = 0
+        ctx.history = []
+        ctx.context_prompt = None
+        ctx.channel_prompt = None
+        ctx.result_holder = [result]
+        merged = await runner._run_agent_queued_followup(
+            ctx, adapter, "follow-up", None, result, result, None)
+        assert merged["final_response"] == "second turn"
+        assert wire == [head, tail]
+        with dl._connect() as conn:
+            after = conn.execute(
+                "SELECT obligation_id,content,original_content,state,attempts,last_error "
+                "FROM delivery_obligations").fetchall()
+        assert [tuple(row) for row in after] == [tuple(row) for row in original]
+    finally:
+        db.close()

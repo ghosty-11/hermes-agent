@@ -38,10 +38,10 @@ def lockfile_path() -> Path:
     return Path(__file__).resolve().parent / "lock.json"
 
 
-def store_root() -> Path:
+def store_root(project_root: Path | None = None) -> Path:
     from pm.environments import store_root as resolve
 
-    return resolve(repo_root())
+    return resolve(repo_root() if project_root is None else project_root)
 
 
 def partials_root() -> Path:
@@ -63,9 +63,10 @@ def facts_path() -> Path:
     return store_root() / "facts.json"
 
 
-def writable_store_root() -> Path:
-    if not (store_root().parent / "manifest.json").is_file():
-        return store_root()
+def writable_store_root(project_root: Path | None = None) -> Path:
+    store = store_root(project_root)
+    if not (store.parent / "manifest.json").is_file():
+        return store
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root() / "tools"

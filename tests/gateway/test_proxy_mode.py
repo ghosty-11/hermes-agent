@@ -6,9 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform, StreamingConfig
-from gateway.platforms.base import resolve_proxy_url
+from gateway.platforms.base import SendResult, resolve_proxy_url
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 def _make_runner(proxy_url=None):
     """Create a minimal GatewayRunner for proxy tests."""
@@ -286,6 +287,32 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_failure_transfers_known_remainder_after_consumer_joins(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.REQUIRES_EDIT_FINALIZE = False
+        adapter.send = AsyncMock(return_value=SendResult(
+            success=False, error="attachment unavailable",
+            raw_response={"remaining_content": "Hello\nhttps://example.test/owed.gif"}))
+        consumer = GatewayStreamConsumer(adapter, "!room:server.org", StreamConsumerConfig(buffer_only=True))
+        runner._proxy_stream_consumer = lambda *args: consumer
+        response = _FakeSSEResponse(sse_chunks=[
+            'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+            'data: [DONE]\n\n',
+        ])
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(_FakeSession(response)):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        "question", "", [], _make_source(), "proxy-session")
+        assert result["final_response"] == "Hello"
+        assert result["_stream_delivery_handoff"].result.raw_response["remaining_content"] == (
+            "Hello\nhttps://example.test/owed.gif")
+        assert [call.kwargs["content"] for call in adapter.send.await_args_list] == ["Hello"]
 
     @pytest.mark.asyncio
     async def test_handles_connection_error(self, monkeypatch):

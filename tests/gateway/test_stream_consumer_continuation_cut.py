@@ -38,6 +38,7 @@ class TestContinuationWordBoundary:
         # "рядками"); the continuation must start at the word boundary.
         consumer = _make_consumer()
         consumer._last_sent_text = "Правлю точними живими рядкам ▉"
+        consumer._last_sent_cursor_appended = True
         final_text = "Правлю точними живими рядками (мій попередній EN-паттерн…"
         assert consumer._continuation_text(final_text) == (
             "рядками (мій попередній EN-паттерн…")
@@ -54,4 +55,5 @@ class TestContinuationWordBoundary:
         # The preview ends exactly on a word; the continuation must not repeat it.
         consumer = _make_consumer()
         consumer._last_sent_text = "Here is the answer ▉"
+        consumer._last_sent_cursor_appended = True
         assert consumer._continuation_text("Here is the answer to your question.") == "to your question."

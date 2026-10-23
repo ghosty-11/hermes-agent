@@ -619,7 +619,8 @@ def apply_durability_barriers(conn: sqlite3.Connection) -> bool:
     from hermes_state_wal import _apply_synchronous_pragma
     ok = _reapply_durability_barriers(conn)
     with contextlib.suppress(Exception):
-        from hermes_cli.config import cfg_get, load_config_readonly  # local: avoids an import cycle
+        from hermes_cli.config import load_config_readonly  # local: avoids an import cycle
+        from hermes_cli.config_primitives import cfg_get
         if (raw_synchronous := cfg_get(load_config_readonly(), "database", "synchronous", default=None)) is not None:
             _apply_synchronous_pragma(conn, raw_synchronous, db_label="state.db (guest)")
     return ok

@@ -214,6 +214,9 @@ class TestCommandBoundaryFinalization:
         class _FakeLock:
             holder = None
 
+            def __init__(self, *, path=None, install_root=None):
+                pass
+
             def acquire(self):
                 return True
 

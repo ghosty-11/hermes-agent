@@ -1,6 +1,10 @@
 name: buzz-platform
 label: Buzz
 kind: platform
+platform_dependencies:
+  buzz:
+    extras: []
+    env: [BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY, BUZZ_AUTH_TAG, BUZZ_CREDENTIALS_FILE]
 version: 1.0.0
 description: >
   Buzz gateway adapter for Hermes Agent.

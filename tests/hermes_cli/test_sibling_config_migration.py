@@ -116,6 +116,18 @@ def test_one_broken_profile_does_not_block_others(monkeypatch, tmp_path):
 
     assert [m[0] for m in migrated] == ["healthy"]
 
+def test_offline_completion_refuses_broken_sibling_config(monkeypatch, tmp_path):
+    import pytest
+
+    active = _write_profile(tmp_path / "profiles", "active", _latest_version())
+    broken = _write_profile(tmp_path / "profiles", "broken", 12)
+    (broken / "config.yaml").write_text(":\nnot yaml: [", encoding="utf-8")
+    _setup(monkeypatch, tmp_path, active)
+
+    with pytest.raises(RuntimeError, match="broken"):
+        update_cmd_config._migrate_sibling_profile_configs(offline=True)
+
+
 
 def test_override_is_reset_after_run(monkeypatch, tmp_path):
     """The ContextVar override must not leak past the sweep."""

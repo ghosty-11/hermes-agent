@@ -92,7 +92,7 @@ def test_pm_cli_verifies_tls_with_platform_trust(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(home / "tools"))
     uv = shutil.which("uv")
     assert uv
-    python = prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime")
+    python = prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime", cache=tmp_path / "cache")
     source = Path(__file__).resolve().parents[2]
     repo = tmp_path / "source"
     for name in ("pm", "hermes_cli"):

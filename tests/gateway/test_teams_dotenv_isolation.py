@@ -206,25 +206,20 @@ class TestTeamsAdapterImportDoesNotLeakDotenv:
         monkeypatch.setattr(teams_adapter, "App", None)
         monkeypatch.setattr(teams_adapter, "AIOHTTP_AVAILABLE", True)
 
-        def _fake_ensure_and_bind(feature, importer, target_globals, **kwargs):
-            assert feature == "teams"
-            # Call dotenv the way microsoft_teams.apps.app does, but from inside
-            # the importer which wraps SDK imports in _suppress_third_party_dotenv.
-            # We inject the dotenv call by wrapping the importer.
-            original_importer = importer
+        # Simulate the SDK's import-time dotenv read at the module attribute
+        # boundary. The actual requirements path must suppress it while binding.
+        apps = sys.modules["microsoft_teams.apps"]
+        sdk_app = apps.App
+        monkeypatch.delattr(apps, "App")
 
-            def _importer_with_sdk_dotenv():
-                with teams_adapter._suppress_third_party_dotenv():
-                    dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True))
-                return original_importer()
+        def sdk_attribute(name):
+            if name != "App":
+                raise AttributeError(name)
+            dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True))
+            return sdk_app
 
-            bound = _importer_with_sdk_dotenv()
-            target_globals.update(bound)
-            return True
-
-        monkeypatch.setattr(
-            "pm.extras.ensure_and_bind", _fake_ensure_and_bind
-        )
+        monkeypatch.setattr(apps, "__getattr__", sdk_attribute, raising=False)
+        monkeypatch.setattr("pm.ensure_import", lambda _extra: None)
         assert teams_adapter.check_teams_requirements() is True
         assert CANARY_KEY not in os.environ
         assert teams_adapter.App is not None

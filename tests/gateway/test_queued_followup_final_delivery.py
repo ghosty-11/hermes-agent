@@ -120,6 +120,19 @@ async def test_refused_queued_send_leaves_the_completion_send_as_the_fallback(mo
     assert adapter.sent and {c["content"] for c in adapter.sent} == {"answer 1"}
     # The text never landed, so its attachments wait for the completion send too.
     assert adapter.documents == []
-    assert not result.get("already_sent")
+    # A failed queued bracket is settled but incomplete; its exact reply stays owed.
+    handoff = result["_stream_delivery_handoff"]
+    assert result.get("already_sent") is True
+    assert handoff.settled and not handoff.complete and handoff.owed == "answer 1"
+    from gateway import delivery_ledger
+    with delivery_ledger._connect() as conn:
+        obligations = conn.execute(
+            "SELECT state, content FROM delivery_obligations"
+        ).fetchall()
+    assert obligations == [("failed", "answer 1")]
 
-    assert await _completion_seam(adapter, result, final) == final
+    # Completion must not replay a refused queued reply or upload its media.
+    attempted = list(adapter.sent)
+    assert await _completion_seam(adapter, result, final) is None
+    assert adapter.sent == attempted
+    assert adapter.documents == []

@@ -348,5 +348,7 @@ class Runner:
         self.env = env
 
     def run(self, cmd, **kwargs) -> subprocess.CompletedProcess:
-        kwargs.setdefault("env", self.env)
-        return subprocess.run(cmd, **kwargs)
+        from pm.writer_claim import child_spawn
+        env = dict(kwargs.pop("env", self.env))
+        with child_spawn(env) as spawn:
+            return subprocess.run(cmd, env=env, **kwargs, **spawn)

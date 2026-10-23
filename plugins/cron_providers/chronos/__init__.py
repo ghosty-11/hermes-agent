@@ -23,7 +23,8 @@ logger = logging.getLogger("cron.chronos")
 def _cfg(*keys: str, default: Any = "") -> Any:
     """Read a cron.chronos.* config value (no network)."""
     try:
-        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config import load_config
+        from hermes_cli.config_primitives import cfg_get
         return cfg_get(load_config(), *keys, default=default)
     except Exception:
         return default

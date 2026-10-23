@@ -20,6 +20,7 @@ from pm.package import InstallError, Package, Runner, StatePackage, compose_env
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
 from pm.registry import get_package, walk
 from pm.store import Store, current_target, merge_tree, tree_digest
+from pm.operations import pm_mutation
 
 LOG = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ LOG = logging.getLogger(__name__)
 
 
 def _prepare_artifacts(package, store, scratch, artifacts, version, target, *,
-                       progress=None, pause_event=None, download_progress=None):
+                       progress=None, pause_event=None, download_progress=None, offline=False):
     def tick(done, total, ranges):
         if progress is not None:
             active = next(reversed(ranges))
@@ -39,7 +40,7 @@ def _prepare_artifacts(package, store, scratch, artifacts, version, target, *,
             download_progress(done, total, ranges)
 
     staged = scratch / "tree"
-    archives = store.fetch_many(artifacts, scratch, progress=tick, pause_event=pause_event)
+    archives = store.fetch_many(artifacts, scratch, progress=tick, pause_event=pause_event, offline=offline)
     for index, archive in enumerate(archives):
         if pause_event is not None and pause_event.is_set():
             raise DownloadPaused("install paused")
@@ -175,7 +176,8 @@ def lazy_installs_allowed() -> bool:
     ):
         return False
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly, require_readable_config_before_write
+        from hermes_cli.config import load_config_readonly, require_readable_config_before_write
+        from hermes_cli.config_primitives import cfg_get
     except ModuleNotFoundError as exc:
         return exc.name in {"hermes_cli", "hermes_cli.config"}
     except ImportError:
@@ -341,6 +343,7 @@ def _log_repair(package, previous, version, artifacts) -> None:
     LOG.info("repair: %s re-realized %s -> %s", package.name, old, new)
 
 
+@pm_mutation
 def _install(
     package: Package,
     lockfile: Lockfile,
@@ -354,6 +357,7 @@ def _install(
     copy_from: tuple[Facts, Store] | None = None,
     _lock_held: bool = False,
     _fresh_copy: bool = False,
+    offline: bool = False,
 ) -> Path:
     """Realize one pin. Host installs commit facts; cross-target stages carry a marker."""
     version = lockfile.version(package.name)
@@ -399,7 +403,7 @@ def _install(
                 else:
                     staged = _prepare_artifacts(package, store, scratch, artifacts, version, target,
                                                 progress=progress, pause_event=pause_event,
-                                                download_progress=download_progress)
+                                                download_progress=download_progress, offline=offline)
                 if pause_event is not None and pause_event.is_set():
                     raise DownloadPaused("install paused")
                 if progress is not None:
@@ -426,6 +430,7 @@ def _install(
     return entry
 
 
+@pm_mutation
 def stage_only(
     name: str, target: str, progress=None, *,
     pause_event: threading.Event | None = None,
@@ -474,6 +479,7 @@ def ensure(
     progress=None,
     pause_event: threading.Event | None = None,
     download_progress: ProgressFn | None = None,
+    offline: bool = False,
     _operation: _InstallOperation | None = None,
 ) -> Runner:
     """``explicit`` marks a deliberate install command (`hermes pm
@@ -493,7 +499,7 @@ def ensure(
             # Python construction can provision tools itself. Drop both the
             # lock and its validity before entering that independent operation.
             _operation.close()
-        sync_venv(explicit=explicit)
+        sync_venv(explicit=explicit, offline=offline)
         return Runner(name, compose_env([], base=base_env))
 
     lockfile = _lockfile()
@@ -522,7 +528,7 @@ def ensure(
             checked.clear()
             _install(package, lockfile, facts, store, target, progress=progress,
                      pause_event=pause_event, download_progress=download_progress,
-                     _lock_held=_operation is not None)
+                     offline=offline, _lock_held=_operation is not None)
     return Runner(name, env_for(name, base_env=base_env))
 
 
@@ -711,13 +717,14 @@ def _target_selection(package, fact: dict, *, extras, inputs: dict, repair: bool
 
 
 def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stamp: str, inputs: dict,
-                      current: bool, repair: bool, explicit: bool, skip_invalid_secondary: bool = False) -> None:
+                      current: bool, repair: bool, explicit: bool, skip_invalid_secondary: bool = False,
+                      offline: bool = False) -> None:
     """Build (unless current), publish the plugin change, then record the selection."""
     from pm import receipt
     from hermes_cli.runtime_state import finish_publication, recover_publication
 
     try:
-        result = {} if current else (package.apply(enabled, explicit=explicit,
+        result = {} if current else (package.apply(enabled, explicit=explicit, offline=offline,
                                                    skip_invalid_secondary=skip_invalid_secondary, **inputs) or {})
         if not repair and package.expected_stamp(enabled, **inputs) != stamp:
             raise ValueError("Dependency inputs changed while preparing publication; retry.")
@@ -736,9 +743,10 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
         raise
 
 
+@pm_mutation
 def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
               plugins: PluginInput | None = None, repair: bool = False,
-              evict_incompatible_plugins: bool = False) -> None:
+              evict_incompatible_plugins: bool = False, offline: bool = False) -> None:
     """Make the venv match uv.lock + the enabled extras. Extras union into
     the installed state (one ledger); no-op when the stamp already matches.
     ``repair`` restores the recorded dependency graph into a fresh generation,
@@ -781,7 +789,7 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
             change = _publication(plugins)
             if isinstance(change, StagedPlugin) and not change.active:
                 _publish_inactive(change)
-            elif evict_incompatible_plugins:
+            elif evict_incompatible_plugins and not offline:
                 from pm.plugin_eviction import sync_evicting
 
                 facts = Facts(paths.runtime_facts_path())
@@ -798,7 +806,7 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
                     raise _refuse_lazy("venv", str(extras) if extras else "venv out of sync")
                 receipt.record_feature_list(enabled)
                 _commit_selection(package, facts, change, enabled=enabled, stamp=stamp, inputs=inputs,
-                                  current=current, repair=repair, explicit=explicit)
+                                  current=current, repair=repair, explicit=explicit, offline=offline)
         outcome = "ok"
     except BaseException as exc:
         receipt.record_step("dependency-sync", False, f"{type(exc).__name__}: {exc}")

@@ -39,12 +39,11 @@ def is_connected(config) -> bool:
     read enabled an inbound server in every secondary; all fell back to the default port and N-1 died
     ``bind_failed`` (#122126).
     """
-    extra = getattr(config, "extra", {}) or {}
-    if extra.get("enabled"):
-        return True
-    from gateway.platforms._shared import env_is_connected
+    import hermes_cli.gateway as gateway_mod
+    from gateway.platform_configuration import plugin_configured
 
-    return env_is_connected("A2A_PORT")(config)
+    return plugin_configured("a2a", getattr(config, "extra", {}) or {},
+                             lambda name: (gateway_mod.get_env_value(name) or "").strip())
 
 
 def interactive_setup() -> None:

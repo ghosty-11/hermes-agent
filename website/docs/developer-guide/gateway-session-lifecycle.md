@@ -381,6 +381,39 @@ build (naive local time) is read as host-local time.
 A turn already in the ledger is redelivered by the ledger sweep, which also clears any
 `resume_pending` for that session, so it is never both delivered and re-answered.
 
+The delivery ledger keeps the original reply identity separate from mutable
+`content`, which is the payload still owed. Ledger insertions populate
+`original_content`. Recovery copies may omit it; deduplication then uses the
+unchanged content until the first narrowing atomically captures that original.
+An already-captured original never changes during delivery retries. When an adapter
+reports a nonempty `raw_response["remaining_content"]`, failure finalization
+stores that payload atomically with the failure state. It can include a
+tool-attached media URL even when nothing landed. `partial_overflow` instead
+means that some content landed; it is not a synonym for changed content.
+Adapters without a resumable partial-send hook leave partial delivery failed
+for durable replay rather than resending the visible head inline. Recovery
+markers still disclose acknowledgement ambiguity; this is not an exactly-once
+transport guarantee.
+
+A failed partial receipt can still contain acknowledged text and message IDs.
+Shared turn accounting records those acknowledgements and the unresolved
+failure together. Multi-chunk success retains every acknowledged message ID.
+Plain-text fallback preserves the complete owed payload; platform-specific
+chunking remains the adapter's responsibility.
+
+Streaming retains a known owed payload in a turn-local `StreamDeliveryHandoff`.
+It survives segment resets and stops further stream sends while later text is
+buffered for final delivery. The runner transfers it to the current event
+without replacing the original response text or claiming that an owed reply
+was already sent.
+
+Normal and queued final delivery use the same ledger bracket. They send only
+the remaining payload and combine earlier acknowledgements with the final
+receipt. A failed queued attempt records its current error and owed tail;
+a later successful final clears that error without duplicating the earlier
+acknowledgements. The carrier is cleared after use so concurrent turns and
+reused events cannot inherit another turn's receipt.
+
 ### Stuck-Loop Detection (`_suspend_stuck_loop_sessions`)
 
 Counts consecutive restarts via a JSON file (`{HERMES_HOME}/restart_counts.json`). If a

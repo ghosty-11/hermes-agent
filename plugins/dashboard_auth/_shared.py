@@ -33,7 +33,8 @@ def load_config_section(logger: logging.Logger, tag: str, *path: str) -> dict:
     """The ``config.yaml`` block at ``path`` as a dict, or ``{}`` — robust to load_config()
     raising (fresh install, malformed YAML), absent keys, or a non-dict value."""
     try:
-        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config import load_config
+        from hermes_cli.config_primitives import cfg_get
 
         cfg = load_config()
     except Exception as exc:  # noqa: BLE001 — broad catch is intentional

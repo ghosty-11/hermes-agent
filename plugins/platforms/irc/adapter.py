@@ -333,8 +333,8 @@ def check_requirements() -> bool:
 
 def validate_config(config) -> bool:
     """Validate that the platform config (env or config.yaml) has enough info to connect."""
-    server, channel = _server_channel(config)
-    return bool(server and channel)
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("irc", getattr(config, "extra", {}) or {}, _get_scoped_secret)
 
 
 def interactive_setup() -> None:

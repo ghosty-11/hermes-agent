@@ -17,7 +17,7 @@ def rooted(tmp_path, monkeypatch):
     """Point features_path at a temp runtime dir (store_root().parent)."""
     store = tmp_path / "tools"
     store.mkdir()
-    monkeypatch.setattr("pm.paths.store_root", lambda: store)
+    monkeypatch.setattr("pm.paths.store_root", lambda project_root=None: store)
     return tmp_path
 
 

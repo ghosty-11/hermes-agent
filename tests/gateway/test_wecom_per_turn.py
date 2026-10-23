@@ -287,6 +287,9 @@ class TestNativeFallbackStreamClose:
         from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
         from gateway.platforms.base import BasePlatformAdapter
 
+        import asyncio
+        first_content_frame = asyncio.Event()
+        failed_content_frame = asyncio.Event()
         class MockAdapter(BasePlatformAdapter):
             MAX_MESSAGE_LENGTH = 4096
             SUPPORTS_MESSAGE_EDITING = False
@@ -305,8 +308,11 @@ class TestNativeFallbackStreamClose:
             ):
                 self.frame_count += 1
                 self.frames.append({"text": text, "finalize": finalize})
+                if self.frame_count == 2:
+                    first_content_frame.set()
                 # First 2 frames succeed, 3rd fails (non-expired error)
                 if self.frame_count == 3:
+                    failed_content_frame.set()
                     raise RuntimeError("network error")
                 # 4th frame (finalize in fallback) succeeds
                 return True
@@ -320,14 +326,12 @@ class TestNativeFallbackStreamClose:
         cfg = StreamConsumerConfig(chat_type="dm", cursor="", edit_interval=0.01, buffer_threshold=5)
         consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
 
-        # Send enough to trigger frames
-        consumer.on_delta("First frame content that exceeds the threshold.")
-        consumer.on_delta(" Second frame content also exceeds threshold.")
-        consumer.on_delta(" Third will fail.")
-
-        import asyncio
+        # Keep the failing third frame non-final: seed, first content ACK, then failed content.
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.1)
+        consumer.on_delta("First frame content that exceeds the threshold.")
+        await asyncio.wait_for(first_content_frame.wait(), timeout=5)
+        consumer.on_delta(" Second frame content also exceeds threshold.")
+        await asyncio.wait_for(failed_content_frame.wait(), timeout=5)
         consumer.finish()
         await task
 

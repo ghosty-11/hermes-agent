@@ -9,11 +9,11 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from agent.model_metadata import is_local_endpoint
 from hermes_cli.config import (
     DEFAULT_CONFIG,
-    cfg_get,
     clear_model_endpoint_credentials,
     find_provider_entry,
     read_raw_config,
 )
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.web_server_memory import _normalize_memory_provider_name
 from tools.wake_word import _PROVIDER_PREFERENCE
 

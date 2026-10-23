@@ -1,9 +1,9 @@
 """Contract tests for scripts/ci/check_lazy_deps_imports.py.
 
-``tools/lazy_deps.py`` survives only as an old-updater stub; pm.extras
-(available / ensure_import / ensure_and_bind) is the only lazy-install
-surface. A ``tools.lazy_deps`` import left in production code never gets
-its dependencies.
+``tools/lazy_deps.py`` never provides dependencies. Passive checks use
+``pm.extras``. Bundled installers call
+``pm.platform_requirements.ensure_platform_dependencies`` with an explicit
+``plugin.yaml`` path, then rebind their optional dependency symbols.
 
 Each test drives the real checker CLI (subprocess) against a fresh
 per-test git fixture repo, so the tests are order-independent: the guard

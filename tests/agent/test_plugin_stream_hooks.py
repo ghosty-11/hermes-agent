@@ -172,7 +172,7 @@ def test_reasoning_stream_delta_plugin_hook_is_opt_in(monkeypatch):
 
     # The opt-in is resolved once per stream; a new request picks up the flipped flag.
     agent._reset_stream_delivery_tracking()
-    with patch("hermes_cli.config.cfg_get", return_value=True):
+    with patch("hermes_cli.config_primitives.cfg_get", return_value=True):
         agent._fire_reasoning_delta("visible reasoning")
         _wait_for(lambda: calls)
         shutdown_plugin_stream_hook_dispatcher()
@@ -320,7 +320,7 @@ def test_bedrock_reasoning_delta_reaches_plugin_only_observer(monkeypatch):
         calls.append(kwargs)
 
     monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
-    monkeypatch.setattr("hermes_cli.config.cfg_get", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("hermes_cli.config_primitives.cfg_get", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         "agent.bedrock_adapter._get_bedrock_runtime_client",
         lambda _region: SimpleNamespace(converse_stream=lambda **_kwargs: {"stream": []}),

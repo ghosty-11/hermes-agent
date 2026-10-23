@@ -134,3 +134,15 @@ def test_update_installs_the_extras_configured_features_need(monkeypatch, tmp_pa
     out = capsys.readouterr().out
     assert "IRC: irc hint" in out
     assert "Discord" not in out and "MCP servers" not in out
+
+def test_offline_completion_refuses_configured_feature_without_local_extra(monkeypatch, tmp_path):
+    from hermes_cli import main_install_repair as repair
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\n'
+        "[project.optional-dependencies]\ndiscord = []\n", encoding="utf-8")
+    monkeypatch.setattr(repair, "_configured_features_missing_deps",
+                        lambda **kwargs: [("IRC", "needs a local dependency", "irc")])
+    with pytest.raises(RuntimeError, match="IRC"):
+        repair._install_configured_features_missing_deps(tmp_path, offline=True)
+

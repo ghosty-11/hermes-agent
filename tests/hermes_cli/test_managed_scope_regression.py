@@ -35,7 +35,8 @@ def _write_user_config(home, body: str):
 
 
 def test_user_config_overrides_default(hermes_home, monkeypatch):
-    from hermes_cli.config import load_config, cfg_get
+    from hermes_cli.config import load_config
+    from hermes_cli.config_primitives import cfg_get
 
     _write_user_config(
         hermes_home,
@@ -49,7 +50,8 @@ def test_user_config_overrides_default(hermes_home, monkeypatch):
 
 
 def test_env_expansion_in_user_config(hermes_home, monkeypatch):
-    from hermes_cli.config import load_config, cfg_get
+    from hermes_cli.config import load_config
+    from hermes_cli.config_primitives import cfg_get
 
     monkeypatch.setenv("MY_BASE", "https://example.test")
     _write_user_config(

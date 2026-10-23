@@ -1557,6 +1557,12 @@ def restore_quick_snapshot(
     return restored > 0
 
 
+def _strict_path_present(path: Path) -> bool:
+    """Missing inputs are no-ops; dangling links and failed reads are not absence."""
+    from hermes_cli.config_paths import strict_file_present
+    return strict_file_present(path)
+
+
 def _count_cron_jobs(path: Path) -> Optional[int]:
     """Return the number of cron jobs stored in ``path``.
 
@@ -1591,6 +1597,8 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
 def restore_cron_jobs_if_emptied(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
+    *,
+    strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Safety net for silent cron-job loss across ``hermes update``.
 
@@ -1630,11 +1638,15 @@ def restore_cron_jobs_if_emptied(
     # ``None`` (missing or unparseable) is intentionally left alone — that's a
     # different failure mode the user should see rather than have papered over.
     if live_count is None:
+        if strict and _strict_path_present(live_path):
+            raise RuntimeError(f"Cannot inspect live cron jobs: {live_path}")
         return None
 
     snap_path = _quick_snapshot_root(home) / snapshot_id / _CRON_JOBS_REL
     snap_count = _count_cron_jobs(snap_path)
     if not snap_count:  # None or 0 — nothing worth restoring
+        if strict and snap_count is None and _strict_path_present(snap_path):
+            raise RuntimeError(f"Cannot inspect snapshot cron jobs: {snap_path}")
         return None
 
     # Restore when live has FEWER jobs than the pre-update snapshot.
@@ -1651,6 +1663,8 @@ def restore_cron_jobs_if_emptied(
         logger.error(
             "Cron jobs were emptied during update but auto-restore failed: %s", exc
         )
+        if strict:
+            raise RuntimeError(f"Cannot restore cron jobs to {live_path}: {exc}") from exc
         return None
 
     logger.warning(
@@ -1709,6 +1723,8 @@ def _prompt_degraded(job: Dict[str, Any]) -> bool:
 def restore_cron_prompt_fields_if_degraded(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
+    *,
+    strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Safety net for field-level cron-job degradation across ``hermes update``.
 
@@ -1752,9 +1768,13 @@ def restore_cron_prompt_fields_if_degraded(
 
     live_doc = _load_cron_jobs_doc(live_path)
     if live_doc is None:
+        if strict and _strict_path_present(live_path):
+            raise RuntimeError(f"Cannot inspect live cron prompts: {live_path}")
         return None
     snap_doc = _load_cron_jobs_doc(snap_path)
     if snap_doc is None:
+        if strict and _strict_path_present(snap_path):
+            raise RuntimeError(f"Cannot inspect snapshot cron prompts: {snap_path}")
         return None
 
     snap_by_id: Dict[str, Dict[str, Any]] = {}
@@ -1793,6 +1813,8 @@ def restore_cron_prompt_fields_if_degraded(
             "failed: %s",
             exc,
         )
+        if strict:
+            raise RuntimeError(f"Cannot restore cron prompts to {live_path}: {exc}") from exc
         return None
 
     logger.warning(
@@ -1813,6 +1835,8 @@ def restore_cron_prompt_fields_if_degraded(
 def restore_cron_prompt_fields_all_profiles(
     profile_snapshots: Dict[str, str],
     invoking_home: Optional[Path] = None,
+    *,
+    strict: bool = False,
 ) -> list[Dict[str, Any]]:
     """Run the cron prompt-field safety net for every sibling profile.
 
@@ -1825,16 +1849,20 @@ def restore_cron_prompt_fields_all_profiles(
     if not profile_snapshots:
         return restored
     home = invoking_home or get_hermes_home()
-    by_name = dict(_sibling_profile_homes(home))
+    by_name = dict(_sibling_profile_homes(home, **({"strict": True} if strict else {})))
     for name, snap_id in profile_snapshots.items():
         profile_home = by_name.get(name)
         if profile_home is None:
+            if strict:
+                raise RuntimeError(f"Snapshot profile {name} is no longer enumerable")
             continue
         try:
             result = restore_cron_prompt_fields_if_degraded(
-                snap_id, hermes_home=profile_home
+                snap_id, hermes_home=profile_home, **({"strict": True} if strict else {})
             )
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Cron prompt restore failed for profile {name}: {exc}") from exc
             logger.debug(
                 "Cron prompt-field restore check for profile %s failed: %s",
                 name,
@@ -1847,36 +1875,39 @@ def restore_cron_prompt_fields_all_profiles(
     return restored
 
 
-def _sibling_profile_homes(invoking_home: Path) -> list[tuple[str, Path]]:
-    """(name, home) for every OTHER profile on this install. Never raises.
-
-    The update's code swap and gateway fleet restart touch every profile,
-    so the pre-update snapshot must too (#66140). The invoking profile is
-    excluded — its snapshot is taken by the existing call.
-    """
+def _sibling_profile_homes(invoking_home: Path, *, strict: bool = False) -> list[tuple[str, Path]]:
+    """Enumerate other homes; strict scans distinguish absence from failed metadata."""
     homes: list[tuple[str, Path]] = []
     try:
         from hermes_cli.profiles import (
-            _get_default_hermes_home,
-            _get_profiles_root,
-            _PROFILE_ID_RE,
+            _get_default_hermes_home, _get_profiles_root, _PROFILE_ID_RE,
         )
+
+        from hermes_cli.config_paths import strict_directory_present
+
+        def directory_present(path: Path, *, listed: bool = False) -> bool:
+            present = strict_directory_present(path)
+            if listed and not present:
+                raise ValueError(f"listed profile directory disappeared: {path}")
+            return present
 
         invoking = invoking_home.resolve()
         default_home = _get_default_hermes_home()
-        if default_home.is_dir() and default_home.resolve() != invoking:
+        if (directory_present(default_home) if strict else default_home.is_dir()) and default_home.resolve() != invoking:
             homes.append(("default", default_home))
         root = _get_profiles_root()
-        if root.is_dir():
+        if (directory_present(root) if strict else root.is_dir()):
             for entry in sorted(root.iterdir()):
                 if (
-                    entry.is_dir()
-                    and entry.name != "default"
+                    entry.name != "default"
                     and _PROFILE_ID_RE.match(entry.name)
+                    and (directory_present(entry, listed=True) if strict else entry.is_dir())
                     and entry.resolve() != invoking
                 ):
                     homes.append((entry.name, entry))
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"Cannot enumerate sibling profiles: {exc}") from exc
         logger.debug("Sibling profile enumeration failed: %s", exc)
     return homes
 
@@ -1927,7 +1958,7 @@ _PROTECTED_CONFIG_PATHS: Tuple[Tuple[str, ...], ...] = (
 
 
 def _read_raw_yaml_dict(path: Path) -> Optional[Dict[str, Any]]:
-    """Parse ``path`` as a YAML mapping. ``None`` = missing/unreadable/non-dict."""
+    """Parse YAML mapping; None denotes missing/unreadable/invalid input, not an empty document."""
     if not path.is_file():
         return None
     try:
@@ -1937,7 +1968,7 @@ def _read_raw_yaml_dict(path: Path) -> Optional[Dict[str, Any]]:
             data = yaml.safe_load(f)
     except Exception:
         return None
-    return data if isinstance(data, dict) else None
+    return {} if data is None else data if isinstance(data, dict) else None
 
 
 def _get_config_path_value(data: Dict[str, Any], dotted: Tuple[str, ...]) -> Any:
@@ -1963,6 +1994,8 @@ def _set_config_path_value(data: Dict[str, Any], dotted: Tuple[str, ...], value:
 def restore_config_model_settings_if_rewritten(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
+    *,
+    strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Safety net for silent config.yaml model/MoA loss across ``hermes update``.
 
@@ -1998,10 +2031,14 @@ def restore_config_model_settings_if_rewritten(
     snap_path = _quick_snapshot_root(home) / snapshot_id / "config.yaml"
 
     snap = _read_raw_yaml_dict(snap_path)
-    if not snap:
+    if snap is None:
+        if strict and _strict_path_present(snap_path):
+            raise RuntimeError(f"Cannot inspect snapshot model settings: {snap_path}")
         return None  # no snapshot copy — nothing to compare against
     live = _read_raw_yaml_dict(live_path)
     if live is None:
+        if strict and _strict_path_present(live_path):
+            raise RuntimeError(f"Cannot inspect live model settings: {live_path}")
         # Missing or unparseable live config is a different failure mode the
         # user should see rather than have papered over (matches the cron net).
         return None
@@ -2025,6 +2062,8 @@ def restore_config_model_settings_if_rewritten(
 
         atomic_config_write(live_path, live)
     except (OSError, PermissionError) as exc:
+        if strict:
+            raise RuntimeError(f"Cannot restore model settings to {live_path}: {exc}") from exc
         logger.error(
             "config.yaml model settings were rewritten during update but "
             "auto-restore failed: %s",
@@ -2044,6 +2083,8 @@ def restore_config_model_settings_if_rewritten(
 def restore_config_model_settings_all_profiles(
     profile_snapshots: Dict[str, str],
     invoking_home: Optional[Path] = None,
+    *,
+    strict: bool = False,
 ) -> list[Dict[str, Any]]:
     """Run the config model-settings safety net for every sibling profile.
 
@@ -2056,16 +2097,20 @@ def restore_config_model_settings_all_profiles(
     if not profile_snapshots:
         return restored
     home = invoking_home or get_hermes_home()
-    by_name = dict(_sibling_profile_homes(home))
+    by_name = dict(_sibling_profile_homes(home, **({"strict": True} if strict else {})))
     for name, snap_id in profile_snapshots.items():
         profile_home = by_name.get(name)
         if profile_home is None:
+            if strict:
+                raise RuntimeError(f"Snapshot profile {name} is no longer enumerable")
             continue
         try:
             result = restore_config_model_settings_if_rewritten(
-                snap_id, hermes_home=profile_home
+                snap_id, hermes_home=profile_home, **({"strict": True} if strict else {})
             )
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Model settings restore failed for profile {name}: {exc}") from exc
             logger.debug(
                 "Config model-settings restore check for profile %s failed: %s",
                 name,
@@ -2081,6 +2126,8 @@ def restore_config_model_settings_all_profiles(
 def restore_cron_jobs_all_profiles(
     profile_snapshots: Dict[str, str],
     invoking_home: Optional[Path] = None,
+    *,
+    strict: bool = False,
 ) -> list[Dict[str, Any]]:
     """Run the cron-jobs safety net for every sibling profile (#66140).
 
@@ -2095,14 +2142,20 @@ def restore_cron_jobs_all_profiles(
     if not profile_snapshots:
         return restored
     home = invoking_home or get_hermes_home()
-    by_name = dict(_sibling_profile_homes(home))
+    by_name = dict(_sibling_profile_homes(home, **({"strict": True} if strict else {})))
     for name, snap_id in profile_snapshots.items():
         profile_home = by_name.get(name)
         if profile_home is None:
+            if strict:
+                raise RuntimeError(f"Snapshot profile {name} is no longer enumerable")
             continue
         try:
-            result = restore_cron_jobs_if_emptied(snap_id, hermes_home=profile_home)
+            result = restore_cron_jobs_if_emptied(
+                snap_id, hermes_home=profile_home, **({"strict": True} if strict else {})
+            )
         except Exception as exc:
+            if strict:
+                raise RuntimeError(f"Cron jobs restore failed for profile {name}: {exc}") from exc
             logger.debug("Cron restore check for profile %s failed: %s", name, exc)
             continue
         if result:

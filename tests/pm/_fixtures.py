@@ -119,7 +119,11 @@ def isolated_python(tmp_path_factory):
     root = tmp_path_factory.mktemp("pm-python")
     uv = shutil.which("uv")
     assert uv, "the worker contract requires real uv"
-    python = stage_runtime(Path(uv), Path(sys.executable), root)
+    wheelhouse = os.environ.get("HERMES_TEST_PM_RUNTIME_WHEELHOUSE")
+    python = stage_runtime(
+        Path(uv), Path(sys.executable), root,
+        wheelhouse=Path(wheelhouse) if wheelhouse else None,
+    )
     _run([str(python), "-I", "-c", "import importlib.util; assert importlib.util.find_spec('yaml') is None"],
          cwd=root, env=dict(os.environ))
     return python

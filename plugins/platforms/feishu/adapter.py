@@ -1231,10 +1231,10 @@ def check_feishu_requirements() -> bool:
     if FEISHU_AVAILABLE:
         return True
 
-    from pm import ensure_import
+    from pm.platform_requirements import ensure_platform_dependencies
 
     try:
-        ensure_import("feishu")
+        ensure_platform_dependencies("feishu", Path(__file__).with_name("plugin.yaml"))
         return True
     except Exception:
         return False
@@ -4474,8 +4474,8 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
 
 def _is_connected(config) -> bool:
     """Feishu counts as connected once app_id is configured."""
-    extra = getattr(config, "extra", {}) or {}
-    return bool(extra.get("app_id"))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("feishu", getattr(config, "extra", {}) or {}, lambda _name: None)
 
 
 

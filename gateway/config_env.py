@@ -20,6 +20,7 @@ from gateway.config import (
     Platform,
     PlatformConfig,
     _getenv_str,
+    _getenv,
     _has_usable_api_server_key,
     SHARED_LISTENER_MIRROR_PLATFORMS,
 )
@@ -121,11 +122,6 @@ def _mention_patterns(value: str) -> Any:
         return _csv_list(value.replace("\n", ","))
 
 
-def _env_first(envs) -> str:
-    """First truthy value among *envs* (a single name or a tuple of alternatives)."""
-    if isinstance(envs, str):
-        return getenv(envs)
-    return next((v for v in map(getenv, envs) if v), "")
 
 
 # --- reusable steps -----------------------------------------------------------
@@ -229,20 +225,15 @@ class _Cred:
     home_strip: bool = False
 
     def __call__(self, config: GatewayConfig) -> None:
-        if not all(_env_first(group) for group in self.creds):
+        from gateway.platform_configuration import credential_groups_present, credential_seed
+        if not credential_groups_present(self.creds, getenv):
             return
         if self.warn_missing and not getenv(self.warn_missing[0]):
             logger.warning(self.warn_missing[1])
         platform_config = _enable_from_env(config, self.platform)
         if self.token and (token := getenv(self.token)):
             platform_config.token = token
-        extra = platform_config.extra
-        for key, env, *rest in self.fixed:
-            default = rest[0] if rest else ""
-            value = _env_first(env) or default if isinstance(env, tuple) else getenv(env, default)
-            extra[key] = rest[1](value) if len(rest) > 1 else value
-        _env_extras(extra, self.optional)
-        _env_extras(extra, self.optional_stripped, strip=True)
+        platform_config.extra.update(credential_seed(self, _getenv))
         if self.then is not None:
             self.then(config, platform_config)
         if self.home:
@@ -466,18 +457,17 @@ def _relay(config: GatewayConfig) -> None:
     api_server, webhook; same set as the scale-to-zero arm gate). relay_url from YAML only keeps the
     additive behavior. Opt out with GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true.
     """
-    relay_url_env = getenv("GATEWAY_RELAY_URL").strip()
+    from gateway.platform_configuration import relay_configuration
     existing_relay = config.platforms.get(Platform.RELAY)
-    relay_url_yaml = str(existing_relay.extra.get("relay_url") or "").strip() if existing_relay else ""
-    relay_url_val = relay_url_env or relay_url_yaml
+    relay_url_val, relay_exclusive = relay_configuration(
+        existing_relay.extra if existing_relay else {}, getenv)
     if relay_url_val:
         relay_config = _enable_from_env(config, Platform.RELAY)
-        relay_config.extra["relay_url"] = relay_url_val.rstrip("/")
-        # An opted-out relay does not own this profile's native connections.
+        relay_config.extra["relay_url"] = relay_url_val
         if not relay_config.enabled:
             return
 
-    if not relay_url_env or is_truthy_value(getenv("GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS")):
+    if not relay_exclusive:
         return
     skip = {Platform.RELAY, Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}
     for platform, platform_config in config.platforms.items():

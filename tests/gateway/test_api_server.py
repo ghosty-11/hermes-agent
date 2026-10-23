@@ -3006,12 +3006,12 @@ class TestApiKeyStartupGuardFailsClosed:
         )
 
     @staticmethod
-    def _blocking_auth_import():
+    def _blocking_validation_import():
         real_import = __import__
 
         def _blocked(name, *args, **kwargs):
-            if name == "hermes_cli.auth":
-                raise ImportError("simulated: hermes_cli.auth unavailable")
+            if name == "hermes_cli.secret_validation":
+                raise ImportError("simulated: hermes_cli.secret_validation unavailable")
             return real_import(name, *args, **kwargs)
 
         return patch("builtins.__import__", _blocked)
@@ -3019,13 +3019,13 @@ class TestApiKeyStartupGuardFailsClosed:
     def test_weak_key_refused_when_check_is_unavailable(self):
         """The bug: an unimportable auth module silently dropped the check and
         the server started on a 4-character key."""
-        with self._blocking_auth_import():
+        with self._blocking_validation_import():
             assert self._guard("test") is False
 
     def test_strong_key_also_refused_when_check_is_unavailable(self):
         """Fail-closed: we cannot verify the key, so we do not expose the
         endpoint — the log tells the operator to repair the install."""
-        with self._blocking_auth_import():
+        with self._blocking_validation_import():
             assert self._guard("a" * 40) is False
 
 

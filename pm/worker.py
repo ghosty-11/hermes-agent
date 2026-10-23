@@ -36,13 +36,15 @@ def _read_controls(messages, pause, fd):
 
 
 def main():
-    import truststore
+    # -I omits the script's checkout from sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    return _main_owned()
 
-    truststore.inject_into_ssl()
+
+def _main_owned():
     # Capture the protocol FD before redirecting even native/subprocess stdout.
     wire = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     # A pending read on inherited control stdin can block child Python startup
     # on Windows. Keep the protocol private and give every ordinary child EOF.
     controls = os.dup(0)
@@ -62,6 +64,23 @@ def main():
         return message
 
     request = receive()
+    from pm.worker_operations import OPERATIONS, writes_shared_state
+    operation = request["operation"]
+    if operation not in OPERATIONS:
+        # Reject unsupported wire operations before acquiring any writer claim.
+        wire.write(json.dumps({"id": request["id"], "type": "result",
+                               "error": {"type": "KeyError", "message": repr(operation)}}) + "\n")
+        return
+    from contextlib import nullcontext
+    from pm.writer_claim import writer_claim
+    with writer_claim(inherited_only=True) if writes_shared_state(operation, request["arguments"]) else nullcontext():
+        import truststore
+
+        truststore.inject_into_ssl()
+        _execute_owned(request, wire, receive, pause)
+
+
+def _execute_owned(request, wire, receive, pause):
     from pm import paths, plugin_inputs, receipt
     from pm.package import InstallError
     from pm.registry import load_package_definitions

@@ -17,7 +17,7 @@ from tools.registry import tool_error
 from utils import is_truthy_value
 from .store import MemoryStore
 from .retrieval import FactRetriever
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 
 logger = logging.getLogger(__name__)
 

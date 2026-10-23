@@ -1,6 +1,10 @@
 name: telegram-platform
 label: Telegram
 kind: platform
+platform_dependencies:
+  telegram:
+    extras: [telegram]
+    env: [TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET]
 version: 1.0.0
 description: >
   Telegram gateway adapter for Hermes Agent.

@@ -1,6 +1,10 @@
 name: whatsapp-platform
 label: WhatsApp
 kind: platform
+platform_dependencies:
+  whatsapp:
+    extras: []
+    env: [WHATSAPP_ENABLED]
 version: 1.0.0
 description: >
   WhatsApp gateway adapter for Hermes Agent.

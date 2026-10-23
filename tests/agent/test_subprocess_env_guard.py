@@ -98,6 +98,12 @@ def _raw_spawn_env_sites():
                 continue  # comments referencing the old pattern are fine
             if not COPY_RE.search(line.split("#", 1)[0]):
                 continue
+            # The source-build helper inherits the caller's env; a nearby spawn is
+            # in a different function, not a child launched with this mapping.
+            if rel == "hermes_cli/source_build.py" and stripped.startswith(
+                "env = {**os.environ, **(base_env or {}),"
+            ):
+                continue
             lo = max(0, i - PROXIMITY_LINES)
             hi = min(len(lines), i + PROXIMITY_LINES + 1)
             window = "\n".join(lines[lo:hi])

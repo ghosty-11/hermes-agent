@@ -1560,7 +1560,8 @@ class CLICommandsMixin:
         if not name:
             # Neutral reset — fall back to the user-owned manual prompt.
             try:
-                from hermes_cli.config import cfg_get, read_raw_config
+                from hermes_cli.config import read_raw_config
+                from hermes_cli.config_primitives import cfg_get
                 self.system_prompt = prompt_text(
                     cfg_get(read_raw_config(), "agent", "system_prompt", default=""))
             except Exception:

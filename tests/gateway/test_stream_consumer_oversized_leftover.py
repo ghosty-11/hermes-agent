@@ -67,7 +67,8 @@ def _wire(adapter, fail_first_send_of=None):
         content = kw.get("content", "")
         if fail_first_send_of and not failed and fail_first_send_of in content:
             failed.append(content)
-            return SimpleNamespace(success=False, error="timeout")
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error="timeout")
         sends.append((content, (kw.get("metadata") or {}).get("notify")))
         return SimpleNamespace(success=True, message_id=f"m{len(sends)}")
 
@@ -120,10 +121,22 @@ async def test_every_tail_line_reaches_the_channel_exactly_once(boundary):
     texts = [c for c, _ in sends] + edits
     lost = [f"tail line {i:03d}" for i in range(240)
             if not any(f"tail line {i:03d}" in t for t in texts)]
-    assert not lost, f"{len(lost)} tail line(s) never reached the channel (first: {lost[:3]})"
+    if boundary == "tail_send_fails":
+        # A timed-out tail and later segment stay owed until the authoritative final reconciles them.
+        handoff = consumer.delivery_handoff_for_final(HEAD + TAIL + "POST-TOOL-MARKER")
+        assert handoff is not None and handoff.ambiguous
+        assert failed[0] not in joined
+        assert failed[0] in handoff.owed
+        assert all(marker in handoff.owed for marker in lost)
+    else:
+        assert not lost, f"{len(lost)} tail line(s) never reached the channel (first: {lost[:3]})"
     if boundary == "commentary":
         assert any("COMMENTARY-MARKER" in t for t in texts), "commentary was dropped"
     if boundary != "none":
-        assert any("POST-TOOL-MARKER" in t for t in texts)
+        if boundary == "tail_send_fails":
+            # A blocked later segment remains owed, never speculatively posted after the timeout.
+            assert "POST-TOOL-MARKER" in handoff.owed
+        else:
+            assert any("POST-TOOL-MARKER" in t for t in texts)
         glued = [t for t in texts if "POST-TOOL-MARKER" in t and "tail line" in t]
         assert not glued, "post-boundary text was glued onto the pre-boundary preview"

@@ -1,18 +1,19 @@
 """Durable delivery-obligation ledger for gateway final responses (rows in the shared ``state.db``;
 WAL, owner pid + process-start liveness, bounded retention) so a crash between finalize and
 platform ACK cannot lose a response silently. Checkpoints: record_obligation() 'pending' before
-any send | mark_attempting() 'attempting' right before the await | mark_delivered() 'delivered'
-only on SendResult.success | mark_failed() 'failed' on a definitive rejection. Crash semantics
+any send | mark_attempting() 'attempting' right before the await | finalize_delivery() settles
+as 'delivered', 'failed', or terminal 'declined' for an egress-guard refusal. Crash semantics
 (never silently resend an ambiguous send): pending = never started, redeliver plainly; attempting
 = crashed mid-await, platform MAY have it, redeliver WITH a visible recovered marker; failed =
-rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
-and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). Everything is
+rejected once, restart is a retry boundary, also marked; delivered/declined = prune. Attempts
+are capped and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). Everything is
 best-effort: ledger failures must never block a send; callers wrap every call in try/except.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -41,11 +42,9 @@ _MAX_ROWS = 500
 RECOVERED_MARKER = "♻️ Recovered reply — the gateway restarted during delivery, so this may be a duplicate:\n\n"
 RECONNECTED_MARKER = ("♻️ Recovered reply — the messaging platform reconnected after the original "
                       "delivery failed, so this may be a duplicate:\n\n")
-# A reply refused by flood control may have gone out as several requests (the adapter chunks long replies,
-# and MarkdownV2 escaping alone can push a reply that fits one message into two), and the platform may have
-# accepted the first chunk(s) before refusing the rest; the send result does not say which landed. The raw
-# length of the stored text says nothing about that, so every flood redelivery carries a marker, and neither
-# of the markers above tells the truth here (no restart, no reconnect): the rate limit gets its own.
+# An adapter may report exact still-owed content even when no part landed (for example, a
+# tool-attached GIF added to the send payload). Failure narrows mutable content to that
+# payload; original_content remains the immutable identity for crash-left adoption.
 FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit refused the original, so part of "
                 "it may already have arrived above:\n\n")
 
@@ -185,6 +184,55 @@ def _connect() -> sqlite3.Connection:
                    row_factory=None, initialize=_initialize_schema)
 
 
+def _owner_record(turn_receipt: Optional[dict]) -> Optional[str]:
+    if turn_receipt is None:
+        return None
+    from gateway.delivery_handoff import StreamDeliveryHandoff
+
+    owner = StreamDeliveryHandoff.from_record(turn_receipt)
+    return json.dumps(owner.to_record(), ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+
+
+def _decode_owner(value: Optional[str]) -> Optional[dict]:
+    if value is None:
+        return None
+    from gateway.delivery_handoff import StreamDeliveryHandoff
+
+    return StreamDeliveryHandoff.from_record(json.loads(value)).to_record()
+
+
+def _owner_is_declined(receipt: Optional[str]) -> bool:
+    if receipt is None:
+        return False
+    try:
+        return bool(_decode_owner(receipt)["egress_declined"])
+    except (TypeError, ValueError, KeyError):
+        return False  # corrupt owners still take the existing uncertain-ACK path
+
+
+def _declined_since(conn: sqlite3.Connection, session_key: str, since: float) -> bool:
+    """A terminal row or a crash-left canonical refusal owns the turn."""
+    rows = conn.execute(
+        """SELECT state, turn_receipt FROM delivery_obligations
+           WHERE session_key=? AND created_at>=?
+             AND (state='declined' OR turn_receipt IS NOT NULL)""",
+        (session_key, since),
+    )
+    return any(state == "declined" or _owner_is_declined(receipt) for state, receipt in rows)
+
+
+def _automatic_uncertainty(receipt: Optional[str], state: str, error: Optional[str]) -> bool:
+    if receipt is not None:
+        try:
+            return bool(_decode_owner(receipt)["delivery_ambiguous"])
+        except (TypeError, ValueError, KeyError):
+            # A corrupt owner cannot authorize an automatic resend.
+            return True
+    # Older failed rows did not persist whether a timed-out request was accepted.
+    return state == "failed" and bool(re.search(
+        r"timed out|timeout|deadline exceeded", error or "", re.IGNORECASE))
+
+
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS delivery_obligations (
@@ -194,6 +242,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             chat_id TEXT NOT NULL,
             thread_id TEXT,
             content TEXT NOT NULL,
+            original_content TEXT,
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
@@ -201,17 +250,33 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            turn_receipt TEXT
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "adapter_profile" not in columns:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    if "turn_receipt" not in columns:
+        add_column_if_missing(conn, "delivery_obligations", "turn_receipt", "turn_receipt TEXT")
+    # A legacy row must capture its identity before mark_failed narrows mutable content.
+    # Only the migrator backfills: repeated opens must not rewrite the original reply.
+    if "original_content" not in columns:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if add_column_if_missing(conn, "delivery_obligations", "original_content", "original_content TEXT"):
+                conn.execute(
+                    "UPDATE delivery_obligations SET original_content=content WHERE original_content IS NULL")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
 
-def _transaction():
+def _transaction(*, immediate: bool = False):
     from hermes_cli.sqlite_util import transaction
 
-    return transaction(_connect())
+    return transaction(_connect(), immediate=immediate)
 
 
 def _start_time(pid: int) -> Optional[int]:
@@ -268,21 +333,39 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      original_content: Optional[str] = None, turn_receipt: Optional[dict] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
+    encoded = _owner_record(turn_receipt)
+    if encoded is not None:
+        from gateway.delivery_handoff import StreamDeliveryHandoff
+
+        owner = StreamDeliveryHandoff.from_record(turn_receipt)
+        if owner.source_content != (original_content if original_content is not None else content) or owner.owed != content:
+            raise ValueError("turn receipt does not match original obligation or owed content")
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                content, original_content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, adapter_profile, turn_receipt)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
-        # Same transaction, same connection: the cron ledgers prune this way too
-        # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
+             content, original_content if original_content is not None else content,
+             now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+             encoded))
         _prune_unlocked(conn, now)
+
+
+def begin_delivery(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                   thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                   original_content: Optional[str] = None, turn_receipt: Optional[dict] = None) -> None:
+    """Begin the durable final bracket with the same original inbound identity."""
+    record_obligation(
+        obligation_id=obligation_id, session_key=session_key, platform=platform, chat_id=chat_id,
+        thread_id=thread_id, content=content, adapter_profile=adapter_profile,
+        original_content=original_content, turn_receipt=turn_receipt)
 
 
 def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
@@ -291,20 +374,30 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
-    since *since* (the turn start), and idempotent across boots that die before their sweep."""
+    or this turn's destination was declined since *since* (the turn start)."""
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(immediate=True) as conn:
+        if _declined_since(conn, session_key, since):
+            return
         conn.execute(
             """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
+                content, original_content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile)
-               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?
+               SELECT ?, ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?
                WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
-                                 WHERE session_key = ? AND content = ? AND created_at >= ?)""",
+                                 WHERE session_key = ? AND created_at >= ?
+                                   AND (COALESCE(original_content, content) = ?
+                                        OR state='declined'))""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
-             session_key, content, since))
+             content, content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
+             session_key, since, content))
+
+
+def has_terminal_decline(session_key: str, since: float) -> bool:
+    """Whether a turn's destination already has a durable egress refusal."""
+    with _DB_LOCK, _connect() as conn:
+        return _declined_since(conn, session_key, since)
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -315,8 +408,77 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
+def mark_failed(obligation_id: str, error: str = "", *, remaining_content: Optional[str] = None) -> None:
+    if remaining_content is not None:
+        if not isinstance(remaining_content, str) or not remaining_content:
+            raise ValueError("remaining_content must be a nonempty string")
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute(
+                """UPDATE delivery_obligations
+                   SET original_content=COALESCE(original_content, content),
+                       content=?, state='failed', updated_at=?, last_error=?
+                   WHERE obligation_id=?""",
+                (remaining_content, time.time(), error[:500] if error else None, obligation_id))
+        return
     _update_state(obligation_id, "failed", error=error)
+
+def finalize_delivery(obligation_id: str, *, success: bool, error: str = "",
+                      remaining_content: Optional[str] = None,
+                      turn_receipt: Optional[dict] = None) -> bool:
+    """Settle one claimed attempt, atomically narrowing content with its canonical receipt."""
+    encoded = _owner_record(turn_receipt)
+    declined = False
+    original = None
+    if encoded is not None:
+        from gateway.delivery_handoff import StreamDeliveryHandoff
+
+        owner = StreamDeliveryHandoff.from_record(json.loads(encoded))
+        original = owner.source_content
+        from gateway.relay.egress import declined_send
+        declined = declined_send(owner.result)
+        if remaining_content is not None and remaining_content != owner.owed:
+            raise ValueError("remaining_content conflicts with turn receipt")
+        if remaining_content is None and owner.owed:
+            remaining_content = owner.owed
+        if success and (declined or not owner.complete):
+            raise ValueError("incomplete or declined turn receipt cannot settle delivered")
+    if remaining_content is not None and (not isinstance(remaining_content, str) or not remaining_content):
+        raise ValueError("remaining_content must be a nonempty string")
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET original_content=COALESCE(original_content, content),
+                   content=COALESCE(?, content), state=?, updated_at=?, last_error=?,
+                   turn_receipt=COALESCE(?, turn_receipt)
+               WHERE obligation_id=? AND state='attempting'
+                 AND owner_pid IS ? AND owner_started_at IS ?
+                 AND (? IS NULL OR COALESCE(original_content, content)=?)""",
+            (remaining_content if not success else None,
+             "declined" if declined else "delivered" if success else "failed",
+             time.time(), None if success else (error[:500] if error else None),
+             encoded, obligation_id, pid, started, original, original))
+    return bool(cursor.rowcount)
+
+
+def decline_claimed_ownerless_attempt(obligation_id: str, *, attempted_content: str,
+                                      error: str = "") -> bool:
+    """Fail closed after a refused recovery send if canonical finalization loses its identity guard.
+
+    Do not attach a receipt to an identity we cannot prove. Only the still-owned ownerless
+    attempt for these exact attempted bytes can be made terminal.
+    """
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='declined', updated_at=?, last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND owner_pid IS ? AND owner_started_at IS ?
+                 AND content=? AND turn_receipt IS NULL""",
+            (time.time(), error[:500] if error else None, obligation_id,
+             pid, started, attempted_content))
+    return bool(cursor.rowcount)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -349,9 +511,10 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
             (state, time.time(), error[:500] if error else None, obligation_id))
 
 
-def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
-                 needs_marker: bool, runtime: bool = False, flood: bool = False,
-                 last_error: Optional[str] = None) -> Dict[str, Any]:
+def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, original_content,
+                 attempts, profile, *, needs_marker: bool, runtime: bool = False,
+                 flood: bool = False, last_error: Optional[str] = None,
+                 turn_receipt: Optional[dict] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
@@ -359,7 +522,8 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
     released unsent goes back to ``failed`` with the same error and keeps its retry eligibility."""
     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
-            "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
+            "thread_id": thread_id, "content": content, "original_content": original_content,
+            "needs_marker": needs_marker, "turn_receipt": turn_receipt,
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
             **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
@@ -390,15 +554,42 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
+                      content, COALESCE(original_content, content), state, attempts, created_at,
+                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+                      turn_receipt
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
+        for (oid, session_key, platform, chat_id, thread_id, content, original_content,
+             state, attempts, created_at, owner_pid, owner_started_at, adapter_profile,
+             last_error, updated_at, receipt) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
+            if _owner_is_declined(receipt):
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='declined', updated_at=?
+                       WHERE obligation_id=? AND state=? AND owner_pid IS ?
+                         AND owner_started_at IS ?""",
+                    (now, oid, state, owner_pid, owner_started_at))
+                if cursor.rowcount:
+                    claimed.append({"obligation_id": oid, "session_key": session_key,
+                                    "adopted": True})
+                continue
+            if _automatic_uncertainty(receipt, state, last_error):
+                # Adopt without claiming: resume_pending must be cleared, but neither the boot send
+                # nor the reconnect/timer may replay an acknowledgement-uncertain request.
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET owner_pid=?, owner_started_at=?, state='failed',
+                           last_error=COALESCE(last_error, 'delivery acknowledgement uncertain')
+                       WHERE obligation_id=? AND state=? AND owner_pid IS ?
+                         AND owner_started_at IS ?""",
+                    (pid, started, oid, state, owner_pid, owner_started_at))
+                if cursor.rowcount:
+                    claimed.append({"obligation_id": oid, "session_key": session_key,
+                                    "adopted": True, "uncertain": True})
+                continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
@@ -422,6 +613,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
+                        "turn_receipt": _decode_owner(receipt),
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
                 continue
             # Every claim starts a send, so the row leaves 'pending'/'failed' for 'attempting' in the same
@@ -440,9 +632,10 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # mid-await, other rejection, a flood refusal whose earlier chunks the platform may have
                 # accepted, or a pending row an older build already claimed and may have sent) carries
                 # the marker.
-                claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
-                                            adapter_profile or "default",
-                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row))
+                claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content,
+                                            original_content, attempts, adapter_profile or "default",
+                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row,
+                                            turn_receipt=_decode_owner(receipt)))
     return claimed
 
 
@@ -466,14 +659,24 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile, updated_at
+                      content, COALESCE(original_content, content), attempts, created_at, owner_pid,
+                      owner_started_at, last_error, adapter_profile, updated_at, turn_receipt
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
-        for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
-             owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
+        for (oid, session_key, row_platform, chat_id, thread_id, content, original_content,
+             attempts, created_at, owner_pid, owner_started_at, last_error,
+             adapter_profile, updated_at, receipt) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
+                continue
+            if _owner_is_declined(receipt):
+                conn.execute(
+                    """UPDATE delivery_obligations SET state='declined', updated_at=?
+                       WHERE obligation_id=? AND state='failed'
+                         AND owner_pid IS ? AND owner_started_at IS ?""",
+                    (now, oid, owner_pid, owner_started_at))
+                continue
+            if _automatic_uncertainty(receipt, "failed", last_error):
                 continue
             due = retry_not_before(updated_at, last_error, attempts)
             if due is None:
@@ -499,9 +702,11 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # The failed send's ack may have been lost (reconnect) or its earlier chunks accepted
                 # (flood): every runtime redelivery carries a marker. The pre-claim error rides along so a
                 # claim released unsent keeps its flood retry eligibility.
-                claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
-                                            attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            flood=is_flood_error(last_error), last_error=last_error))
+                claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id,
+                                            content, original_content, attempts, adapter_profile,
+                                            needs_marker=True, runtime=True,
+                                            flood=is_flood_error(last_error), last_error=last_error,
+                                            turn_receipt=_decode_owner(receipt)))
     return claimed
 
 
@@ -515,14 +720,16 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
         return []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
+            """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at,
+                      turn_receipt
                FROM delivery_obligations
                WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
     earliest: Dict[tuple, float] = {}
-    for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
+    for platform, adapter_profile, updated_at, last_error, attempts, created_at, receipt in rows:
         # Reconnect-only rows (a claim released because the adapter was gone) are re-claimed by the
         # reconnect sweep; a timer would claim and release them every tick until the adapter is back.
-        if is_reconnect_only(last_error):
+        if (_owner_is_declined(receipt) or is_reconnect_only(last_error)
+                or _automatic_uncertainty(receipt, "failed", last_error)):
             continue
         due = retry_not_before(updated_at, last_error, attempts)
         if due is None or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -538,7 +745,8 @@ def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
+           WHERE state IN ('delivered', 'declined', 'abandoned') AND updated_at < ?""",
+        (now - _RETENTION_SECONDS,))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
@@ -546,6 +754,7 @@ def _prune_unlocked(conn, now: float) -> None:
                  SELECT obligation_id FROM delivery_obligations
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
+                            WHEN 'declined' THEN 0
                             WHEN 'abandoned' THEN 1
                             ELSE 2
                           END, updated_at ASC

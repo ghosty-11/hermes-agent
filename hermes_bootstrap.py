@@ -525,13 +525,44 @@ class RelaunchExit(SystemExit):
 
 
 from pm.environments import activate_dependencies, install_state_permission_message
-from hermes_cli._early_recovery import recover_if_needed
+from hermes_cli._early_recovery import local_transaction_marker, recover_if_needed
 
 from hermes_cli._parser import command_argv
 
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
-_pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
-if not _pm_repair:
+_update_argv = command_argv(sys.argv[1:])
+_local_intent = (_update_argv[:1] == ["update"] and
+                 any(option == flag or option.startswith(flag + "=")
+                     for option in _update_argv[1:]
+                     for flag in ("--source-repo", "--target", "--rollback-local-update")))
+_pm_repair = _update_argv[:2] == ["pm", "repair"]
+_local_transaction = (_local_intent or os.environ.get("HERMES_LOCAL_UPDATE_CONTEXT") == "1"
+                      or local_transaction_marker(_root).exists())
+_frozen_probe = (
+    _local_transaction
+    and os.environ.get("HERMES_RETAINED_WRITER_CLAIMS") is not None
+    and os.environ.get("_HERMES_FROZEN_PROBE_ROOT") == str(_root)
+    and os.environ.get("HERMES_INSTALL_ROOT") is not None
+)
+_boot_claim_needed = (os.environ.get("HERMES_RETAINED_WRITER_CLAIMS") is not None
+                      or (_local_transaction and os.environ.get("HERMES_LOCAL_UPDATE_CONTEXT") != "1"))
+if _boot_claim_needed and not _pm_repair:
+    from pm.writer_claim import writer_claim
+    import atexit
+
+    _local_boot_claim = writer_claim(
+        install=Path(os.environ.get("HERMES_INSTALL_ROOT", str(_root))),
+        inherited_only=os.environ.get("HERMES_RETAINED_WRITER_CLAIMS") is not None,
+    )
+    _local_boot_claim.__enter__()
+    atexit.register(_local_boot_claim.__exit__, None, None, None)
+if _local_transaction and not _pm_repair:
+    print("hermes: local update requires explicit completion or rollback; automatic repair disabled",
+          file=sys.stderr)
+    if (os.environ.get("HERMES_LOCAL_UPDATE_CONTEXT") != "1"
+            or (_boot_claim_needed and Path(sys.argv[0]).name != "local_update_entry.py")):
+        activate_dependencies(Path(os.environ["HERMES_INSTALL_ROOT"]) if _frozen_probe else _root)
+if not _pm_repair and not _local_transaction:
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
 
     try:
@@ -546,7 +577,8 @@ if not _pm_repair:
                 import subprocess
 
                 raise RelaunchExit(subprocess.call(_command))
-            os.execv(str(_launch_python), _command)
+            from pm.writer_claim import exec_inheriting_claims
+            exec_inheriting_claims(str(_launch_python), _command)
     except Exception as exc:
         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
             print(f"hermes: {message}", file=sys.stderr)

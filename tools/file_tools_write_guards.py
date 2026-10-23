@@ -194,7 +194,8 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     ``security.protected_instruction_extra_patterns`` (fnmatch on basename). Config read
     failures keep the gate ON — fail-safe for a security boundary."""
     try:
-        from hermes_cli.config import load_config, cfg_get
+        from hermes_cli.config import load_config
+        from hermes_cli.config_primitives import cfg_get
         cfg = load_config()
         enabled = cfg_get(cfg, "security", "protected_instruction_files", default=True)
         extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns", default=[])

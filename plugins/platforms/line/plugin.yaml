@@ -1,6 +1,10 @@
 name: line-platform
 label: LINE
 kind: platform
+platform_dependencies:
+  line:
+    extras: []
+    env: [LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET]
 version: 1.0.0
 description: >
   LINE Messaging API gateway adapter for Hermes Agent.

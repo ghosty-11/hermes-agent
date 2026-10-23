@@ -340,6 +340,7 @@ def test_cold_profile_hydration_retries_failed_source(tmp_path, monkeypatch):
                     overrode_env=False,
                 )
             },
+            activation_decisions={"command": True},
         )
 
     monkeypatch.setattr(reg_module, "apply_all", _apply_after_credentials_are_fixed)
@@ -522,7 +523,7 @@ def test_apply_external_secret_sources_status_line_suppresses_secret_names(
 def test_external_secret_values_are_isolated_between_homes(tmp_path, monkeypatch):
     """A later apply for the same key must not mutate an earlier home snapshot."""
     from agent.secret_scope import build_profile_secret_scope
-    from agent.secret_sources.base import FetchResult
+    from agent.secret_sources.base import FetchResult, SecretSource
     from agent.secret_sources.registry import (
         AppliedVar,
         ApplyReport,
@@ -544,18 +545,25 @@ def test_external_secret_values_are_isolated_between_homes(tmp_path, monkeypatch
         str(home_b.resolve()): "value-b",
     }
 
-    def _fake_apply_all(_cfg, home_path):
-        value = values[str(Path(home_path).resolve())]
-        monkeypatch.setenv("SHARED_API_KEY", value)
+    class _TestSource(SecretSource):
+        name = "test-source"
+        label = "Test Source"
+        override_existing_default = True
+
+        def fetch(self, cfg, home_path):
+            return FetchResult(secrets={"SHARED_API_KEY": values[str(home_path.resolve())]})
+
+    source = _TestSource()
+
+    def _fake_apply_all(_cfg, home_path, *, environ=None):
+        result = source.fetch(_cfg["test-source"], Path(home_path))
+        environ["SHARED_API_KEY"] = result.secrets["SHARED_API_KEY"]
         return ApplyReport(
-            # Real apply_all always appends a SourceReport per enabled
-            # source; the env_loader guard (#40597) early-returns on an
-            # empty sources list, so the fake must match the real shape.
             sources=[
                 SourceReport(
                     name="test-source",
                     label="Test Source",
-                    result=FetchResult(),
+                    result=result,
                     applied=["SHARED_API_KEY"],
                 )
             ],
@@ -566,7 +574,9 @@ def test_external_secret_values_are_isolated_between_homes(tmp_path, monkeypatch
                     shape="mapped",
                     overrode_env=True,
                 )
-            }
+            },
+            activation_decisions={"test-source": True},
+            _fetches=[(source, _cfg["test-source"], result)],
         )
 
     monkeypatch.setattr(reg_module, "apply_all", _fake_apply_all)

@@ -11,6 +11,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 # Optional SDKs: catch broad Exception, not just ImportError — their transitive cryptography
@@ -163,8 +164,8 @@ def ensure_dingtalk_deps() -> bool:
     if DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE:
         return True
     try:
-        from pm.extras import ensure_import
-        ensure_import("dingtalk")
+        from pm.platform_requirements import ensure_platform_dependencies
+        ensure_platform_dependencies("dingtalk", Path(__file__).with_name("plugin.yaml"))
         import dingtalk_stream as _ds, httpx as _httpx  # noqa: E401
         from dingtalk_stream import ChatbotMessage as _CM
         from dingtalk_stream.frames import CallbackMessage as _CBM, AckMessage as _AM
@@ -842,7 +843,8 @@ def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
 
 def _is_connected(config) -> bool:
     """Connected when client_id + client_secret are present (PlatformConfig.extra first, then env)."""
-    return all(_credentials(getattr(config, "extra", {})))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("dingtalk", getattr(config, "extra", {}) or {}, _get_scoped_secret)
 
 
 

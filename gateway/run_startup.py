@@ -20,7 +20,7 @@ from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, _delivery_failure_error
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
@@ -35,6 +35,18 @@ from typing import Any, Dict, Optional, Tuple
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _without_recovery_header(text: str, marker: str) -> Optional[str]:
+    """Remove only this send's visible header, including Ambient's whitespace-trimmed split."""
+    if text.startswith(marker):
+        return text[len(marker):]
+    trimmed = marker.rstrip()
+    if text == trimmed:
+        return ""
+    if text.startswith(trimmed + "\n"):
+        return text[len(trimmed) + 1:]
+    return None
 
 
 class GatewayStartupMixin:
@@ -423,45 +435,242 @@ class GatewayStartupMixin:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
         reopening the turn-replay window. Returns the redelivered count."""
-        # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
-        # not due yet, and those still need their timer armed below.
+        # An empty send list still needs to arm timers for adopted flood waits.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER, decline_claimed_ownerless_attempt, finalize_delivery,
+                mark_delivered, mark_failed,
+            )
+            from gateway.delivery_handoff import (
+                StreamDeliveryHandoff, delivery_handoff_from_receipt, normalize_delivery_result,
+            )
+            from gateway.platforms.base import SendResult
+            from gateway.relay.egress import declined_send
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
         for row in claimed:
             if row.get("adopted"):
-                # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
-                # the timer armed below sends it once the platform's deadline has passed.
+                # The boot sweep adopts uncertain, waiting, and declined rows without a send.
+                continue
+            owner_record = row.get("turn_receipt")
+            owner = StreamDeliveryHandoff.from_record(owner_record) if owner_record is not None else None
+            if owner is not None and declined_send(owner.result):
+                # A claimed legacy row can still carry a declined owner; never
+                # cross the recovery send boundary with that destination.
+                await asyncio.to_thread(
+                    finalize_delivery, row["obligation_id"], success=False,
+                    error=owner.result.error or "egress declined",
+                    remaining_content=owner.owed or None, turn_receipt=owner.to_record())
                 continue
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
-            content = row["content"]
-            if row.get("needs_marker"):
-                content = row.get("marker", RECOVERED_MARKER) + content
+            owner_home = None
+            if owner is not None and owner.address:
+                from gateway.session import profile_from_session_key_namespace
+                from hermes_cli.profiles import get_profile_dir, profile_exists
+
+                parts = str(row.get("session_key") or "").split(":")
+                if len(parts) >= 4 and parts[0] == "agent":
+                    profile = profile_from_session_key_namespace(parts[1])
+                    if profile_exists(profile):
+                        owner_home = get_profile_dir(profile)
+                if owner_home is None:
+                    await asyncio.to_thread(
+                        finalize_delivery, row["obligation_id"], success=False,
+                        error="addressed delivery profile unavailable",
+                        remaining_content=owner.owed or None, turn_receipt=owner.to_record())
+                    continue
+            owed = row["content"]
+            marker = row.get("marker", RECOVERED_MARKER) if row.get("needs_marker") else ""
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            if owner is not None and row["platform"] == "telegram":
+                chunks = owner.formatted_transport_chunks(owed)
+                if chunks is not None:
+                    # Telegram owns these already-formatted frames. Let its send
+                    # path resume them without escaping MarkdownV2 a second time.
+                    marker = adapter.format_message(marker) if marker else ""
+                    metadata = {**(metadata or {}),
+                                "_delivery_formatted_chunks": chunks,
+                                "_delivery_recovery_marker": marker}
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                result = await adapter.send(
+                    chat_id=row["chat_id"], content=marker + owed, metadata=metadata)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
-                result = None
+                result = SendResult(success=False, error=str(send_err),
+                                    raw_response={"remaining_content": owed,
+                                                  "delivery_ambiguous": isinstance(send_err, TimeoutError)})
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
-                if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                if owner is not None:
+                    result = normalize_delivery_result(result)
+                    # The recovery marker is auxiliary transport context. Remove it only from
+                    # acknowledged text (or an adapter's exact uncarried full payload), never
+                    # count it as model prose or as an acknowledged requested-body carriage.
+                    raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+                    projected = dict(raw)
+                    if marker:
+                        value = projected.get("remaining_content")
+                        if isinstance(value, str):
+                            remaining = _without_recovery_header(value, marker)
+                            if remaining is not None:
+                                projected["remaining_content"] = remaining
+                        model_owed = projected.get("model_remaining_content")
+                        stripped_model = (_without_recovery_header(model_owed, marker)
+                                          if isinstance(model_owed, str) else None)
+                        if stripped_model is not None:
+                            projected["model_remaining_content"] = stripped_model
+                        if stripped_model == "":
+                            attachment_owed = projected.get("attachment_remaining_content")
+                            if isinstance(attachment_owed, str):
+                                projected["remaining_content"] = attachment_owed
+                        nested = projected.get("ambient_carriages")
+                        if isinstance(nested, (tuple, list)) and nested:
+                            first = nested[0]
+                            first_text = getattr(first, "delivered_text", None)
+                            normalized = (_without_recovery_header(first_text, marker)
+                                          if isinstance(first_text, str) else None)
+                            removed_header = False
+                            if normalized == "" or (
+                                    stripped_model == "" and not getattr(first, "success", False)):
+                                requested = tuple(nested[1:])
+                                removed_header = True
+                            elif normalized is not None:
+                                requested = (dataclasses.replace(first, delivered_text=normalized), *nested[1:])
+                                removed_header = True
+                            else:
+                                requested = tuple(nested)
+                            projected["ambient_carriages"] = requested
+                            if removed_header:
+                                failed = next((part for part in requested if not part.success), None)
+                                result = dataclasses.replace(
+                                    result, success=bool(requested) and failed is None,
+                                    error=getattr(failed, "error", None),
+                                    retryable=bool(getattr(failed, "retryable", False)),
+                                    retry_after=getattr(failed, "retry_after", None),
+                                    error_kind=getattr(failed, "error_kind", None),
+                                    message_id=next((part.message_id for part in requested
+                                                     if getattr(part, "message_id", None)), None))
+                                projected["delivery_error"] = getattr(failed, "error", None)
+                                projected["delivery_ambiguous"] = any(
+                                    isinstance(getattr(part, "raw_response", None), dict)
+                                    and part.raw_response.get("delivery_ambiguous") for part in requested)
+                        carriages = projected.get("acknowledged_carriages")
+                        if isinstance(carriages, (tuple, list)) and carriages:
+                            first = carriages[0]
+                            if isinstance(first, dict) and isinstance(first.get("text"), str):
+                                first_text = first["text"]
+                                normalized = _without_recovery_header(first_text, marker)
+                                if normalized is not None:
+                                    projected["acknowledged_carriages"] = (
+                                        ([{**first, "text": normalized}] if normalized else [])
+                                        + list(carriages[1:]))
+                                    if not normalized and first.get("message_id") == result.message_id:
+                                        remaining = projected["acknowledged_carriages"]
+                                        result = dataclasses.replace(
+                                            result, message_id=next(
+                                                (item.get("message_id") for item in remaining
+                                                 if item.get("message_id")), None))
+                        chunks = projected.get("acknowledged_chunks")
+                        if isinstance(chunks, (tuple, list)) and chunks and isinstance(chunks[0], str):
+                            normalized = _without_recovery_header(chunks[0], marker)
+                            if normalized is not None:
+                                header_only_chunk = not normalized
+                                projected["acknowledged_chunks"] = (
+                                    ([] if header_only_chunk else [normalized]) + list(chunks[1:]))
+                                ids = projected.get("message_ids")
+                                if header_only_chunk and isinstance(ids, (tuple, list)):
+                                    projected["message_ids"] = list(ids[1:])
+                                    if ids and result.message_id == ids[0]:
+                                        result = dataclasses.replace(
+                                            result, message_id=next(
+                                                (mid for mid in ids[1:] if mid), None))
+                    text = result.delivered_text
+                    normalized = (_without_recovery_header(text, marker)
+                                  if marker and isinstance(text, str) else None)
+                    header_only = normalized == "" if normalized is not None else False
+                    if normalized is not None:
+                        text = normalized
+                    if (header_only and not projected.get("ambient_carriages")
+                            and not projected.get("acknowledged_carriages")
+                            and not projected.get("acknowledged_chunks")):
+                        # The auxiliary header alone cannot settle owed requested bytes.
+                        result = dataclasses.replace(
+                            result, success=False, message_id=None, error="recovery carried only its header",
+                            delivered_text=None, raw_response={**projected, "remaining_content": owed})
+                    else:
+                        result = dataclasses.replace(result, delivered_text=text, raw_response=projected)
+                    updated = delivery_handoff_from_receipt(
+                        owner.source_content, result, previous=owner, attempted_content=owed,
+                        resolve_attempt=bool(result.success and not projected.get("delivery_ambiguous")))
+                    recorded = True
+                    if updated.address:
+                        from gateway.run import _profile_runtime_scope
+
+                        with _profile_runtime_scope(owner_home, {}):
+                            outcome = BasePlatformAdapter._turn_delivery_outcome(
+                                [updated.result], hint=updated.address["disposition_hint"],
+                                streamed_text=None)
+                            recorded = await self.record_turn_delivery(
+                                updated.address, {**outcome, "lane": "text"})
+                        if not recorded:
+                            logger.warning("obligation %s: addressed delivery row refused",
+                                           row["obligation_id"])
+                    if not recorded and updated.complete:
+                        # Transport may already have accepted the reply. An unresolved
+                        # row cannot authorize automatic retransmission of those bytes.
+                        updated = dataclasses.replace(
+                            updated, result=dataclasses.replace(
+                                updated.result, success=False,
+                                error="addressed delivery row refused",
+                                raw_response={**updated.result.raw_response,
+                                              "delivery_ambiguous": True}))
+                    error = _delivery_failure_error(updated.result) or "send failed"
+                    settled = await asyncio.to_thread(
+                        finalize_delivery, row["obligation_id"], success=updated.complete,
+                        error=error, remaining_content=updated.owed or None,
+                        turn_receipt=updated.to_record())
+                    if not settled:
+                        continue
+                    success = updated.complete
+                else:
+                    success = bool(result.success)
+                    if declined_send(result):
+                        # Preserve the original identity; content is only the attempted tail.
+                        updated = delivery_handoff_from_receipt(
+                            row["original_content"], result, attempted_content=row["content"])
+                        error = _delivery_failure_error(result) or "egress declined"
+                        settled = await asyncio.to_thread(
+                            finalize_delivery, row["obligation_id"], success=False,
+                            error=error, remaining_content=updated.owed or None,
+                            turn_receipt=updated.to_record())
+                        if not settled:
+                            terminal = await asyncio.to_thread(
+                                decline_claimed_ownerless_attempt, row["obligation_id"],
+                                attempted_content=row["content"], error=error)
+                            logger.warning(
+                                "obligation %s: canonical decline finalization failed; guarded terminal=%s",
+                                row["obligation_id"], terminal)
+                        success = False
+                    elif success:
+                        await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    else:
+                        error = _delivery_failure_error(result) or "send failed"
+                        raw = getattr(result, "raw_response", None)
+                        remainder = raw.get("remaining_content") if isinstance(raw, dict) else None
+                        if isinstance(remainder, str) and remainder:
+                            await asyncio.to_thread(
+                                mark_failed, row["obligation_id"], error, remaining_content=remainder)
+                        else:
+                            await asyncio.to_thread(mark_failed, row["obligation_id"], error)
+                if success:
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
-                else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
-                    )
-        # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
-        # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
         with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
             await self._arm_flood_timers_for_waiting_rows()
         return redelivered
@@ -730,7 +939,8 @@ class GatewayStartupMixin:
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
-        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+        from gateway.delivery_ledger import (
+            compute_obligation_id, has_terminal_decline, ledger_enabled, record_crash_left_reply)
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -745,6 +955,10 @@ class GatewayStartupMixin:
         for key, session_id, token, started_at, origin, profile in marked:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
+                continue
+            if await asyncio.to_thread(has_terminal_decline, key, started):
+                if await self.async_session_store.clear_turn_active(key, token):
+                    await self.async_session_store.clear_resume_pending(key)
                 continue
             text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
                                           started, origin)

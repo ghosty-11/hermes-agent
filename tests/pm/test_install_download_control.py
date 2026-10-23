@@ -47,7 +47,7 @@ def test_install_pause_preserves_archives_and_resumes_the_same_pin(tmp_path, mon
     root = tmp_path / "store"
     lock_path = tmp_path / "lock.json"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(paths, "store_root", lambda: root)
+    monkeypatch.setattr(paths, "store_root", lambda project_root=None: root)
     monkeypatch.setattr(paths, "lockfile_path", lambda: lock_path)
     monkeypatch.setitem(registry._packages, ComponentPackage.name, ComponentPackage())
     contents = {"engine.dat": b"engine component", "runtime.dll": bytes(range(256)) * (64 * 1024)}

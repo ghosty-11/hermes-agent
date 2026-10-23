@@ -28,6 +28,7 @@ security event laundered into an apparent success.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -35,14 +36,13 @@ logger = logging.getLogger(__name__)
 # The connector stamps this on a structured decline (preferred signal).
 EGRESS_DECLINE_CODE = "egress_declined"
 
-# Fallback signal: the connector's uniform decline sentence. Matched
-# case-insensitively on this fragment ONLY — the rest of the sentence is
-# deliberately uninformative (finding F-005) and must not be parsed.
-EGRESS_DECLINE_MARKER = "egress declined:"
+# Fallback signal for connectors that send no structured code: the uniform decline
+# prefix ("[<platform>] egress declined:", any case) at the START of the error. The
+# rest of the sentence is deliberately uninformative (finding F-005) and is not
+# parsed; the same fragment quoted inside another failure is not a decline.
+_UNIFORM_DECLINE_RE = re.compile(r"\s*(?:[a-z][a-z0-9_-]*\s+)?egress declined:", re.IGNORECASE)
 
-# Transport-ambiguity text. A lost ack means the frame MAY have been delivered,
-# so it is never an authorization refusal. Needed because the text-only branch
-# of `declined_send` sees no structured `ambiguous` flag to check.
+# A lost ack means the frame MAY have been delivered, not refused.
 _AMBIGUOUS_MARKER = "ack lost"
 
 
@@ -52,21 +52,20 @@ def is_egress_decline(result: Any) -> bool:
     A decline is distinguished from every other outbound failure by three
     properties, all required:
 
-    * it failed (``success`` is falsey),
-    * it is DEFINITE — an ``ambiguous`` result (lost ack, mid-write drop) says
-      the frame may well have been applied, so it is a transport outcome, not
-      an authorization one,
-    * it carries the connector's decline code, or its uniform decline text.
+    * it failed (``success`` is false),
+    * it is DEFINITE — neither ``ambiguous`` nor ``delivery_ambiguous`` may
+      be set on a frame that may already have been applied,
+    * it carries the connector's decline code, or starts with its uniform decline prefix.
     """
     if not isinstance(result, dict):
         return False
-    if result.get("success"):
+    if result.get("success") is not False:
         return False
-    if result.get("ambiguous"):
+    if result.get("ambiguous") or result.get("delivery_ambiguous"):
         return False
     if str(result.get("code") or "") == EGRESS_DECLINE_CODE:
         return True
-    return EGRESS_DECLINE_MARKER in str(result.get("error") or "").lower()
+    return _UNIFORM_DECLINE_RE.match(str(result.get("error") or "")) is not None
 
 
 def declined_send(result: Any) -> bool:
@@ -86,26 +85,25 @@ def declined_send(result: Any) -> bool:
     Both shapes are authoritative, so both are checked here, once:
 
     * ``raw_response`` when the connector sent a structured body,
-    * otherwise the error text against the uniform decline marker.
+    * otherwise the error text against the uniform decline prefix.
 
     The latch in ``RelayAdapter`` already catches both (it classifies the
     transport dict directly), which is why the inconsistency cost verdicts and
     futile retries rather than leaked content. This helper makes the gateway
     lanes agree with the wire.
     """
+    if getattr(result, "success", None) is not False:
+        return False
     raw = getattr(result, "raw_response", None)
     if isinstance(raw, dict):
-        return is_egress_decline(raw)
+        if raw.get("ambiguous") or raw.get("delivery_ambiguous"):
+            return False
+        return is_egress_decline({**raw, "success": raw.get("success", False)})
     error = getattr(result, "error", None)
     if not error:
         return False
     if _AMBIGUOUS_MARKER in str(error).lower():
-        # DEFENCE IN DEPTH for a lost `ambiguous` flag. The text branch exists
-        # only for connectors that send no structured body, so it cannot see
-        # `ambiguous` — and a projection that drops `raw_response` therefore
-        # turned "ack lost" into a definite refusal, terminating the run for a
-        # frame that may well have been delivered. Any error text that says the
-        # ack was lost is treated as a transport outcome, never authorization.
+        # A projected lost acknowledgement is still ambiguous without a body.
         return False
     return is_egress_decline({"success": False, "error": error})
 

@@ -8,7 +8,8 @@ import contextlib
 import logging
 from typing import Any, Callable, Optional
 
-from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter, _delivery_failure_error
+from gateway.delivery_handoff import normalize_delivery_result
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 
 logger = logging.getLogger("gateway.stream_consumer")
@@ -18,8 +19,10 @@ class StreamFallbackMixin:
     """Non-streaming delivery paths used once progressive edits fail or the turn ends oddly."""
 
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str], *,
-                              final: bool = False) -> Optional[str]:
+                              final: bool = False, later_chunks: tuple[str, ...] = ()) -> Optional[str]:
         """Send a new chunk threaded to ``reply_to_id``; returns the new message_id."""
+        if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+            return None
         text = self._clean_for_display(text)
         if not text.strip():
             return reply_to_id
@@ -27,23 +30,48 @@ class StreamFallbackMixin:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, reply_to=reply_to_id,
                 metadata=self._metadata_for_send(final=final, expect_edits=not final))
+            result = normalize_delivery_result(result)
+            if not result.success:
+                from gateway.relay.egress import declined_send
+                if declined_send(result):
+                    self._retain_egress_decline(
+                        result, attempted_content=text, later_chunks=later_chunks)
+                else:
+                    self._retain_delivery_remainder(
+                        self._clean_for_display(self._stream_ledger or text), result,
+                        later_chunks=later_chunks, attempted_content=text)
+                    return reply_to_id
+                self._edit_supported = False
+                return reply_to_id
             if not (result.success and result.message_id):
                 self._edit_supported = False
                 return reply_to_id
+            self._retain_delivery_remainder(
+                self._clean_for_display(self._stream_ledger or text), result,
+                later_chunks=later_chunks, attempted_content=text)
             self._message_id = str(result.message_id)
             self._track_preview_ids_from_result(result)
             self._already_sent = True
             self._last_sent_text = text
+            self._last_sent_cursor_appended = False
             self._notify_new_message()
             return str(result.message_id)
         except Exception as e:
+            from gateway.platforms.base import SendResult
+            self._retain_delivery_remainder(
+                self._clean_for_display(self._stream_ledger or text),
+                SendResult(success=False, error=str(e), raw_response={
+                    "delivery_ambiguous": True, "remaining_content": text,
+                    "model_remaining_content": text, "attachment_remaining_content": ""}),
+                later_chunks=later_chunks, attempted_content=text)
             logger.error("Stream send chunk error: %s", e)
             return reply_to_id
 
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
         prefix = self._last_sent_text or ""
-        if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
+        if (self.cfg.cursor and getattr(self, "_last_sent_cursor_appended", False)
+                and prefix.endswith(self.cfg.cursor)):
             prefix = prefix[:-len(self.cfg.cursor)]
         return self._clean_for_display(prefix)
 
@@ -96,6 +124,8 @@ class StreamFallbackMixin:
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working (one flood retry
         per chunk)."""
+        if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+            return
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run. The
             # whole point of this path is to deliver the unseen tail as a NEW
@@ -121,28 +151,42 @@ class StreamFallbackMixin:
 
         stale_message_id = self._message_id  # partial message to clean up
         last_message_id: Optional[str] = None
-        last_successful_chunk = ""
         sent_any_chunk = False
         # Thread only a FULL resend (it replaces the preview); a tail continuation
         # keeps its existing unthreaded delivery on every platform.
         anchor = self._initial_reply_to_id if continuation == final_text else None
-        for chunk in chunks:
-            result = await self._send_with_flood_retry(
-                content=chunk, reply_to=None if sent_any_chunk else anchor,
-                retry_log="Flood control on fallback send, retrying in %.1fs")
+        for index, chunk in enumerate(chunks):
+            try:
+                result = await self._send_with_flood_retry(
+                    content=chunk, reply_to=None if sent_any_chunk else anchor,
+                    retry_log="Flood control on fallback send, retrying in %.1fs")
+                result = normalize_delivery_result(result)
+            except Exception as exc:
+                from gateway.platforms.base import SendResult
+                result = SendResult(success=False, error=str(exc), raw_response={
+                    "delivery_ambiguous": True, "remaining_content": chunk,
+                    "model_remaining_content": chunk, "attachment_remaining_content": ""})
             if not result or not result.success:
-                # Partial continuation landed: do NOT set _final_response_sent (the
-                # gateway must still deliver the full answer); _already_sent only
-                # prevents a duplicate of the partial.  Nothing landed: let the
-                # gateway final send try once more.
-                self._already_sent = sent_any_chunk
-                self._message_id = last_message_id
-                self._last_sent_text = last_successful_chunk
-                self._fallback_prefix = ""
+                from gateway.relay.egress import declined_send
+                if result and declined_send(result):
+                    self._retain_egress_decline(
+                        result, source_content=final_text, attempted_content=chunk,
+                        later_chunks=tuple(chunks[index + 1:]))
+                    return
+                if result is None:
+                    from gateway.platforms.base import SendResult
+                    result = SendResult(success=False, error="send returned no receipt", raw_response={
+                        "delivery_ambiguous": True, "remaining_content": chunk,
+                        "model_remaining_content": chunk, "attachment_remaining_content": ""})
+                self._retain_delivery_remainder(
+                    final_text, result, later_chunks=tuple(chunks[index + 1:]),
+                    attempted_content=chunk)
                 return
             sent_any_chunk = True
-            last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
+            self._retain_delivery_remainder(
+                final_text, result, later_chunks=tuple(chunks[index + 1:]),
+                attempted_content=chunk)
             self._notify_new_message()
 
         # Best-effort delete of the frozen partial — ONLY when the FULL final was
@@ -150,14 +194,17 @@ class StreamFallbackMixin:
         # the answer ("sent only the second half" symptom).
         if (stale_message_id and stale_message_id != last_message_id
                 and not self._fallback_preserve_partial_messages and continuation == final_text):
-            await self._delete_previews([stale_message_id], label="Fallback partial",
-                                        skip_sentinel=False)
+            deleted = await self._delete_previews([stale_message_id], label="Fallback partial",
+                                                  skip_sentinel=False)
+            if self._delivery_handoff is not None:
+                self._delivery_handoff = self._delivery_handoff.without_deleted(deleted)
 
         self._message_id = last_message_id
         self._already_sent = True
         # Recorder substitutes the unsplit ledger on a split turn.
         self._mark_final_delivered(record=final_text)
         self._last_sent_text = chunks[-1]
+        self._last_sent_cursor_appended = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
 
@@ -171,25 +218,18 @@ class StreamFallbackMixin:
         if (final_text.strip() and final_text == visible
                 and getattr(self.adapter, "RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK", False) is True):
             delivery = await self._send_empty_fallback_final(final_text)
+            if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+                return None
             if delivery == "delivered":
                 return None
-            self._already_sent = True
-            self._fallback_prefix = ""
-            self._fallback_preserve_partial_messages = False
-            # "ambiguous" (timeout: Telegram may have accepted) and "preview" (flood:
-            # the complete ACKed preview is authoritative) keep dup suppression;
-            # "failed" lets the gateway perform its normal final send.
-            self._final_content_delivered = delivery in {"ambiguous", "preview"}
+            # Only an already-acknowledged preview can stand in for a
+            # definitively flood-rejected cosmetic commit.
             if delivery == "preview":
-                # This branch is only reached when the ACKed preview already shows the complete final text
-                # (final_text == _visible_prefix()), so record it as the turn-final payload: the gateway's
-                # reconciliation then confirms delivery instead of re-sending a second bubble next to the
-                # never-deleted preview (#71047 Problem B).
+                self._already_sent = True
+                self._fallback_prefix = ""
+                self._fallback_preserve_partial_messages = False
+                self._final_content_delivered = True
                 self._record_turn_final_payload(final_text)
-            elif delivery == "ambiguous":
-                self._delivery_ambiguous = True
-            else:
-                self._final_response_sent = False
             return None
         # The prefix may be from a *previous* segment (before a tool boundary),
         # wrongly reading as "already shown" — send final_text as-is.
@@ -197,12 +237,17 @@ class StreamFallbackMixin:
             return final_text
         # Best-effort strip of a cursor left stuck by the edit failure.
         if (self._message_id and self._last_sent_text and self.cfg.cursor
+                and getattr(self, "_last_sent_cursor_appended", False)
                 and self._last_sent_text.endswith(self.cfg.cursor)):
             clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
             with contextlib.suppress(Exception):
                 result = await self._edit_message(message_id=self._message_id, content=clean_text)
                 if result.success:
+                    self._retain_delivery_remainder(
+                        self._clean_for_display(self._stream_ledger or clean_text), result,
+                        edited_message_id=str(self._message_id), attempted_content=clean_text)
                     self._last_sent_text = clean_text
+                    self._last_sent_cursor_appended = False
         self._already_sent = True
         # Recorder substitutes the full ledger on a split turn.
         self._mark_final_delivered(record=final_text)
@@ -231,12 +276,26 @@ class StreamFallbackMixin:
         result = None
         for attempt in range(2):
             result = await self.adapter.send(**kwargs)
+            result = normalize_delivery_result(result)
             if getattr(result, "success", False):
                 break
+            from gateway.relay.egress import declined_send
+            if declined_send(result):
+                break  # no retry may re-address a destination the connector refused
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict) and raw.get("delivery_ambiguous"):
+                break
+            remainder = raw.get("remaining_content") if isinstance(raw, dict) else None
+            if isinstance(remainder, str) and remainder:
+                kwargs["content"] = remainder
+            elif kwargs["content"] != content:
+                result.raw_response = {
+                    **(raw if isinstance(raw, dict) else {}),
+                    "remaining_content": kwargs["content"],
+                }
             retry_delay = self._fallback_flood_retry_delay(result)
             if attempt or retry_delay is None:
                 break  # non-flood error, long flood wait, or second failure
-            raw = getattr(result, "raw_response", None)
             if isinstance(raw, dict) and raw.get("partial_overflow"):
                 break  # split head already on screen: re-sending the whole content duplicates it
             logger.debug(retry_log, retry_delay)
@@ -244,9 +303,9 @@ class StreamFallbackMixin:
         return result
 
     async def _send_empty_fallback_final(self, final_text: str) -> str:
-        """Commit a completed answer after Telegram finalization fails: "delivered", "failed"
-        (gateway may retry), "ambiguous" (a timeout may have landed) or "preview" (flood
-        control; the complete preview is authoritative)."""
+        """Commit a completed answer after Telegram finalization fails: return "delivered",
+        "failed" (including uncertain acknowledgements), or "preview" when a definite
+        flood rejection leaves the already-complete preview authoritative."""
         # Segment-scoped only: never delete an earlier finalized preamble.
         stale_ids = self._stale_preview_ids(segment_only=True)
         try:
@@ -254,18 +313,33 @@ class StreamFallbackMixin:
                 content=final_text, reply_to=self._initial_reply_to_id,
                 retry_log="Flood control on empty fallback final send; retrying in %.1fs")
         except Exception as exc:
+            from gateway.platforms.base import SendResult
+            failed = normalize_delivery_result(
+                SendResult(success=False, error=str(exc) or type(exc).__name__), exception=exc)
+            self._retain_delivery_remainder(
+                final_text, SendResult(success=False, error=failed.error, raw_response={
+                    "delivery_ambiguous": (failed.raw_response or {}).get("delivery_ambiguous", False),
+                    "remaining_content": final_text, "model_remaining_content": final_text,
+                    "attachment_remaining_content": ""}))
             logger.debug("Empty fallback final send failed: %s", exc)
-            return "ambiguous" if self._send_failure_may_have_delivered(exc) else "failed"
+            return "failed"
         if not getattr(result, "success", False):
-            if self._is_flood_error(result):
+            raw = result.raw_response if isinstance(getattr(result, "raw_response", None), dict) else {}
+            if (self._is_flood_error(result) and not raw.get("remaining_content")
+                    and self._delivery_handoff is not None and self._delivery_handoff.complete
+                    and self._visible_prefix() == final_text):
                 return "preview"
-            return "ambiguous" if self._send_failure_may_have_delivered(result) else "failed"
+            self._retain_delivery_remainder(final_text, result)
+            return "failed"
 
         new_message_id = getattr(result, "message_id", None)
         # Telegram reports delete failure by returning False; the flood window that
         # broke the finalize can reject this too — one bounded retry.
-        await self._delete_previews(stale_ids, skip=new_message_id, label="Empty fallback",
-                                    retry_on_false=True)
+        deleted = await self._delete_previews(stale_ids, skip=new_message_id, label="Empty fallback",
+                                               retry_on_false=True)
+        if self._delivery_handoff is not None:
+            self._delivery_handoff = self._delivery_handoff.without_deleted(deleted)
+        self._retain_delivery_remainder(final_text, result, attempted_content=final_text)
         self._segment_preview_message_ids = set()
         self._message_id = new_message_id or "__no_edit__"
         self._already_sent = True
@@ -275,19 +349,12 @@ class StreamFallbackMixin:
         # delivery for text this path removed.
         self._delivered_final_text = self._display_payload(final_text)
         self._last_sent_text = final_text
+        self._last_sent_cursor_appended = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
         self._notify_new_message()
         return "delivered"
 
-    @staticmethod
-    def _send_failure_may_have_delivered(result_or_exc: Any) -> bool:
-        """Return True for timeout failures where retrying may duplicate."""
-        if getattr(result_or_exc, "retryable", None) is True:
-            return False
-        error = str(getattr(result_or_exc, "error", None) or result_or_exc).lower()
-        name = result_or_exc.__class__.__name__.lower()
-        return "timeout" in error or "timed out" in error or "timeout" in name
 
     def _fallback_flood_retry_delay(self, result: Any) -> float | None:
         """Return a bounded retry delay for a fallback send, if safe to retry."""
@@ -304,21 +371,25 @@ class StreamFallbackMixin:
         return max(0.0, delay)
 
     def _is_flood_error(self, result) -> bool:
-        """Check if a SendResult failure is due to flood control / rate limiting."""
-        err_lower = (getattr(result, "error", "") or "").lower()
+        """Check the underlying transport failure, not aggregate display text."""
+        err_lower = _delivery_failure_error(result).lower()
         return "flood" in err_lower or "retry after" in err_lower or "rate" in err_lower
 
     async def _flush_segment_tail_on_edit_failure(self) -> None:
         """Before a segment reset, send the unseen tail as a new message (and best-effort
         strip the stuck cursor from the partial)."""
+        if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+            return
         if getattr(self, "_egress_declined", False):
             return  # a new message is exactly the re-addressing the egress guard refused
         if not self._fallback_final_send:
             await self._try_strip_cursor()
+            if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+                return
         visible = self._fallback_prefix or self._visible_prefix()
         tail = self._accumulated
         if visible and tail.startswith(visible):
-            tail = tail[len(visible):].lstrip()
+            tail = tail[len(visible):]
         tail = self._clean_for_display(tail)
         if not tail.strip():
             return
@@ -327,23 +398,45 @@ class StreamFallbackMixin:
             _md = dict(self.metadata) if self.metadata else {}
             _md["_interim_send"] = True
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
+            result = normalize_delivery_result(result)
             if result.success:
                 self._already_sent = True
+            self._retain_delivery_remainder(
+                self._clean_for_display(self._stream_ledger), result, attempted_content=tail)
         except Exception as e:
+            from gateway.platforms.base import SendResult
+            self._retain_delivery_remainder(
+                self._clean_for_display(self._stream_ledger),
+                SendResult(success=False, error=str(e), raw_response={
+                    "delivery_ambiguous": True, "remaining_content": tail,
+                    "model_remaining_content": tail, "attachment_remaining_content": ""}),
+                attempted_content=tail)
             logger.error("Segment-break tail flush error: %s", e)
 
     async def _try_strip_cursor(self) -> None:
         """Best-effort edit removing a stuck cursor when entering fallback mode."""
         prefix = self._visible_prefix()
-        if not self._has_real_preview() or not prefix.strip():
+        if (not self._has_real_preview() or not prefix.strip()
+                or not self._last_sent_cursor_appended):
             return
         with contextlib.suppress(Exception):  # never block the fallback path
             result = await self._edit_message(message_id=self._message_id, content=prefix)
             if getattr(result, "success", False):
+                self._retain_delivery_remainder(
+                    self._clean_for_display(self._stream_ledger or prefix), result,
+                    edited_message_id=str(self._message_id), attempted_content=prefix)
                 self._last_sent_text = prefix
+                self._last_sent_cursor_appended = False
+            else:
+                from gateway.relay.egress import declined_send
+                if declined_send(result):
+                    self._retain_egress_decline(
+                        result, attempted_content=prefix, edited_message_id=str(self._message_id))
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
+        if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+            return False
         text = self._clean_for_display(text)
         if not text.strip():
             return False
@@ -361,8 +454,10 @@ class StreamFallbackMixin:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text,
                 reply_to=self._initial_reply_to_id if _needs_reply_anchor else None, metadata=_md)
+            result = normalize_delivery_result(result)
             # Do NOT set _already_sent: commentary is interim, and the flag would
             # suppress the real final after multiple tool calls.
+            self._retain_delivery_remainder(text, result, attempted_content=text)
             if result.success:
                 self._notify_new_message()
                 # Lets run.py confirm whether an interim send carried the final.
@@ -372,6 +467,11 @@ class StreamFallbackMixin:
                 self._delivered_commentary_texts.append(text)
             return result.success
         except Exception as e:
+            from gateway.platforms.base import SendResult
+            self._retain_delivery_remainder(
+                text, SendResult(success=False, error=str(e), raw_response={
+                    "delivery_ambiguous": True, "remaining_content": text,
+                    "model_remaining_content": text, "attachment_remaining_content": ""}))
             logger.error("Commentary send error: %s", e)
             return False
 
@@ -406,10 +506,13 @@ class StreamFallbackMixin:
         if self._native_stream_opened:
             await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
 
-        await self._delete_previews(self._stale_preview_ids(), label="Silence-marker")
+        deleted = await self._delete_previews(self._stale_preview_ids(), label="Silence-marker")
+        if self._delivery_handoff is not None:
+            self._delivery_handoff = self._delivery_handoff.without_deleted(deleted)
         self._preview_message_ids = set()
         self._message_id = None
         self._accumulated = self._stream_ledger = self._last_sent_text = ""
+        self._last_sent_cursor_appended = False
         self._already_sent = False
         self._clear_turn_final_flags()
         logger.info("Suppressed streamed intentional-silence marker (chat=%s)", self.chat_id)

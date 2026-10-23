@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from pm import paths, plugin_inputs
 from pm.package import InstallError, Runner, StatePackage
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection
 from pm.runtime import is_runtime, runtime_command, runtime_environment
-from pm.worker_operations import OPERATIONS
+from pm.worker_operations import OPERATIONS, writes_shared_state
 
 
 def _missing_or_refuse(name):
@@ -47,7 +48,8 @@ def _refuse_cold_runtime(cold: InstallError, arguments) -> InstallError:
     return exc
 
 
-def _worker_command(spec, arguments, worker: Path, environment: dict) -> list[str]:
+def _worker_command(spec, arguments, worker: Path, environment: dict, *,
+                    bootstrap: bool | None = None) -> list[str]:
     """How to start the worker; may disable lazy installs in *environment*."""
     from pm.install import lazy_installs_allowed
     from pm.registry import get_package
@@ -61,14 +63,14 @@ def _worker_command(spec, arguments, worker: Path, environment: dict) -> list[st
         # A ready PM still decides no-op/refusal under its install lock. A cold
         # PM is itself a missing prerequisite, not permission to bootstrap tools.
         try:
-            command = runtime_command(worker, bootstrap=False, cache=cache)
+            command = runtime_command(worker, bootstrap=False, cache=cache,
+                                      offline=arguments.get("offline", False))
         except InstallError as cold:
             raise _refuse_cold_runtime(cold, arguments) from None
         environment["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
         return command
-    if spec.bootstrap == "never":
-        return runtime_command(worker, bootstrap=False, cache=cache)
-    return runtime_command(worker, cache=cache)
+    return runtime_command(worker, bootstrap=spec.bootstrap != "never" if bootstrap is None else bootstrap,
+                           cache=cache, offline=arguments.get("offline", False))
 
 
 _WORKER_ERRORS = {"ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
@@ -89,6 +91,15 @@ def _raise_worker_error(error: dict):
 
 
 def _request(operation, arguments, *, callbacks=None, pause_event=None, project_root=None):
+    from contextlib import nullcontext
+    from pm.operations import pm_writer_claim
+
+    with pm_writer_claim() if writes_shared_state(operation, arguments) else nullcontext():
+        return _request_owned(operation, arguments, callbacks=callbacks,
+                              pause_event=pause_event, project_root=project_root)
+
+
+def _request_owned(operation, arguments, *, callbacks=None, pause_event=None, project_root=None):
     from pm import receipt
     from pm.registry import package_definitions
 
@@ -108,13 +119,38 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     }
     worker = Path(__file__).with_name("worker.py").resolve()
     environment = runtime_environment()
-    command = _worker_command(spec, arguments, worker, environment)
+    if arguments.get("offline"):
+        from pm.offline import offline_environment
+        environment = offline_environment(environment)
+    if os.name != "posix":
+        command = _worker_command(spec, arguments, worker, environment)
+    elif writes_shared_state(operation, arguments):
+        command = _worker_command(spec, arguments, worker, environment)
+    else:
+        try:
+            command = _worker_command(spec, arguments, worker, environment, bootstrap=False)
+        except InstallError as cold:
+            if cold.package != "pm-runtime" or spec.bootstrap == "never":
+                raise
+            from pm.operations import pm_writer_claim
+            # Bootstrap belongs to the shared writer domain; the independent
+            # operation itself runs after the claim has been released.
+            with pm_writer_claim():
+                _worker_command(spec, arguments, worker, environment, bootstrap=True)
+            command = _worker_command(spec, arguments, worker, environment, bootstrap=False)
     callback_error = None
     stopped = threading.Event()
     write_lock = threading.Lock()
     monitor = None
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True, encoding="utf-8", env=environment) as process:
+    from pm.writer_claim import child_spawn
+    transfer = child_spawn(environment)
+    spawn = transfer.__enter__()
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   text=True, encoding="utf-8", env=environment, **spawn)
+    finally:
+        transfer.__exit__(None, None, None)
+    with process:
         assert process.stdin is not None and process.stdout is not None
         writer = process.stdin
 
@@ -178,14 +214,15 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
                 process.wait(timeout=5)
 
 
-def ensure(name, *, base_env=None, explicit=False, progress=None, pause_event=None, download_progress=None) -> Runner:
+def ensure(name, *, base_env=None, explicit=False, progress=None, pause_event=None,
+           download_progress=None, offline=False) -> Runner:
     from pm.install import env_for
     from pm.registry import get_package
 
     if is_runtime():
         from pm.install import ensure as direct
         return direct(name, base_env=base_env, explicit=explicit, progress=progress,
-                      pause_event=pause_event, download_progress=download_progress)
+                      pause_event=pause_event, download_progress=download_progress, offline=offline)
     if not explicit and not isinstance(get_package(name), StatePackage):
         if not _missing_or_refuse(name):
             return Runner(name, env_for(name, base_env=base_env))
@@ -198,12 +235,14 @@ def ensure(name, *, base_env=None, explicit=False, progress=None, pause_event=No
     if download_progress is not None:
         callbacks["download_progress"] = lambda done, total, ranges: download_progress(
             done, total, {key: [tuple(row) for row in rows] for key, rows in ranges.items()})
-    _request("ensure", {"name": name, "explicit": explicit}, callbacks=callbacks, pause_event=pause_event)
+    _request("ensure", {"name": name, "explicit": explicit, "offline": offline},
+             callbacks=callbacks, pause_event=pause_event)
     return Runner(name, env_for(name, base_env=base_env))
 
 
 def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None, repair=False,
-              project_root: Path | None = None, evict_incompatible_plugins: bool = False) -> None:
+              project_root: Path | None = None, evict_incompatible_plugins: bool = False,
+              offline: bool = False) -> None:
     from pm.environments import running_from_selected_environment
 
     if extras and not explicit and not repair and not running_from_selected_environment(
@@ -226,13 +265,13 @@ def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None
     if is_runtime() and not foreign:
         from pm.install import sync_venv as direct
         return direct(extras, explicit=explicit, plugins=plugins, repair=repair,
-                      evict_incompatible_plugins=evict_incompatible_plugins)
+                      evict_incompatible_plugins=evict_incompatible_plugins, offline=offline)
     _request("sync_venv", {"extras": extras, "explicit": explicit, "repair": repair,
-                          "plugins": plugin_inputs.encode(plugins),
+                          "plugins": plugin_inputs.encode(plugins), "offline": offline,
                           "evict_incompatible_plugins": evict_incompatible_plugins}, project_root=project_root)
 
 
-def ensure_tools_for_sync() -> None:
+def ensure_tools_for_sync(*, offline: bool = False) -> None:
     """Publish every required tool in this tree's lockfile, then put them on PATH.
 
     Updates call this before the venv sync: the sync only pulls uv/python in
@@ -248,7 +287,7 @@ def ensure_tools_for_sync() -> None:
     from pm.registry import tool_roots
 
     for name in tool_roots(Lockfile(paths.lockfile_path()).names()):
-        ensure(name, explicit=True)
+        ensure(name, explicit=True, offline=offline)
     problems = activate(allow_incomplete=True)
     if problems:
         raise RuntimeError(f"tools not on PATH before venv sync: {'; '.join(problems)}")
@@ -264,8 +303,13 @@ def stage_only(name, target, *, progress=None) -> Path:
 
 def _python_operation(operation: str, arguments: dict):
     if is_runtime():
-        return OPERATIONS[operation].resolve(operation)(**arguments)
-    payload = {key: str(value.absolute()) if isinstance(value, Path) else value
+        from contextlib import nullcontext
+        from pm.writer_claim import has_writer_claim, writer_claim
+
+        with writer_claim() if writes_shared_state(operation, arguments) and not has_writer_claim() else nullcontext():
+            return OPERATIONS[operation].resolve(operation)(**arguments)
+    payload = {key: (str(value) if key in ("out", "cache") and not value.is_absolute()
+                     else str(value.absolute())) if isinstance(value, Path) else value
                for key, value in arguments.items()}
     return _request(operation, payload)
 
@@ -418,4 +462,6 @@ def stage_tools(names: Sequence[str], *, source_store: Path, out: Path, target: 
 
 
 def prune_cache(cache: Path, *, ci: bool = False) -> None:
-    _python_operation("prune_cache", {"cache": Path(cache), "ci": ci})
+    from pm.operations import pm_writer_claim
+    with pm_writer_claim(transaction=True):
+        _python_operation("prune_cache", {"cache": Path(cache), "ci": ci})

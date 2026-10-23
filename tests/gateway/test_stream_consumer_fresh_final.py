@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.platforms.base import SendResult
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 def _make_adapter(*, supports_delete: bool = True) -> MagicMock:
@@ -263,7 +264,7 @@ class TestFinalCleanupEditFloodControl:
     @pytest.mark.asyncio
     async def test_failed_final_cleanup_edit_marks_visible_content_delivered(self):
         adapter = _make_adapter()
-        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+        adapter.edit_message = AsyncMock(return_value=SendResult(
             success=False,
             error="Flood control exceeded. Retry in 12 seconds",
         ))

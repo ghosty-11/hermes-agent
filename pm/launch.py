@@ -7,6 +7,12 @@ import truststore
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 def main() -> int:
+    from pm.writer_claim import writer_claim
+    with writer_claim(inherited_only=True):
+        return _main_owned()
+
+
+def _main_owned() -> int:
     # PM's import closure constructs HTTPS clients; install platform trust
     # before importing it, but never mutate SSL merely by importing launch.
     truststore.inject_into_ssl()

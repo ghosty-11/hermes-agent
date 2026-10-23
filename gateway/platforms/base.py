@@ -18,12 +18,16 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from functools import wraps
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
+from gateway.delivery_handoff import StreamDeliveryHandoff, delivery_handoff_from_receipt, normalize_delivery_result
+from gateway.relay.egress import declined_send
+from gateway.turn_refusals import begin_turn, record as record_turn_refusal, refused
 
 logger = logging.getLogger(__name__)
 
@@ -1647,14 +1651,19 @@ class ExecApprovalPrompt:
         return [choice for _, choice, _ in self.actions]
 
 
+# Partial delivery obligations persist only the uncarried remainder.
+SUPPORTS_PARTIAL_DELIVERY_REPLAY = True
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
     success: bool
     message_id: Optional[str] = None
     error: Optional[str] = None
-    # Adapter-specific metadata. Contract: Telegram edit-overflow partials set
-    # raw_response["partial_overflow"] so the stream consumer sends the missing tail.
+    # partial_overflow records acknowledged carriage. remaining_content retains the
+    # unresolved obligation; delivery_ambiguous marks bytes that may already have
+    # landed and must not be replayed inline. delivery_error is the transport error.
     raw_response: Any = None
     retryable: bool = False  # transient connection error — base retries automatically
     retry_after: Optional[float] = None  # server-requested delay (Telegram FloodWait) beats our backoff
@@ -1670,6 +1679,12 @@ class SendResult:
     # has no text projection at all (media/TTS lanes). Adapters may override what the base
     # fills so the recorded delivery reflects THEIR screening, not the gateway's draft.
     delivered_text: Optional[str] = None
+
+
+def _delivery_failure_error(result: SendResult) -> str:
+    raw = getattr(result, "raw_response", None)
+    underlying = raw.get("delivery_error") if isinstance(raw, dict) else None
+    return underlying if isinstance(underlying, str) else str(getattr(result, "error", "") or "")
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -1869,8 +1884,91 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
+def _turn_boundary(handler):
+    @wraps(handler)
+    async def wrapped(self, event, session_key):
+        with begin_turn():
+            return await handler(self, event, session_key)
+    return wrapped
+
+
+_CHAT_EGRESS_METHODS = frozenset({
+    "send", "send_draft", "edit_message", "delete_message", "send_typing",
+    "stop_typing", "send_multiple_images", "send_image", "send_image_file",
+    "send_document", "send_voice", "send_video", "send_animation",
+    "send_native_task_card_progress", "update_native_task_card_progress",
+    "stop_native_task_card_progress", "send_exec_approval", "send_slash_confirm",
+    "send_clarify", "send_private_notice", "send_reaction", "remove_reaction",
+    "mark_read", "abandon_open_draft", "send_for_platform", "send_sticker",
+    "create_handoff_thread", "send_stream_frame",
+})
+_COSMETIC_EGRESS_METHODS = frozenset({
+    "delete_message", "send_typing", "stop_typing", "send_reaction",
+    "remove_reaction", "mark_read", "create_handoff_thread",
+})
+
+
+def _gate_chat_method(name, method):
+    """Wrap a resolved transport implementation once, including mixin methods."""
+    if not inspect.iscoroutinefunction(method) or getattr(method, "__egress_gated__", False):
+        return method
+    signature = inspect.signature(method)
+    chat_parameter = "parent_chat_id" if name == "create_handoff_thread" else "chat_id"
+    position = (list(signature.parameters).index(chat_parameter) - 1
+                if chat_parameter in signature.parameters
+                else (1 if name == "send_for_platform" else 0))
+    metadata_position = (list(signature.parameters).index("metadata") - 1
+                         if name == "send" and "metadata" in signature.parameters else None)
+
+    @wraps(method)
+    async def gated(self, *args, **kwargs):
+        # Bookkeeping must never fail the send it guards: an operation whose destination
+        # cannot be located passes through ungated (nothing could have been recorded for it).
+        if len(args) > position:
+            chat_id = args[position]
+        elif chat_parameter in kwargs:
+            chat_id = kwargs[chat_parameter]
+        else:
+            return await method(self, *args, **kwargs)
+        logical_platform = (
+            args[0] if args else kwargs.get("logical_platform")
+        ) if name == "send_for_platform" else None
+        if metadata_position is not None:
+            metadata = (args[metadata_position] if len(args) > metadata_position
+                        else kwargs.get("metadata"))
+            if isinstance(metadata, dict):
+                logical_platform = logical_platform or metadata.get("_relay_logical_platform")
+        own_platform = getattr(self, "platform", None)
+        chat_platform = getattr(self, "_chat_platform", None)
+        platform = logical_platform or (
+            chat_platform(chat_id) if chat_platform is not None and _platform_name(own_platform) == "relay"
+            else own_platform
+        )
+        previous = refused(platform, chat_id)
+        if previous is not None:
+            return None if name in {"send_typing", "stop_typing", "create_handoff_thread"} else (
+                False if name in _COSMETIC_EGRESS_METHODS or name == "send_stream_frame" else previous)
+        result = await method(self, *args, **kwargs)
+        record_turn_refusal(platform, chat_id, result)
+        return result
+    gated.__egress_gated__ = True
+
+    return gated
+
+
+def _install_chat_egress(cls):
+    for name in _CHAT_EGRESS_METHODS:
+        method = getattr(cls, name, None)
+        if method is not None and not getattr(method, "__egress_gated__", False):
+            setattr(cls, name, _gate_chat_method(name, method))
+
+
 class BasePlatformAdapter(ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _install_chat_egress(cls)
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
     # fenced terminal command; plain-text platforms get the preview).
@@ -2960,9 +3058,9 @@ class BasePlatformAdapter(ABC):
         metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send ``(url, alt)`` images (``http(s)://`` or ``file://``) one by one (GIFs via
         ``send_animation``, local files via ``send_image_file``); override to bundle natively
-        (Signal). Returns success when at least one image was delivered — the outcome
-        the turn-level delivery tracker records; every override must return the same
-        aggregate, or a media-only turn on that platform reports FAILURE (#106153)."""
+        (Signal). Returns success when at least one image was delivered, unless a destination
+        decline stops the batch and returns its receipt. The turn-level delivery tracker
+        records this result; every override must preserve the same aggregate contract."""
         delivered = False
         for image_url, alt_text in images:
             if human_delay > 0:
@@ -2979,6 +3077,8 @@ class BasePlatformAdapter(ABC):
                     sender, url_kw = self.send_image, {"image_url": image_url}
                 img_result = await sender(
                     chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=metadata)
+                if declined_send(img_result):
+                    return img_result
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 else:
@@ -3178,7 +3278,7 @@ class BasePlatformAdapter(ABC):
 
     async def _notify_media_delivery_failure(
         self, chat_id: str, media_path: str, *, is_voice: bool = False,
-        metadata: Optional[Dict[str, Any]] = None) -> None:
+        metadata: Optional[Dict[str, Any]] = None) -> Optional[SendResult]:
         """User-visible notice when a MEDIA attachment upload failed: the tag was
         already stripped from the text, so silence would be a silent drop.
 
@@ -3193,6 +3293,7 @@ class BasePlatformAdapter(ABC):
             text = _media_failure_text("video")
         else:
             text = _media_failure_text("file", os.path.basename(media_path))
+        notice = None
         try:
             notice = await self.emit_warning(chat_id, text, metadata=metadata)
             problem = None if notice is None or notice.success else notice.error
@@ -3200,6 +3301,7 @@ class BasePlatformAdapter(ABC):
             problem = notify_err
         if problem is not None:
             logger.debug("[%s] Could not send media-delivery-failure notice: %s", self.name, problem)
+        return notice
 
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None,
@@ -3606,20 +3708,40 @@ class BasePlatformAdapter(ABC):
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
         async def _send(text: str) -> "SendResult":
-            return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+            return normalize_delivery_result(
+                await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata))
+
+        owed_content = content
+
+        def _remember_owed(failed: "SendResult") -> None:
+            nonlocal owed_content
+            raw = getattr(failed, "raw_response", None)
+            remainder = raw.get("remaining_content") if isinstance(raw, dict) else None
+            if isinstance(remainder, str) and remainder:
+                owed_content = remainder
+            elif owed_content != content:
+                # A later failure without its own remainder must not restore the
+                # pre-attachment payload. Retain the last known owed content for
+                # durable replay, without changing this attempt's transport error
+                # or partial-delivery flag.
+                failed.raw_response = {**raw, "remaining_content": owed_content} if isinstance(raw, dict) else {
+                    "remaining_content": owed_content}
 
         async def _send_again(previous: "SendResult") -> "Optional[SendResult]":
-            """Retry: the whole payload normally; only the undelivered remainder after a partial split
-            delivery (``raw_response["partial_overflow"]``). ``None`` when the adapter cannot resume — the
-            caller then keeps the partial failure rather than re-sending the already-visible head."""
+            """Retry a total failure with all owed content; partial sends use the adapter's
+            safe remainder hook or remain failed for durable replay."""
             if not self._is_partial_delivery(previous):
-                return await _send(content)
-            return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
+                return await _send(owed_content)
+            resumed = await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
+            return normalize_delivery_result(resumed) if resumed is not None else None
 
         result = await _send(content)
-        if result.success or self._send_retry_is_final(result):
+        if not result.success:
+            _remember_owed(result)
+        if result.success or (isinstance(result.raw_response, dict)
+                              and result.raw_response.get("delivery_ambiguous")) or self._send_retry_is_final(result):
             return result
-        error_str = result.error or ""
+        error_str = _delivery_failure_error(result)
         # A rate-limited / flood-capped send is transient: it should back off
         # (honoring the server's retry_after when present) rather than fall
         # through to the plain-text fallback, which re-enters the ban and can
@@ -3668,7 +3790,10 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
-                error_str = result.error or ""
+                _remember_owed(result)
+                if isinstance(result.raw_response, dict) and result.raw_response.get("delivery_ambiguous"):
+                    return result
+                error_str = _delivery_failure_error(result)
                 if self._send_retry_is_final(result):
                     return result
                 if result.retry_after is not None:
@@ -3709,16 +3834,20 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
-        # Non-network / post-retry formatting failure: try plain text as fallback. A
-        # rate-limited error never reaches here: it classifies as network above and the
-        # loop only breaks on a non-transient, non-rate-limited error.
+        # Only a confirmed markup rejection can be fixed by reformatting. A
+        # definite transport refusal still owes these bytes; posting a banner
+        # would be a second send of the same requested content.
+        if (result.error_kind or classify_send_error(None, error_str)) != "bad_format":
+            return result
         if self._is_partial_delivery(result):
             # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
             return result
-        logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
+        logger.warning("[%s] Formatting rejected: %s — trying plain-text fallback", self.name, error_str)
+        fallback_result = await self._send_plain_fallback(
+            chat_id, owed_content, reply_to=reply_to, metadata=metadata)
         if not fallback_result.success:
+            _remember_owed(fallback_result)
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
 
@@ -3748,7 +3877,7 @@ class BasePlatformAdapter(ABC):
         likely culprit override it (Photon drops rich links instead of adding the banner)."""
         return await self.send(
             chat_id=chat_id, content=self.warning_text(
-                t("gateway.notify.plain_fallback_prefix", content=content[:3500]), content[:3500],
+                t("gateway.notify.plain_fallback_prefix", content=content), content,
                 chat_id=chat_id, metadata=metadata),
             reply_to=reply_to, metadata=metadata)
 
@@ -4205,23 +4334,41 @@ class BasePlatformAdapter(ABC):
         any_success = False
         any_failed = False
         first_error = None
+        resolved = False
         for result in results or []:
             if result is None:
                 continue
-            if getattr(result, "success", False):
-                any_success = True
+            succeeded = bool(getattr(result, "success", False))
+            raw = getattr(result, "raw_response", None)
+            partial = isinstance(raw, dict) and bool(raw.get("partial_overflow"))
+            if succeeded and isinstance(raw, dict) and raw.get("stream_handoff"):
+                resolved = not raw.get("remaining_content") and not raw.get("delivery_ambiguous")
+            if succeeded or partial:
+                any_success = any_success or succeeded
                 delivered_text = getattr(result, "delivered_text", None)
                 if isinstance(delivered_text, str) and delivered_text:
                     texts.append(delivered_text)
-                if getattr(result, "message_id", None):
-                    message_ids.append(str(result.message_id))
-                elif delivered_text == "" and getattr(result, "error", None) and no_carriage_reason is None:
+                    any_success = True
+                ids = raw.get("message_ids") if isinstance(raw, dict) else None
+                acknowledged_ids: list = []
+                if isinstance(ids, (list, tuple)):
+                    acknowledged_ids = [str(mid) for mid in ids if mid]
+                elif getattr(result, "message_id", None):
+                    acknowledged_ids = [str(result.message_id)]
+                message_ids.extend(acknowledged_ids)
+                any_success = any_success or bool(acknowledged_ids)
+                # A reduced owner carries an explicit (possibly empty) id list; an
+                # empty projection with no acknowledged id is still no carriage.
+                if (not acknowledged_ids and delivered_text == ""
+                        and getattr(result, "error", None) and no_carriage_reason is None):
                     no_carriage_reason = str(result.error)
-            else:
+            if not succeeded:
                 any_failed = True
                 if first_error is None:
-                    first_error = str(getattr(result, "error", "") or "") or "send failed"
+                    first_error = _delivery_failure_error(result) or "send failed"
         outcome: Dict[str, Any] = {"message_ids": message_ids}
+        if resolved:
+            outcome["resolved"] = True
 
         def _mark_partial_failure(record: Dict[str, Any]) -> Dict[str, Any]:
             """A succeeded lane must never mask a failed one (review finding): the row
@@ -4259,12 +4406,10 @@ class BasePlatformAdapter(ABC):
         outcome["disposition"] = "unknown"
         return outcome
 
-    async def _finalize_turn_delivery_record(self, event: MessageEvent, results) -> None:
-        """Record the turn's actual delivery on the assistant row the gateway stamped on
-        the event (``turn_delivery_address``), via the gateway runner's
-        ``record_turn_delivery`` — no adapter SQL, no text-matching row search. Best-effort
-        by design: a missing address/runner/db writes nothing and replay reads an unknown
-        delivery, never a phantom answer."""
+    async def _finalize_turn_delivery_record(
+        self, event: MessageEvent, results, *, media_results=(),
+    ) -> None:
+        """Persist the final text owner and independent media receipts on their row."""
         address = getattr(event, "turn_delivery_address", None)
         if not isinstance(address, dict):
             return
@@ -4273,23 +4418,31 @@ class BasePlatformAdapter(ABC):
             recorder = getattr(runner, "record_turn_delivery", None)
             if not callable(recorder):
                 return
-            outcome = self._turn_delivery_outcome(
-                results, hint=address.get("disposition_hint"),
-                streamed_text=address.get("streamed_text"),
-            )
-            recorded = recorder(address, outcome)
-            if recorded:
-                logger.info(
-                    "[%s] Recorded turn delivery (%s) for session %s row %s",
-                    self.name, outcome.get("disposition"), address.get("session_id"),
-                    address.get("row_id"),
-                )
+            for lane, receipts in (("text", results), ("media", media_results)):
+                if lane == "text" and not receipts and media_results:
+                    continue
+                if lane == "media" and not receipts:
+                    continue
+                outcome = self._turn_delivery_outcome(
+                    receipts, hint=address.get("disposition_hint") if lane == "text" else None,
+                    streamed_text=address.get("streamed_text") if lane == "text" else None)
+                outcome["lane"] = lane
+                recorded = recorder(address, outcome)
+                if inspect.isawaitable(recorded):
+                    recorded = await recorded
+                if recorded:
+                    logger.info(
+                        "[%s] Recorded turn delivery (%s) for session %s row %s",
+                        self.name, outcome.get("disposition"), address.get("session_id"),
+                        address.get("row_id"))
         except Exception:
             logger.debug("turn delivery record failed", exc_info=True)
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool,
+        *, original_content: Optional[str] = None, turn_receipt: Optional[dict] = None,
+    ) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
@@ -4298,7 +4451,7 @@ class BasePlatformAdapter(ABC):
             return None
         try:
             from gateway.delivery_ledger import (
-                compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
+                begin_delivery, compute_obligation_id, ledger_enabled, mark_attempting)
             if not await asyncio.to_thread(ledger_enabled):
                 return None
             source = event.source
@@ -4308,13 +4461,17 @@ class BasePlatformAdapter(ABC):
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
-            await asyncio.to_thread(
-                record_obligation, obligation_id=obligation_id, session_key=session_key,
+                session_key, str(_ledger_id or ""), original_content if original_content is not None else text_content)
+            obligation = dict(
+                obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                turn_receipt=turn_receipt)
+            if original_content is not None:
+                obligation["original_content"] = original_content
+            await asyncio.to_thread(begin_delivery, **obligation)
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4323,20 +4480,24 @@ class BasePlatformAdapter(ABC):
 
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
-        delivery_adapter: "BasePlatformAdapter") -> None:
-        """Mark the ledger row delivered/failed (best-effort). On ``send_path_degraded`` with a
-        replacement adapter live, trigger another redelivery sweep (the watcher's may have run
-        before this failure landed; atomic claiming keeps it idempotent). On any other rejection arm
-        the runner's timed redelivery, so the reply goes out once the flood penalty or the retry
-        backoff has passed instead of waiting for the next restart (#91653)."""
+        delivery_adapter: "BasePlatformAdapter", *, turn_receipt: Optional[dict] = None,
+    ) -> None:
+        """Settle the ledger row (best-effort). Only ordinary failures may trigger
+        reconnect or timed recovery; a connector decline is terminal."""
         try:
             from gateway.dead_targets import classify_dead_error
-            from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
-            if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
+            from gateway.delivery_ledger import finalize_delivery, is_reconnect_only
+            success = bool(getattr(result, "success", False))
+            error = "" if success else _delivery_failure_error(result)
+            raw = getattr(result, "raw_response", None)
+            remainder = raw.get("remaining_content") if isinstance(raw, dict) else None
+            settled = await asyncio.to_thread(
+                finalize_delivery, obligation_id, success=success, error=error,
+                remaining_content=remainder if isinstance(remainder, str) and remainder else None,
+                turn_receipt=turn_receipt)
+            if not settled or success or declined_send(result) or (
+                    isinstance(raw, dict) and raw.get("delivery_ambiguous")):
                 return
-            error = str(getattr(result, "error", "") or "")
-            await asyncio.to_thread(mark_failed, obligation_id, error)
             if is_reconnect_only(error):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
@@ -4355,7 +4516,7 @@ class BasePlatformAdapter(ABC):
     async def _deliver_media_attachments(
         self, event: MessageEvent, media_files: list, local_files: list, *,
         force_document_attachments: bool, human_delay: float, metadata: Dict[str, Any],
-        record_delivery: Callable) -> None:
+        record_delivery: Callable, delivery_declined: Callable[[], bool] = lambda: False) -> None:
         """Deliver MEDIA-tag files and detected local files by type: images batched via
         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
         tags only, never bare local files), video → send_video, else send_document. Every failure is
@@ -4366,7 +4527,7 @@ class BasePlatformAdapter(ABC):
             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
         _image_paths = [p for p, is_voice in media_files if not is_voice and _as_image(p)]
         _image_paths += [p for p in local_files if _as_image(p)]
-        if _image_paths:
+        if _image_paths and not delivery_declined():
             await self._send_image_batch(
                 event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
                 record_delivery)
@@ -4384,18 +4545,25 @@ class BasePlatformAdapter(ABC):
                 result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             else:
                 result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
-            if not result.success:
+            if not result.success and not declined_send(result):
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
-                await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
+                notice = await self._notify_media_delivery_failure(
+                    chat_id, path, is_voice=is_voice, metadata=metadata)
+                if declined_send(notice):
+                    return notice
             return result
         queue = [(p, v, True) for p, v in media_files if v or not _as_image(p)]
         if queue:
             logger.info("[%s] Delivering %d non-image MEDIA attachment(s)", self.name, len(queue))
         queue += [(p, False, False) for p in local_files if not _as_image(p)]
         for path, is_voice, media_tag in queue:
+            if delivery_declined():
+                break
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
+            if delivery_declined():
+                break
             try:
                 record_delivery(await _send_one(path, is_voice=is_voice, media_tag=media_tag))
             except Exception as err:
@@ -4431,18 +4599,79 @@ class BasePlatformAdapter(ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
+        handoff = getattr(event, "_stream_delivery_handoff", None)
+        if not isinstance(handoff, StreamDeliveryHandoff):
+            handoff = delivery_handoff_from_receipt(
+                text_content, SendResult(success=False, raw_response={
+                    "model_remaining_content": text_content, "attachment_remaining_content": "",
+                    "remaining_content": text_content}))
+        address = getattr(event, "turn_delivery_address", None)
+        if isinstance(address, dict):
+            handoff = handoff.with_address(address)
+        owed = handoff.owed
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
-                    len(text_content), event.source.chat_id)
+                    len(owed), event.source.chat_id)
+        refusal = refused(event.source.platform, event.source.chat_id)
+        if refusal is not None and not declined_send(handoff.result):
+            handoff = delivery_handoff_from_receipt(
+                handoff.source_content, refusal, previous=handoff)
+            owed = handoff.owed
         obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+            event, session_key, owed, delivery_adapter, is_ephemeral_response,
+            original_content=handoff.source_content, turn_receipt=handoff.to_record())
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-        result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
-        stop_reply_clock(delivery_adapter, event.source.chat_id, result)
+        if handoff.ambiguous or handoff.complete or declined_send(handoff.result):
+            owner = handoff
+        else:
+            try:
+                send_metadata = metadata
+                if str(getattr(event.source.platform, "value", event.source.platform)) == "telegram":
+                    chunks = handoff.formatted_transport_chunks(owed)
+                    if chunks is not None:
+                        send_metadata = {**(metadata or {}),
+                                         "_delivery_formatted_chunks": chunks}
+                result = await delivery_adapter._send_with_retry(
+                    chat_id=event.source.chat_id, content=owed, reply_to=reply_to,
+                    metadata=send_metadata)
+                result = normalize_delivery_result(result)
+            except Exception as exc:
+                result = normalize_delivery_result(
+                    SendResult(success=False, error=str(exc) or type(exc).__name__,
+                               raw_response={"remaining_content": owed}),
+                    exception=exc)
+            stop_reply_clock(delivery_adapter, event.source.chat_id, result)
+            owner = delivery_handoff_from_receipt(
+                handoff.source_content, result, previous=handoff, attempted_content=owed,
+                resolve_attempt=True)
+        result = owner.result
+        ledger_owner = owner
+        if obligation_id is not None and owner.address:
+            runner = getattr(self, "gateway_runner", None)
+            recorder = getattr(runner, "record_turn_delivery", None)
+            recorded = False
+            if callable(recorder):
+                try:
+                    outcome = self._turn_delivery_outcome(
+                        [result], hint=owner.address["disposition_hint"], streamed_text=None)
+                    recorded = recorder(owner.address, {**outcome, "lane": "text"})
+                    if inspect.isawaitable(recorded):
+                        recorded = await recorded
+                except Exception:
+                    logger.debug("final delivery row record failed", exc_info=True)
+            if not recorded and owner.complete:
+                # The transport may have accepted this body. A refused row cannot
+                # authorize a delivered ledger state or an automatic replay.
+                ledger_owner = dataclasses.replace(
+                    owner, result=dataclasses.replace(
+                        result, success=False, error="addressed delivery row refused",
+                        raw_response={**result.raw_response, "delivery_ambiguous": True}))
         if obligation_id is not None:
-            await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+            await self._finalize_delivery_obligation(
+                obligation_id, ledger_owner.result, event, delivery_adapter,
+                turn_receipt=ledger_owner.to_record())
+        event._stream_delivery_handoff = owner
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
@@ -4459,12 +4688,6 @@ class BasePlatformAdapter(ABC):
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
-        # Post-screening projection (S02/V10): the text this final send actually carried.
-        # An adapter that screened the content sets its own ``delivered_text`` ("" when it
-        # carried nothing); fill only when the result has no projection of its own.
-        if getattr(result, "delivered_text", None) is None:
-            with contextlib.suppress(Exception):
-                result.delivered_text = text_content
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
@@ -4497,19 +4720,21 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
-                                   record_delivery: Callable) -> None:
+                                   record_delivery: Callable,
+                                   delivery_declined: Callable[[], bool] = lambda: False) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them."""
         human_delay = self._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
-        if images:
+        if images and not delivery_declined():
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
             await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
         await self._deliver_media_attachments(
             event, media_files, local_files,
             force_document_attachments=extracted.force_document_attachments,
-            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery)
+            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery,
+            delivery_declined=delivery_declined)
         if not (anything_sent or images or local_files or media_files) and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
                          "(%d chars) produced no delivered message or attachment "
@@ -4579,17 +4804,24 @@ class BasePlatformAdapter(ABC):
             text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
+    @_turn_boundary
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
-        _delivery_results: list = []  # actual SendResults, for the turn-delivery record
+        _delivery_results: list = []  # final text owner's actual receipts
+        _media_results: list = []  # independent attachment and voice receipts
+        delivery_declined = False
+        decline_receipt = None
 
-        def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+        def _record_delivery(result, *, lane="media"):
+            nonlocal delivery_attempted, delivery_succeeded, delivery_declined, decline_receipt
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
-                _delivery_results.append(result)
+                (_delivery_results if lane == "text" else _media_results).append(result)
+                if declined_send(result):
+                    delivery_declined = True
+                    decline_receipt = result
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4604,39 +4836,68 @@ class BasePlatformAdapter(ABC):
             with self._media_delivery_scope(event.source):
                 if diagnostic_wake_muted(event):
                     response = None
+                    if hasattr(event, "_stream_delivery_handoff"):
+                        del event._stream_delivery_handoff
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
             # None/empty is normal (streamed/queued). Suppress a stale response after an interrupt.
-            if response and interrupt_event.is_set() and session_key in self._pending_messages:
+            turn_handoff = getattr(event, "_stream_delivery_handoff", None)
+            if not isinstance(turn_handoff, StreamDeliveryHandoff):
+                turn_handoff = None
+            if (response or turn_handoff) and interrupt_event.is_set() and session_key in self._pending_messages:
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
-            if not response:
+                if turn_handoff:
+                    del event._stream_delivery_handoff
+                    turn_handoff = None
+            shared_refusal = refused(event.source.platform, event.source.chat_id)
+            if shared_refusal is not None and (response or turn_handoff):
+                if not turn_handoff or not declined_send(turn_handoff.result):
+                    turn_handoff = delivery_handoff_from_receipt(
+                        turn_handoff.source_content if turn_handoff else response or "",
+                        shared_refusal, previous=turn_handoff)
+                    event._stream_delivery_handoff = turn_handoff
+            delivery_declined = bool(turn_handoff and declined_send(turn_handoff.result))
+            if not response and not turn_handoff:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
-                extracted = await self._extract_response_content(
-                    response, event, session_key, is_ephemeral_response=is_ephemeral_response)
+                if turn_handoff and turn_handoff.complete:
+                    # Stream media was handled by the turn owner. Keep its acknowledged
+                    # model text as the obligation identity without extracting it again.
+                    extracted = _ExtractedResponse(
+                        text_content=turn_handoff.source_content, images=[], media_files=[],
+                        local_files=[], force_document_attachments=False, pre_extract=response or "")
+                else:
+                    extracted = await self._extract_response_content(
+                        response or "", event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
-                if self._wants_auto_tts(
+                if not delivery_declined and self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
                     _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
-                        _tts_caption_delivered |= await self._play_tts_file(
-                            event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
-                            _record_delivery)
+                        if not delivery_declined:
+                            _tts_caption_delivered |= await self._play_tts_file(
+                                event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
+                                _record_delivery)
                     finally:
                         with contextlib.suppress(OSError):
                             os.remove(_tts_path)
                 if not _tts_paths and _tts_requested_path is not None:
                     with contextlib.suppress(OSError):
                         os.remove(_tts_requested_path)
+                if decline_receipt is not None:
+                    turn_handoff = delivery_handoff_from_receipt(
+                        turn_handoff.source_content if turn_handoff else text_content,
+                        decline_receipt, previous=turn_handoff)
+                    event._stream_delivery_handoff = turn_handoff
                 # Suspend the typing refresh before the first delivery attempt, not just in
                 # the turn's finally (#117300): if the final send stalls (platform accepted it
                 # but the HTTP ack never returns), control never reaches the finally, and
@@ -4646,21 +4907,24 @@ class BasePlatformAdapter(ABC):
                 # _stop_typing_refresh's finally discards it, so it cannot leak into the next
                 # turn. No new await on the delivery path (a fire-and-forget stop task was
                 # measured to have no effect).
-                if text_content or extracted.images or extracted.media_files or extracted.local_files \
+                if text_content or turn_handoff or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
-                if text_content and not _tts_caption_delivered:
+                if turn_handoff or (text_content and not _tts_caption_delivered):
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                        is_ephemeral_response, _ephemeral_ttl,
+                        lambda result: _record_delivery(result, lane="text"))
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                    record_delivery=_record_delivery,
+                    delivery_declined=lambda: delivery_declined)
             # Actual-delivery accounting (plan S02/V10): record what REALLY went out on the
             # assistant row the gateway addressed — success, silence, failure or unknown;
             # never a phantom answer and never inferred by text search.
-            await self._finalize_turn_delivery_record(event, _delivery_results)
+            await self._finalize_turn_delivery_record(
+                event, _delivery_results, media_results=_media_results)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -4692,7 +4956,9 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
+            if not delivery_declined and not declined_send(
+                    getattr(getattr(event, "_stream_delivery_handoff", None), "result", None)):
+                _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
@@ -4993,3 +5259,6 @@ class BasePlatformAdapter(ABC):
         if len(chunks) > 1:
             chunks = [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)]
         return chunks
+
+
+_install_chat_egress(BasePlatformAdapter)

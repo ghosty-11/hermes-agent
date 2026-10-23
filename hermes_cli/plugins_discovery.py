@@ -10,12 +10,13 @@ import contextlib
 import contextvars
 import importlib.metadata
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from hermes_constants import get_hermes_home
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.plugin_capabilities import VALID_CAPABILITY_IDS
 from hermes_cli.plugin_capabilities import parse_declared_capabilities as _parse_declared_capabilities
 from hermes_cli.plugins_manifest import (
@@ -69,17 +70,56 @@ def _select_entry_point_group(entry_points: Any, group: str) -> list:
     return [ep for ep in entry_points if ep.group == group]
 
 
-def discover_entrypoint_manifests() -> List["PluginManifest"]:
-    """Return metadata-only manifests for installed entry-point plugins. Kind comes from an import-free source
-    scan (memory/model providers route to their own discovery). Capabilities come from the companion
-    ``hermes_agent.plugin_capabilities`` group (``<plugin-id>.<capability-id>`` entries pointing at the same
-    object), so consent works without importing plugin code. Failures are isolated per entry point."""
+class _StrictDistribution(importlib.metadata.PathDistribution):
+    """Do not let PathDistribution suppress unreadable selected metadata."""
+
+    def read_text(self, filename):
+        from hermes_cli.config_paths import strict_file_present
+
+        path = self._path / filename
+        if not strict_file_present(path):
+            return None
+        with path.open(encoding="utf-8") as stream:
+            return stream.read()
+
+
+def discover_entrypoint_manifests(*, strict: bool = False,
+                                  selected_paths: tuple[Path, ...] | None = None) -> List["PluginManifest"]:
+    """Enumerate entry points from distribution metadata; strict never executes a finder."""
     manifests: List[PluginManifest] = []
     try:
-        eps = importlib.metadata.entry_points()
-        group_eps = _select_entry_point_group(eps, ENTRY_POINTS_GROUP)
-        capability_eps = _select_entry_point_group(eps, ENTRY_POINT_CAPABILITIES_GROUP)
+        if strict:
+            if selected_paths is None:
+                import sys
+                selected_paths = tuple(Path(p) if p else Path.cwd() for p in sys.path)
+            from hermes_cli.config_paths import strict_directory_present, strict_file_present
+            distributions = []
+            for root in selected_paths:
+                if not strict_directory_present(root):
+                    raise RuntimeError(f"uninspectable selected distribution path: {root}")
+                with os.scandir(root) as entries:
+                    metadata_dirs = sorted(
+                        (root / entry.name for entry in entries
+                         if entry.name.endswith((".dist-info", ".egg-info"))),
+                    )
+                for entry in metadata_dirs:
+                    if not strict_directory_present(entry):
+                        raise RuntimeError(f"uninspectable selected distribution metadata: {entry}")
+                    metadata = entry / ("METADATA" if entry.name.endswith(".dist-info") else "PKG-INFO")
+                    if not strict_file_present(metadata):
+                        raise RuntimeError(f"selected distribution metadata missing: {metadata}")
+                    distributions.append(_StrictDistribution(entry))
+            group_eps = [ep for dist in distributions for ep in dist.entry_points
+                         if ep.group == ENTRY_POINTS_GROUP]
+            capability_eps = [ep for dist in distributions for ep in dist.entry_points
+                              if ep.group == ENTRY_POINT_CAPABILITIES_GROUP]
+        else:
+            eps = importlib.metadata.entry_points()
+            group_eps = _select_entry_point_group(eps, ENTRY_POINTS_GROUP)
+            capability_eps = _select_entry_point_group(eps, ENTRY_POINT_CAPABILITIES_GROUP)
     except Exception as exc:
+        if strict:
+            raise
         logger.debug("Entry-point scan failed: %s", exc)
         return manifests
     for ep in group_eps:
@@ -92,10 +132,12 @@ def discover_entrypoint_manifests() -> List["PluginManifest"]:
                 name=ep.name, version=str(getattr(dist, "version", "") or ""),
                 description=str(metadata.get("Summary", "") or "") if metadata is not None else "",
                 source="entrypoint", path=ep.value, key=ep.name,
-                kind=_classify_entrypoint_value_kind(ep.value),
+                kind="standalone" if strict else _classify_entrypoint_value_kind(ep.value),
                 capabilities=_parse_declared_capabilities(capabilities, ep.name),
             ))
         except Exception as exc:
+            if strict:
+                raise
             logger.debug("Entry-point manifest for %r skipped: %s", getattr(ep, "name", "?"), exc)
     return manifests
 
@@ -132,20 +174,27 @@ def _get_enabled_plugins() -> Optional[set]:
 
 
 def scan_directory(
-    path: Path, source: str, *, skip_names: Optional[Set[str]] = None, prefix: str = "", depth: int = 0
+    path: Path, source: str, *, skip_names: Optional[Set[str]] = None, prefix: str = "", depth: int = 0,
+    strict: bool = False,
 ) -> List[PluginManifest]:
     """Read manifests under *path*: flat ``<root>/<name>/plugin.yaml`` (key ``name``) or category
     ``<root>/<cat>/<name>/plugin.yaml`` (key ``cat/name``; a manifest-less directory recurses one level, depth
     capped at two). *skip_names* ignores top-level names; portable ``plugin.json`` packages are accepted
     alongside YAML manifests."""
     manifests: List[PluginManifest] = []
-    if not path.is_dir():
-        return manifests
-    try:
+    if strict:
+        from hermes_cli.config_paths import strict_directory_present
+        if not strict_directory_present(path):
+            return manifests
         children = sorted(path.iterdir())
-    except OSError as exc:
-        logger.warning("Skipping unreadable plugin directory %s: %s", path, exc)
-        return manifests
+    else:
+        if not path.is_dir():
+            return manifests
+        try:
+            children = sorted(path.iterdir())
+        except OSError as exc:
+            logger.warning("Skipping unreadable plugin directory %s: %s", path, exc)
+            return manifests
     for child in children:
         # Cache/dunder dirs (__pycache__, __MACOSX__, …) are never
         # plugins. Walking them can raise PermissionError and take
@@ -159,57 +208,86 @@ def scan_directory(
         # pathlib.Path.is_dir() swallows OSError, but injected Path-likes
         # and test doubles can still raise. Fail closed per child.
         try:
-            if not child.is_dir() or (depth == 0 and skip_names and child.name in skip_names):
+            if strict:
+                import stat
+                from hermes_cli.config_paths import strict_file_present
+                try:
+                    directory = stat.S_ISDIR(child.stat().st_mode)
+                except FileNotFoundError as exc:
+                    raise ValueError(f"listed plugin entry disappeared or has no target: {child}") from exc
+                if directory:
+                    manifest_file = next((f for f in (child / "plugin.yaml", child / "plugin.yml")
+                                          if strict_file_present(f)), None)
+                    portable_file = child / "plugin.json"
+                    has_portable = strict_file_present(portable_file)
+            else:
+                directory = child.is_dir()
+                if directory:
+                    manifest_file = next((f for f in (child / "plugin.yaml", child / "plugin.yml") if f.exists()), None)
+                    portable_file = child / "plugin.json"
+                    has_portable = portable_file.exists() or portable_file.is_symlink()
+            if not directory or (depth == 0 and skip_names and child.name in skip_names):
                 continue
-            manifest_file = next((f for f in (child / "plugin.yaml", child / "plugin.yml") if f.exists()), None)
-            portable_file = child / "plugin.json"
-            has_portable = portable_file.exists() or portable_file.is_symlink()
         except OSError as exc:
+            if strict:
+                raise
             # stat() raises (not "False") on an unsearchable directory — Windows ACLs (WinError 5) or a
             # mode-000 dir; one such plugin must not abort discovery for every other plugin (#111804).
             logger.warning("Skipping unreadable plugin directory %s: %s", child, exc)
             continue
         if manifest_file is not None:
-            manifest = parse_manifest_file(manifest_file, child, source, prefix)
+            manifest = parse_manifest_file(manifest_file, child, source, prefix, strict=strict)
             if manifest is not None:
                 manifests.append(manifest)
+            if strict and manifest is None:
+                raise ValueError(f"cannot parse plugin manifest: {manifest_file}")
         elif has_portable:
             try:
                 manifests.append(portable_plugin_manifest(child, source, prefix))
             except Exception as exc:
+                if strict:
+                    raise
                 logger.warning("Failed to parse %s: %s", portable_file, exc)
         elif depth >= 1:
             logger.debug("Skipping %s (no plugin.yaml, depth cap reached)", child)
         else:
             sub_prefix = f"{prefix}/{child.name}" if prefix else child.name
-            manifests.extend(scan_directory(child, source, prefix=sub_prefix, depth=depth + 1))
+            manifests.extend(scan_directory(child, source, prefix=sub_prefix, depth=depth + 1, strict=strict))
     return manifests
 
 
-def collect_directory_manifests() -> List[PluginManifest]:
-    """Read directory manifests in full-discovery order (bundled top-level, bundled/platforms, user, opt-in
-    project) without loading or mutating anything, so startup probes share the exact precedence/containment
-    rules of the real discovery sweep."""
-    from hermes_cli import plugins as _origin  # patched names resolve through the origin
+def bundled_plugins_dir(source_root: Path | None = None) -> Path:
+    """Resolve bundled content as runtime does, or for an explicit frozen source."""
+    if source_root is not None:
+        import os
+        override = os.getenv("HERMES_BUNDLED_PLUGINS")
+        return Path(override) if override else Path(source_root) / "plugins"
+    from hermes_cli import plugins as _origin
+    return _origin.get_bundled_plugins_dir()
+
+
+def collect_directory_manifests(*, strict: bool = False, source_root: Path | None = None) -> List[PluginManifest]:
+    """Read manifests in runtime precedence order, bound to the requested source tree."""
+    from utils import env_var_enabled
+    if not strict:
+        from hermes_cli import plugins as _origin
     manifests: List[PluginManifest] = []
 
     def _scan(label: str, directory: Path, source: str, skip_names: Optional[Set[str]] = None) -> None:
-        found = scan_directory(directory, source, skip_names=skip_names)
+        found = scan_directory(directory, source, skip_names=skip_names, strict=strict)
         logger.debug("  %s: %d manifest(s)", label, len(found))
         manifests.extend(found)
 
-    # Excluded bundled top-level categories have their own discovery. ``platforms/`` is an ordinary category
-    # dir: the recursion keys its adapters ``platforms/<dir>`` like every other category (``web/firecrawl``),
-    # which is the key `hermes plugins enable/disable` and the dashboard write (#27548); the manifest name
-    # (``photon-platform``) stays an accepted alias through ``gate_manifest``.
-    repo_plugins = _origin.get_bundled_plugins_dir()
+    # The override wins; frozen updates otherwise use their target source.
+    repo_plugins = bundled_plugins_dir(source_root)
     logger.debug("Scanning bundled plugins: %s", repo_plugins)
     _scan("bundled (top-level)", repo_plugins, "bundled",
           {"memory", "context_engine", "model-providers", "cron_providers"})
     user_dir = get_hermes_home() / "plugins"
     logger.debug("Scanning user plugins: %s", user_dir)
     _scan("user", user_dir, "user")
-    if _origin._env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+    if (env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS") if strict
+            else _origin._env_enabled("HERMES_ENABLE_PROJECT_PLUGINS")):
         project_dir = Path.cwd() / ".hermes" / "plugins"
         logger.debug("Scanning project plugins: %s", project_dir)
         _scan("project", project_dir, "project")
@@ -255,7 +333,8 @@ class ManifestGate:
 
 
 def gate_manifest(
-    manifest: PluginManifest, disabled: Set[str], enabled: Optional[Set[str]]
+    manifest: PluginManifest, disabled: Set[str], enabled: Optional[Set[str]], *,
+    strict: bool = False,
 ) -> ManifestGate:
     """Decide how one winning manifest is handled. Gate order matters: legacy relay refusal, explicit disable,
     category-owned kinds (exclusive / model-provider), bundled auto-loads (backend now, platform deferred),
@@ -299,7 +378,7 @@ def gate_manifest(
             f"not enabled in config (run `hermes plugins enable {lookup_key}` to activate)", logging.DEBUG,
             "Skipping '%s' (not in plugins.enabled)",
         )
-    if manifest.source != "bundled":
+    if manifest.source != "bundled" and not strict:
         # The catalog kill list is enforced at install; a plugin recalled AFTER it was installed must not keep
         # loading. Offline check (in-tree list + cached live copy), honours an explicit install-time bypass.
         from hermes_cli.plugins_cmd_catalog import installed_plugin_removal

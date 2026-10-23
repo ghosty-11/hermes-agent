@@ -92,6 +92,100 @@ def test_installed_npm_does_not_authorize_missing_workspace_dependencies(source_
     assert _events(root) == events
 
 
+def test_offline_node_dependencies_require_prepared_matching_workspaces(source_checkout):
+    from hermes_cli.source_build import prepare_source_dependencies, source_build_env
+
+    root, _ = source_checkout
+    online_env = source_build_env()
+    offline_env = source_build_env(offline=True)
+    assert "npm_config_audit" not in online_env
+    assert offline_env["npm_config_audit"] == "false"
+    with pytest.raises(subprocess.CalledProcessError):
+        prepare_source_dependencies(root, ("ui-tui", "web"), env=offline_env, explicit=True, offline=True)
+    assert _events(root) == []
+
+    prepare_source_dependencies(root, ("ui-tui", "web"), env=online_env, explicit=True)
+    prepared = _events(root)
+    prepare_source_dependencies(root, ("ui-tui", "web"), env=offline_env, explicit=True, offline=True)
+    assert _events(root) == prepared
+
+def test_offline_product_admission_matches_prepared_tree_without_installing_into_new_checkout(source_checkout, tmp_path):
+    from hermes_cli.source_build import (
+        prepare_source_dependencies, source_build_env, validate_offline_products,
+    )
+
+    installed, _ = source_checkout
+    online_env = source_build_env()
+    prepare_source_dependencies(installed, ("ui-tui", "web"), env=online_env, explicit=True)
+    target = tmp_path / "next checkout"
+    shutil.copytree(installed, target, ignore=shutil.ignore_patterns("node_modules", "events.jsonl"))
+    offline_env = source_build_env(offline=True)
+    before = _events(installed)
+    admitted = validate_offline_products(target, installed, env=offline_env)
+    assert admitted["node"]["source"] == str(installed)
+    assert admitted["node"]["workspaces"] == ["ui-tui", "web"]
+    assert str(installed / "node_modules") in admitted["mutation_roots"]
+    assert not (target / "node_modules").exists()
+    assert _events(installed) == before
+
+    manifest = target / "ui-tui/package.json"
+    manifest.write_text(manifest.read_text() + " ", encoding="utf-8")
+    with pytest.raises(subprocess.CalledProcessError):
+        validate_offline_products(target, installed, env=offline_env)
+    manifest.write_bytes((installed / "ui-tui/package.json").read_bytes())
+    lock = target / "package-lock.json"
+    lock.write_text(lock.read_text() + " ", encoding="utf-8")
+    with pytest.raises(subprocess.CalledProcessError):
+        validate_offline_products(target, installed, env=offline_env)
+    assert _events(installed) == before
+
+@pytest.mark.parametrize("staged", [False, True], ids=["selected-tools", "private-staged-tools"])
+def test_offline_admission_normalizes_private_npmrc_without_hiding_changed_inputs(
+        source_checkout, tmp_path, monkeypatch, staged):
+    from hermes_cli.source_build import (
+        prepare_source_dependencies, source_build_env, validate_offline_products,
+    )
+
+    installed, _ = source_checkout
+    (installed / ".npmrc").write_text("ignore-scripts=false\n", encoding="utf-8")
+    prepared_env = source_build_env()
+    prepare_source_dependencies(installed, ("ui-tui", "web"), env=prepared_env, explicit=True)
+    target = tmp_path / "frozen checkout"
+    shutil.copytree(installed, target, ignore=shutil.ignore_patterns("node_modules", "events.jsonl"))
+    # stage_local_inputs selects tools into a private environment, not via
+    # source_build_env; neither selection automatically carries the profile npmrc.
+    no_npmrc = dict(prepared_env)
+    no_npmrc.pop("NPM_CONFIG_USERCONFIG")
+    monkeypatch.delenv("NPM_CONFIG_USERCONFIG", raising=False)
+    if staged:
+        admission_env = no_npmrc
+    else:
+        node, npm = Path(shutil.which("node")), Path(shutil.which("npm"))
+        monkeypatch.setattr(pm, "installed_package", lambda name, **_kwargs: (
+            SimpleNamespace(binary={"node": node, "npm": npm}[name])))
+        monkeypatch.setattr(pm, "env_for", lambda _name, base_env: {**base_env, "PATH": no_npmrc["PATH"]})
+        admission_env = None
+
+    def admit():
+        return validate_offline_products(target, installed, env=admission_env)
+
+    before = _events(installed)
+    admitted = admit()
+    assert admitted["node"]["source"] == str(installed)
+    assert admitted["node"]["workspaces"] == ["ui-tui", "web"]
+    assert _events(installed) == before
+    for changed in (target / ".npmrc", target / "ui-tui/package.json",
+                    target / "package-lock.json"):
+        original = changed.read_bytes()
+        changed.write_bytes(original + b"\n# changed\n" if changed.name == "npmrc" else original + b" ")
+        try:
+            with pytest.raises(subprocess.CalledProcessError):
+                admit()
+        finally:
+            changed.write_bytes(original)
+    assert _events(installed) == before
+
+
 @pytest.fixture
 def source_checkout(tmp_path, monkeypatch):
     node, npm = shutil.which("node"), shutil.which("npm")
@@ -101,6 +195,10 @@ def source_checkout(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
     monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "0")
+    for key in tuple(os.environ):
+        if key.lower() in {"npm_config_audit", "npm_config_fund", "npm_config_offline",
+                           "npm_config_prefer_offline"}:
+            monkeypatch.delenv(key)
     monkeypatch.setenv("npm_config_cache", str(tmp_path / "npm-cache"))
     monkeypatch.setenv("ESBUILD_BINARY_PATH", "/wrong/esbuild")
     monkeypatch.setenv("HERMES_PYTHON", "/wrong/python")
@@ -108,7 +206,7 @@ def source_checkout(tmp_path, monkeypatch):
     monkeypatch.delenv("NPM_CONFIG_USERCONFIG", raising=False)
     acquired = []
 
-    def acquire(name, *, base_env=None, explicit=False):
+    def acquire(name, *, base_env=None, explicit=False, offline=False):
         acquired.append(name)
         assert name == "npm"
 
@@ -308,3 +406,5 @@ def test_module_cli_builds_the_requested_products(source_products, desktop, monk
     assert acquired == ["npm"]
     assert (root / "hermes_cli/web_dist/index.html").is_file()
     assert (root / "apps/desktop/release/linux-unpacked/hermes").exists() == desktop
+
+

@@ -173,13 +173,10 @@ def _migrate_to_13(results: Dict[str, Any], quiet: bool) -> None:
     # nothing reads them — config.yaml is the sole source of truth).
     _c = _cfg()
     for dead_var in ("LLM_MODEL", "OPENAI_MODEL"):
-        try:
-            if _c.get_env_value(dead_var):
-                _c.save_env_value(dead_var, "")
-                if not quiet:
-                    print(f"  ✓ Cleared {dead_var} from .env (no longer used — config.yaml is source of truth)")
-        except Exception:
-            pass
+        if _c.get_env_value(dead_var):
+            _c.save_env_value(dead_var, "")
+            if not quiet:
+                print(f"  ✓ Cleared {dead_var} from .env (no longer used — config.yaml is source of truth)")
 
 
 _LOCAL_WHISPER_MODELS = frozenset({
@@ -280,30 +277,40 @@ def _migrate_to_17(results: Dict[str, Any], quiet: bool) -> None:
 
 
 def _installed_user_plugins(disabled: set) -> List[str]:
-    """Names of plugins under ``$HERMES_HOME/plugins/`` with a manifest, minus *disabled*."""
+    """Names of installed plugins; a failed scan must not publish an empty allow-list."""
     _c = _cfg()
     found: List[str] = []
+    user_plugins_dir = _c.get_hermes_home() / "plugins"
     try:
-        user_plugins_dir = _c.get_hermes_home() / "plugins"
-        if user_plugins_dir.is_dir():
-            for child in sorted(user_plugins_dir.iterdir()):
-                if not child.is_dir():
-                    continue
-                manifest_file = child / "plugin.yaml"
-                if not manifest_file.exists():
-                    manifest_file = child / "plugin.yml"
-                if not manifest_file.exists():
-                    continue
-                try:
-                    with open(manifest_file, encoding="utf-8-sig") as _mf:
-                        manifest = _c.fast_safe_load(_mf) or {}
-                except Exception:
-                    manifest = {}
-                name = manifest.get("name") or child.name
-                if name not in disabled:
-                    found.append(name)
-    except Exception:
-        return []
+        import stat
+        mode = user_plugins_dir.stat().st_mode
+    except FileNotFoundError:
+        return found
+    if not stat.S_ISDIR(mode):
+        raise ValueError(f"Plugin directory is not a directory: {user_plugins_dir}")
+    for child in sorted(user_plugins_dir.iterdir()):
+        try:
+            child_mode = child.stat().st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(child_mode):
+            continue
+        manifest_file = child / "plugin.yaml"
+        try:
+            manifest_file.stat()
+        except FileNotFoundError:
+            manifest_file = child / "plugin.yml"
+            try:
+                manifest_file.stat()
+            except FileNotFoundError:
+                continue
+        with open(manifest_file, encoding="utf-8-sig") as stream:
+            manifest = _c.fast_safe_load(stream) or {}
+        if not isinstance(manifest, dict):
+            raise ValueError(f"Plugin manifest is not a mapping: {manifest_file}")
+        name = manifest.get("name") or child.name
+        if name not in disabled:
+            found.append(name)
     return found
 
 
@@ -336,11 +343,8 @@ def _migrate_to_23(results: Dict[str, Any], quiet: bool) -> None:
     _c = _cfg()
     DEFAULT_CONFIG = _c.DEFAULT_CONFIG
 
-    try:
-        curator_dir = _c.get_hermes_home() / "logs" / "curator"
-        curator_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        results["warnings"].append(f"Could not create {curator_dir}: {e}")
+    curator_dir = _c.get_hermes_home() / "logs" / "curator"
+    curator_dir.mkdir(parents=True, exist_ok=True)
 
     config = read_raw_config()
 
@@ -535,28 +539,37 @@ def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
 
 
 def _migrate_to_41(results: Dict[str, Any], quiet: bool) -> None:
-    # 40 → 41: drop the plugin-era "## Messaging other agents" append from every SOUL.md. The
-    # server injects the live Bot Mode section in Bot Chat sessions; the frozen SOUL copy taxed
-    # every other session (~600 tok) and shadowed the live roster in Bot Chat itself.
+    # Remove the legacy Bot Mode append only from live profiles; failed inspection
+    # must leave the version retryable through the migration dispatcher.
+    import stat
+    from hermes_constants import named_profile_is_live
+    from hermes_cli.backup import _sibling_profile_homes
     from hermes_constants import get_hermes_home
-    from tools.bot_mode_probe import _PROTOCOL_HEADING, _hermes_root, _roster, strip_legacy_protocol
+    from tools.bot_mode_probe import _PROTOCOL_HEADING, _hermes_root, strip_legacy_protocol
 
+    root = _hermes_root(get_hermes_home())
     cleaned: List[str] = []
-    for name, profile_dir in _roster(_hermes_root(get_hermes_home())):
+    profiles = [("default", root), *(
+        (name, home) for name, home in _sibling_profile_homes(root, strict=True)
+        if name != "default" and named_profile_is_live(home, strict=True)
+    )]
+    for name, profile_dir in profiles:
         soul = profile_dir / "SOUL.md"
         try:
-            text = soul.read_text(encoding="utf-8-sig") if soul.is_file() else ""
-            if _PROTOCOL_HEADING in text:
-                soul.write_text(strip_legacy_protocol(text), encoding="utf-8")
-                cleaned.append(name)
-        except OSError:
+            mode = soul.lstat().st_mode
+        except FileNotFoundError:
             continue
+        if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            raise ValueError(f"SOUL.md is not a file: {soul}")
+        text = soul.read_text(encoding="utf-8-sig")
+        if _PROTOCOL_HEADING in text:
+            soul.write_text(strip_legacy_protocol(text), encoding="utf-8")
+            cleaned.append(name)
     if cleaned:
         results["config_added"].append(f"removed legacy Bot Mode section from SOUL.md ({', '.join(cleaned)})")
         if not quiet:
             print(f"  ✓ Removed the plugin-era 'Messaging other agents' section from SOUL.md "
                   f"({', '.join(cleaned)}) — Bot Chat sessions now get the live roster instead.")
-
 
 def _migrate_to_45(results: Dict[str, Any], quiet: bool) -> None:
     # 44 → 45: append `connections` to every saved `platform_toolsets` list that predates it
@@ -829,25 +842,30 @@ LEGACY_KEY_STEPS = frozenset({12, 14, 16, 17, 29, 33, 38, 39, 42, 43, 46})
 
 
 def run_migrations(
-    current_ver: int, results: Dict[str, Any], quiet: bool, *, unversioned: bool = False) -> None:
-    """Apply every registered migration whose target version exceeds *current_ver*; a config
-    with no ``_config_version`` (*unversioned*) gets only :data:`LEGACY_KEY_STEPS`.
+    current_ver: int, results: Dict[str, Any], quiet: bool, *,
+    unversioned: bool = False, strict: bool = False,
+) -> None:
+    """Apply registered steps gated by the initial on-disk version.
 
-    *current_ver* is the on-disk schema version captured ONCE before any step runs and does not
-    advance between steps — each step is gated on the same initial value.
+    Strict callers stop at the first failed step so the caller cannot stamp an
+    incomplete migration as current. Online migration keeps warning and moving on.
     """
     for target_ver, migration_fn in MIGRATIONS:
         if current_ver < target_ver and (target_ver in LEGACY_KEY_STEPS or not unversioned):
             try:
                 migration_fn(results, quiet)
             except Exception as exc:
+                if strict:
+                    raise RuntimeError(f"config migration to v{target_ver} failed") from exc
+                results.setdefault("failed_steps", []).append(
+                    {"version": target_ver, "error": str(exc)}
+                )
                 # A malformed nested value in one step must not abort the rest of the
                 # ladder (config loading itself fails otherwise). Loud, not silent.
                 warning = f"config migration to v{target_ver} failed and was skipped: {exc}"
                 results.setdefault("warnings", []).append(warning)
-                # Quiet callers (profile creation, unattended update) discard ``results`` and
-                # migrate_config still stamps the latest version, so without a log line the
-                # skipped step vanishes for good.
+                # Quiet callers may discard results; the version remains retryable, and
+                # the warning remains visible in the log.
                 logger.warning("%s", warning)
                 if not quiet:
                     print(f"  ⚠ {warning}")

@@ -24,7 +24,8 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 import requests
 
 from agent.secret_scope import get_secret
-from hermes_cli.config import cfg_get, load_config, read_raw_config
+from hermes_cli.config import load_config, read_raw_config
+from hermes_cli.config_primitives import cfg_get
 from hermes_constants import get_hermes_home_override, hermes_home_key
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error

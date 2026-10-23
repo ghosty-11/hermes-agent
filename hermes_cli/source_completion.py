@@ -36,6 +36,7 @@ def complete_source_checkout(
     pre_update_version: str | None = None,
     completion_message: str | None = None,
     announce: str | None = None,
+    offline: bool = False,
 ) -> bool:
     """Publish commands, build the products, then run post-build maintenance.
 
@@ -54,9 +55,11 @@ def complete_source_checkout(
         # git; a fresh Windows machine has only PM's.
         expose_pm_git(root)
     except Exception as exc:  # noqa: BLE001 — git-less steps below still complete
+        if offline:
+            raise RuntimeError(f"Offline completion requires pinned Git: {exc}") from exc
         print(f"⚠ Could not provide git for the source completion: {exc}", file=sys.stderr)
     publish_launchers(root)
-    build_update_products(root, desktop=desktop)
+    build_update_products(root, desktop=desktop, **({"offline": True} if offline else {}))
     if announce:
         print(announce)
     complete = _run_post_update_maintenance(
@@ -66,13 +69,18 @@ def complete_source_checkout(
         had_desktop_app_before_update=desktop,
         pre_update_version=pre_update_version,
         completion_message=completion_message,
+        **({"offline": True} if offline else {}),
     )
     if complete:
         from hermes_cli.source_stamp import write_source_stamp
 
         try:
-            write_source_stamp(root)
+            stamp = write_source_stamp(root)
+            if offline and stamp is None:
+                raise RuntimeError("Offline completion could not identify the local source commit")
         except (OSError, ValueError) as exc:
+            if offline:
+                raise RuntimeError(f"Offline completion could not write the source stamp: {exc}") from exc
             print(f"⚠ Source update completed, but the install stamp could not be written: {exc}",
                   file=sys.stderr)
     return complete
@@ -104,18 +112,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ {root} is not a Hermes source checkout", file=sys.stderr)
         return 1
 
+    from pm.writer_claim import writer_claim
+    with writer_claim(install=root):
+        return _main_owned(args, root, prepared)
+
+
+def _main_owned(args, root: Path, prepared: bool) -> int:
     if prepared:
-        # Dependencies are selected before any application import: this is the
-        # same ordering the update completion guarantees.
+        # Dependencies are selected before any application import.
         from pm.environments import activate_dependencies
 
         activate_dependencies(root)
         if args.finish_update:
-            # A source update that never reached its own completion -- a
-            # pre-handoff release cannot flip during `hermes update`, so its
-            # update ends with the tree at HEAD and nothing built -- lands here
-            # on the next ordinary startup. Same tail as an install, so the two
-            # states cannot drift apart.
             ok = complete_source_checkout(
                 root, desktop=args.desktop, assume_yes=True,
                 completion_message=None, announce="\n✓ Code updated!",
@@ -128,14 +136,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
 
     from pm.environments import activation_environment
+    from pm.writer_claim import child_spawn
 
-    # This interpreter is a bootstrap one: the work happens in the re-exec, so
-    # every flag that decides WHICH tail runs has to survive into it. Losing
-    # --finish-update here silently reports an update as an install.
+    # The bootstrap interpreter hands the entire tail to the selected one.
     passthrough = (["--desktop"] if args.desktop else []) + \
                   (["--finish-update"] if args.finish_update else [])
     command = _bootstrap_command(root, passthrough)
-    return subprocess.call(command, cwd=root, env=activation_environment(root))
+    environment = activation_environment(root)
+    with child_spawn(environment) as spawn:
+        return subprocess.call(command, cwd=root, env=environment, **spawn)
 
 
 if __name__ == "__main__":

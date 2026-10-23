@@ -211,7 +211,8 @@ class OpenRouterVideoGenProvider(VideoGenProvider):
 
     def _configured_model(self) -> str:
         try:
-            from hermes_cli.config import cfg_get, load_config
+            from hermes_cli.config import load_config
+            from hermes_cli.config_primitives import cfg_get
             value = cfg_get(load_config(), "video_gen", "model")
         except Exception as exc:  # noqa: BLE001
             logger.debug("Could not read video_gen.model: %s", exc)

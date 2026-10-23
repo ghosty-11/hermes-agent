@@ -14,8 +14,25 @@ import re
 import shutil
 import sys
 import uuid
-
 from pm.package import InstallError
+from contextlib import contextmanager
+from functools import wraps
+
+@contextmanager
+def pm_writer_claim(*, transaction: bool = False):
+    """Retain all canonical writer domains, including across mutating children."""
+    from pm.writer_claim import writer_claim
+
+    with writer_claim():
+        yield
+
+
+def pm_mutation(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        with pm_writer_claim():
+            return function(*args, **kwargs)
+    return guarded
 
 
 def _require_install_allowed(explicit: bool) -> None:
@@ -25,6 +42,7 @@ def _require_install_allowed(explicit: bool) -> None:
         raise _refuse_lazy("venv", "Python dependency operation requires an explicit request")
 
 
+@pm_mutation
 def build_environment(
     *, source: Path, out: Path, python: Path | None = None,
     cache: Path | None = None, env: Mapping[str, str] | None = None,
@@ -65,6 +83,7 @@ def build_environment(
     return environment.executable
 
 
+@pm_mutation
 def lock_project(
     source: Path, *, upgrade: bool = False, python: Path | None = None,
     env: Mapping[str, str] | None = None, cache: Path | None = None,
@@ -85,6 +104,7 @@ def lock_project(
     environment.lock(source, upgrade=upgrade)
 
 
+@pm_mutation
 def stage_manager_runtime(
     *, python: Path, destination: Path, project: Path | None = None,
     offline: bool = False, wheelhouse: Path | None = None, cache: Path | None = None,
@@ -182,6 +202,7 @@ def _requirements(requirements: Sequence[str]) -> list[str]:
         raise ValueError(f"invalid environment requirement: {exc}") from exc
 
 
+@pm_mutation
 def ensure_environment(
     name: str, requirements: Sequence[str], *, root: Path | None = None,
     explicit: bool = False, timeout: int = 1800,
@@ -215,6 +236,7 @@ def ensure_environment(
                               executable=executable)
 
 
+@pm_mutation
 def ensure_project_environment(
     name: str, project: Path, *, extras: Sequence[str] = (), groups: Sequence[str] = (),
     root: Path | None = None, explicit: bool = False, timeout: int = 1800,
@@ -319,6 +341,7 @@ def _ensure_generation(
     return python
 
 
+@pm_mutation
 def ensure_python_tool(
     name: str, requirements: Sequence[str], executable: str, *,
     root: Path | None = None, explicit: bool = False, timeout: int = 1800,

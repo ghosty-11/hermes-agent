@@ -152,18 +152,19 @@ def check_photon_token_valid(token: str) -> bool:
     return True
 
 
+def load_stored_project_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """Auth file's credential pair, independent of any environment field."""
+    entry = _pool_first(_load_auth(), "photon_project") or {}
+    project_id = entry.get("spectrum_project_id") or entry.get("project_id")
+    secret = entry.get("project_secret")
+    return (project_id, secret) if project_id and secret else (None, None)
+
+
 def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
-    """Runtime SDK creds ``(spectrum_project_id, project_secret)``: process env wins
-    (``.env`` is loaded at gateway startup), then ``auth.json`` for offline/status."""
+    """Complete env pair wins, then a complete stored pair; never merge partial groups."""
     env_id = _get_scoped_secret("PHOTON_PROJECT_ID")
     env_sec = _get_scoped_secret("PHOTON_PROJECT_SECRET")
-    if env_id and env_sec:
-        return env_id, env_sec
-    entry = _pool_first(_load_auth(), "photon_project")
-    if entry is None:
-        return env_id, env_sec
-    # back-compat: old records used "project_id" for the spectrum id
-    return env_id or entry.get("spectrum_project_id") or entry.get("project_id"), env_sec or entry.get("project_secret")
+    return (env_id, env_sec) if env_id and env_sec else load_stored_project_credentials()
 
 
 def load_dashboard_project_id() -> Optional[str]:

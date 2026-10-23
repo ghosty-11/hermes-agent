@@ -1,6 +1,10 @@
 name: discord-platform
 label: Discord
 kind: platform
+platform_dependencies:
+  discord:
+    extras: [discord]
+    env: [DISCORD_BOT_TOKEN]
 version: 1.0.0
 description: >
   Discord gateway adapter for Hermes Agent.

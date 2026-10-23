@@ -1,6 +1,10 @@
 name: irc-platform
 label: IRC
 kind: platform
+platform_dependencies:
+  irc:
+    extras: []
+    env: [IRC_SERVER, IRC_CHANNEL, IRC_SERVER_PASSWORD, IRC_NICKSERV_PASSWORD]
 version: 1.0.0
 description: >
   IRC gateway adapter for Hermes Agent.

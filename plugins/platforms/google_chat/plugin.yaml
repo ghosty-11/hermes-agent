@@ -1,6 +1,10 @@
 name: google_chat-platform
 label: Google Chat
 kind: platform
+platform_dependencies:
+  google_chat:
+    extras: [google, google-chat]
+    env: [GOOGLE_CHAT_SERVICE_ACCOUNT_JSON, GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CHAT_HTTP_EVENTS_URL, GOOGLE_CHAT_PROJECT_ID, GOOGLE_CLOUD_PROJECT, GOOGLE_CHAT_SUBSCRIPTION_NAME, GOOGLE_CHAT_SUBSCRIPTION]
 version: 1.0.0
 description: >
   Google Chat gateway adapter for Hermes Agent.

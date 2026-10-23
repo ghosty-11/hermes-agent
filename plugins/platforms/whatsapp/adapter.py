@@ -14,6 +14,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
 
+from gateway.delivery_handoff import normalize_delivery_result
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _extra_or_secret, get_scoped_secret, send_error
 )
@@ -624,7 +625,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     return SendResult(success=True, message_id=data.get("messageId"), raw_response=data)
                 return SendResult(success=False, error=await resp.text())
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return normalize_delivery_result(
+                SendResult(success=False, error=str(e) or type(e).__name__), exception=e)
 
     @_needs_bridge
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -635,6 +637,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         try:
             chunks = self.truncate_message(self.format_message(content), self._outgoing_chunk_limit())
             sent_message_ids: list[str] = []
+            acknowledged_chunks: list[str] = []
             last_message_id = None
             for idx, chunk in enumerate(chunks):
                 payload: Dict[str, Any] = {"chatId": chat_id, "message": chunk}
@@ -642,14 +645,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     payload["replyTo"] = reply_to  # Reply-to on the first chunk only.
                 result = await self._post_bridge_message("send", payload, timeout=30)
                 if not result.success:
-                    return SendResult(success=False, error=result.error)
+                    if not sent_message_ids:
+                        return result
+                    remainder = "\n".join(chunks[idx:])
+                    raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+                    return SendResult(
+                        success=False, error=result.error, retryable=result.retryable,
+                        retry_after=result.retry_after, error_kind=result.error_kind,
+                        message_id=sent_message_ids[0],
+                        delivered_text="\n".join(acknowledged_chunks),
+                        raw_response={**raw, "message_ids": sent_message_ids,
+                                      "acknowledged_chunks": tuple(acknowledged_chunks),
+                                      "partial_overflow": True,
+                                      "remaining_content": remainder,
+                                      "model_remaining_content": remainder,
+                                      "attachment_remaining_content": ""})
                 last_message_id = result.message_id
                 if last_message_id:
                     sent_message_ids.append(str(last_message_id))
+                    acknowledged_chunks.append(chunk)
                 if len(chunks) > 1:
                     await asyncio.sleep(0.3)  # avoid rate limiting between chunks
             return SendResult(success=True, message_id=last_message_id, continuation_message_ids=tuple(sent_message_ids[:-1]),
-                              raw_response={"message_ids": sent_message_ids})
+                              raw_response={"message_ids": sent_message_ids,
+                                            "acknowledged_chunks": tuple(acknowledged_chunks)})
         except Exception as e:
             return SendResult(success=False, error=str(e))
 

@@ -55,15 +55,15 @@ def completion(tmp_path, monkeypatch):
                "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
     for command in (["init", "-q"], ["add", "--all"], ["-c", "commit.gpgsign=false", "commit", "-qm", "selected"]):
         subprocess.run(["git", *command], cwd=source, env=git_env, check=True, capture_output=True)
-    # The selected interpreter is dependency-free, not the pytest environment. A symlink, not a
-    # copy: a relocatable build (python-build-standalone) locates its stdlib beside the resolved
-    # executable, so a lone copied binary cannot even import ``encodings``.
-    python = tmp_path / "store/python/bin/python3"
-    python.parent.mkdir(parents=True)
-    python.symlink_to(Path(sys._base_executable).resolve())
+    # The store interpreter must have its own isolated site-packages. The base
+    # executable can see application packages, even with -I, on this host.
+    store_python = tmp_path / "store/python"
+    subprocess.run([sys._base_executable, "-m", "venv", "--without-pip", str(store_python)],
+                   check=True, capture_output=True)
+    python = store_python / "bin/python3"
+    assert python.is_file()
     _put(tmp_path / "store", "facts.json", json.dumps({"packages": {"python": {"entry": "python"}}}))
-    # A real venv: isolated build children (icon generation, npm lifecycle scripts) run on the
-    # selected generation's own interpreter, not on the store Python that hosts the completion.
+    # Build children run on the selected generation, not the dependency-free store Python.
     generation = install_state_dir(source) / "environments/prepared"
     subprocess.run([str(python), "-m", "venv", "--without-pip", str(generation)],
                    check=True, capture_output=True)
@@ -225,8 +225,22 @@ def completion(tmp_path, monkeypatch):
         runpy.run_path(sys.argv[0], run_name='__main__')
     '''))
     def run(fault=""):
-        return subprocess.run([str(python), "-I", "-B", str(runner), str(context), str(result), fault],
-                              cwd=tmp_path, env=env, capture_output=True, text=True, timeout=90)
+        # A selected continuation receives the parent owner's correlation
+        # context; unrelated subprocesses never inherit it.
+        child_env = dict(env)
+        if os.environ.get("HERMES_UPDATE_TRANSACTION_TOKEN"):
+            child_env.update(
+                HERMES_UPDATE_TRANSACTION_TOKEN=os.environ["HERMES_UPDATE_TRANSACTION_TOKEN"],
+                HERMES_UPDATE_TRANSACTION_OWNER_PID=os.environ["HERMES_UPDATE_TRANSACTION_OWNER_PID"],
+                HERMES_UPDATE_REEXEC="1",
+            )
+        if retained := os.environ.get("HERMES_RETAINED_WRITER_CLAIMS"):
+            child_env["HERMES_RETAINED_WRITER_CLAIMS"] = retained
+        from pm.writer_claim import child_spawn
+        with child_spawn(child_env) as spawn:
+            return subprocess.run(
+                [str(python), "-I", "-B", str(runner), str(context), str(result), fault],
+                cwd=tmp_path, env=child_env, capture_output=True, text=True, timeout=90, **spawn)
     return source, home / ".hermes", request, context, result, run
 
 
@@ -362,7 +376,7 @@ def test_selected_child_builds_and_finalizes_under_parent_lock(completion):
     source, home, request, context, result, run = completion
     node = _npm_graph(source)
     before = context.read_bytes()
-    with UpdateLock() as lock:
+    with UpdateLock(install_root=source) as lock:
         assert lock.acquired
         marker = lock.path.read_bytes()
         child = run()

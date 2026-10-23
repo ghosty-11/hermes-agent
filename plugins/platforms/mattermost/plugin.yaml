@@ -1,6 +1,10 @@
 name: mattermost-platform
 label: Mattermost
 kind: platform
+platform_dependencies:
+  mattermost:
+    extras: []
+    env: [MATTERMOST_URL, MATTERMOST_TOKEN]
 version: 1.0.0
 description: >
   Mattermost gateway adapter for Hermes Agent.

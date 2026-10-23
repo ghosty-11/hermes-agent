@@ -290,46 +290,35 @@ def _read_source_from_origin(origin: Optional[str], limit: int = 8192) -> str:
         return ""
 
 
-def resolve_module_origin(module_name: str) -> Optional[str]:
-    """Return a module's source path WITHOUT importing it, or ``None``. ``find_spec`` on a dotted name imports
-    the parent package, so only the top-level name uses it; remaining segments are walked through
-    ``submodule_search_locations`` by hand. Namespace/zipped/extension modules return ``None``. Shared with
-    ``plugins/memory/__init__.py``."""
-    parts = [p for p in module_name.split(".") if p]
-    if not parts:
-        return None
-    try:
-        spec = importlib.util.find_spec(parts[0])
-        if spec is None or not spec.origin:
+def resolve_module_origin(module_name: str, *, search_paths: tuple[Path, ...] | None = None) -> Optional[str]:
+    """Find ordinary editable modules without importing dotted parents; explicit paths stay finder-free."""
+    if search_paths is None:
+        import sys
+
+        spec = None
+        path = None
+        name = ""
+        try:
+            for part in module_name.split("."):
+                name = f"{name}.{part}" if name else part
+                spec = next((found for finder in sys.meta_path
+                             if (found := finder.find_spec(name, path)) is not None), None)
+                if spec is None:
+                    return None
+                path = spec.submodule_search_locations
+                if name != module_name and path is None:
+                    return None
+        except (ImportError, ValueError, AttributeError):
             return None
-        if len(parts) == 1:
-            return spec.origin
-        search_paths = spec.submodule_search_locations
-        if not search_paths:
-            return None
-        for i, part in enumerate(parts[1:], start=2):
-            found_origin = next_paths = None
-            for base in map(Path, search_paths):
-                pkg_init, mod_file = base / part / "__init__.py", base / (part + ".py")
-                if pkg_init.is_file():
-                    found_origin, next_paths = str(pkg_init), [base / part]
-                    break
-                if mod_file.is_file():
-                    found_origin = str(mod_file)
-                    break
-            if found_origin is None:
-                return None
-            if i == len(parts) or next_paths is None:
-                return found_origin
-            search_paths = next_paths
-        return None
-    except Exception:
-        return None
+        return spec.origin if spec is not None and spec.origin not in {None, "namespace"} else None
+    from pm.extras import passive_module_origin
+    return passive_module_origin(module_name, search_paths=search_paths) or None
 
 
-def _resolve_module_source(module_name: str, limit: int = 8192) -> str:
-    """First ``limit`` chars of a module's source without importing it ("" when unresolvable)."""
-    return _read_source_from_origin(resolve_module_origin(module_name), limit)
+def _resolve_module_source(module_name: str, limit: int = 8192, *,
+                           search_paths: tuple[Path, ...] | None = None) -> str:
+    """First ``limit`` chars of an ordered module origin ("" when unresolvable)."""
+    return _read_source_from_origin(resolve_module_origin(module_name, search_paths=search_paths), limit)
 
 
 def manifest_key(manifest: "PluginManifest") -> str:
@@ -522,7 +511,7 @@ def _manifest_kind(data: Mapping, key: str, plugin_dir: Path) -> str:
 
 
 def parse_manifest_file(
-    manifest_file: Path, plugin_dir: Path, source: str, prefix: str
+    manifest_file: Path, plugin_dir: Path, source: str, prefix: str, *, strict: bool = False
 ) -> Optional[PluginManifest]:
     """Parse one ``plugin.yaml`` into a :class:`PluginManifest`; ``None`` (warned) on failure."""
     try:
@@ -555,5 +544,7 @@ def parse_manifest_file(
             provides_locales=provides_locales, locale_metadata=locale_metadata,
         )
     except Exception as exc:
+        if strict:
+            raise
         logger.warning("Failed to parse %s: %s", manifest_file, exc, exc_info=_plugins_debug())
         return None

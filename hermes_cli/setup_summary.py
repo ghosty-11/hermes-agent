@@ -4,6 +4,7 @@ resolved through the module object so test patches on ``hermes_cli.setup.<name>`
 import logging
 from tools import tool_backend_helpers
 from hermes_cli import nous_subscription
+from hermes_cli.config_primitives import cfg_get
 
 logger = logging.getLogger("hermes_cli.setup")
 
@@ -143,7 +144,7 @@ def _tts_row(config, feats):
     # Configured provider, gated on its key (or local install)
     if feats.tts.managed_by_nous:
         return ("Text-to-Speech (OpenAI via Nous subscription)", True, None)
-    provider = _setup.cfg_get(config, "tts", "provider", default="edge")
+    provider = cfg_get(config, "tts", "provider", default="edge")
     return _voice_provider_status("Text-to-Speech", provider, _TTS_SUMMARY_ROWS, _TTS_SUMMARY_DEFAULT)
 
 
@@ -151,14 +152,14 @@ def _stt_row(config, feats):
     stt_feature = feats.features.get("stt")
     if stt_feature is not None and stt_feature.managed_by_nous:
         return ("Speech-to-Text (OpenAI via Nous subscription)", True, None)
-    provider = _setup.cfg_get(config, "stt", "provider", default="local") or "local"
+    provider = cfg_get(config, "stt", "provider", default="local") or "local"
     return _voice_provider_status("Speech-to-Text", provider, _STT_SUMMARY_ROWS, _STT_SUMMARY_DEFAULT)
 
 
 def _modal_row(config, feats):
     if feats.modal.managed_by_nous:
         return ("Modal Execution (Nous subscription)", True, None)
-    if _setup.cfg_get(config, "terminal", "backend") == "modal":
+    if cfg_get(config, "terminal", "backend") == "modal":
         if feats.modal.direct_override:
             return ("Modal Execution (direct Modal)", True, None)
         return ("Modal Execution", False, "run 'hermes setup terminal'")

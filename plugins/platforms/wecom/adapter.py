@@ -816,13 +816,14 @@ def interactive_setup() -> None:
 
 
 def _is_connected(config) -> bool:
-    return bool((getattr(config, "extra", {}) or {}).get("bot_id"))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("wecom", getattr(config, "extra", {}) or {}, lambda _name: None)
 
 
 def _callback_is_connected(config) -> bool:
     """Callback mode: corp_id or a multi-app `apps` block."""
-    extra = getattr(config, "extra", {}) or {}
-    return bool(extra.get("corp_id") or extra.get("apps"))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("wecom_callback", getattr(config, "extra", {}) or {}, lambda _name: None)
 
 
 

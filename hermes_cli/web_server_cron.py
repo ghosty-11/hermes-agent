@@ -9,7 +9,7 @@ import re
 from fastapi import HTTPException
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.web_models import CronJobCreate
 
 # Same logger the code used before extraction (record parity).

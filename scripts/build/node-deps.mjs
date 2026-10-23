@@ -84,8 +84,9 @@ function runNpmCi(node, npm, args, { source, env }) {
 }
 
 /** Install the full requested workspace union in one strict, locked operation. */
-export function prepareNodeDependencies({ source, workspaces, env = process.env, reuse = false, install = true, nativeToolchain }) {
+export function prepareNodeDependencies({ source, workspaces, env = process.env, reuse = false, install = true, nativeToolchain, preparedSource = source }) {
   source = resolve(source)
+  preparedSource = resolve(preparedSource)
   if (!Array.isArray(workspaces) || workspaces.length === 0) {
     throw new Error('Select at least one workspace; implicit all-workspace installation is not allowed')
   }
@@ -115,17 +116,18 @@ export function prepareNodeDependencies({ source, workspaces, env = process.env,
   ]
   // This receipt certifies dependency preparation, never compiled product freshness.
   // Keep it inside the cached tree so a clean npm ci also removes the receipt.
-  const receipt = join(source, 'node_modules/.hermes-node-deps')
+  const receipt = join(preparedSource, 'node_modules/.hermes-node-deps')
   // Ordinary product builders consume the baseline receipt; preparation also
   // binds lifecycle outputs to its compiler/SDK identity. On a mismatch npm ci
   // removes arbitrary package lifecycle outputs, not just known node-pty paths.
   const nativeReceipt = `${receipt}.native-toolchain`
   const nativeKey = nativeToolchain === undefined ? undefined : JSON.stringify(nativeToolchain)
-  const hiddenLock = join(source, 'node_modules/.package-lock.json')
+  const hiddenLock = join(preparedSource, 'node_modules/.package-lock.json')
   const inputs = createHash('sha256').update(JSON.stringify({
     node: process.versions.node, npm: npmVersion, platform: process.platform, arch: process.arch, args,
     // npm names are case-insensitive; Windows Python uppercases inherited keys.
-    config: Object.entries(env).filter(([key]) => /^npm_config_/i.test(key) && !/^npm_config_(cache|offline|prefer_offline)$/i.test(key))
+    config: Object.entries(env).filter(([key]) => /^npm_config_/i.test(key) &&
+      !/^npm_config_(audit|fund|cache|offline|prefer_offline)$/i.test(key))
       .map(([key, value]) => [key.toLowerCase(), value]).sort(),
   }))
   const files = ['package-lock.json', '.npmrc', ...Object.keys(lock.packages)
@@ -135,10 +137,11 @@ export function prepareNodeDependencies({ source, workspaces, env = process.env,
     inputs.update(file).update('\0').update(existsSync(join(source, file)) ? readFileSync(join(source, file)) : '<missing>').update('\0')
   }
   const key = inputs.digest('hex')
-  if (reuse && completedInstallMatches({ source, receipt, hiddenLock, key, nativeKey })) {
+  if (reuse && completedInstallMatches({ source: preparedSource, receipt, hiddenLock, key, nativeKey })) {
     console.log(`node-deps: reusing completed install (${selected.join(', ')})`)
-    return { source, workspaces: selected }
+    return { source: preparedSource, workspaces: selected, identity: key }
   }
+  if (preparedSource !== source) throw new Error('Prepared workspace dependencies do not match the target source')
   if (!install) throw new Error('Workspace dependencies are stale or missing and lazy installs are disabled; run an explicit build/update')
   // npm can fail during validation before deleting node_modules. Invalidate first.
   rmSync(receipt, { force: true })
@@ -150,7 +153,7 @@ export function prepareNodeDependencies({ source, workspaces, env = process.env,
     writeFileSync(receipt, completed)
     if (nativeKey !== undefined) writeFileSync(nativeReceipt, `${completed}${nativeKey}\n`)
   }
-  return { source, workspaces: selected }
+  return { source, workspaces: selected, identity: key }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
@@ -166,7 +169,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     reuse: { type: 'boolean', default: false },
     'no-install': { type: 'boolean', default: false },
     'native-toolchain': { type: 'string' },
+    'prepared-source': { type: 'string' }, 'check-prepared': { type: 'boolean', default: false },
   } })
   if (!values.source) throw new Error('--source is required')
-  prepareNodeDependencies({ source: values.source, workspaces: values.workspace, reuse: values.reuse, install: !values['no-install'], nativeToolchain: values['native-toolchain'] })
+  const result = prepareNodeDependencies({ source: values.source, workspaces: values.workspace,
+    reuse: values.reuse || values['check-prepared'], install: !values['no-install'] && !values['check-prepared'],
+    nativeToolchain: values['native-toolchain'], preparedSource: values['prepared-source'] })
+  if (values['check-prepared']) console.log(JSON.stringify(result))
 }

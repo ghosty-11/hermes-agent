@@ -1,6 +1,13 @@
 name: wecom-platform
 label: WeCom (Enterprise WeChat)
 kind: platform
+platform_dependencies:
+  wecom:
+    extras: [wecom]
+    env: [WECOM_BOT_ID, WECOM_SECRET]
+  wecom_callback:
+    extras: [wecom]
+    env: [WECOM_CALLBACK_CORP_ID, WECOM_CALLBACK_CORP_SECRET, WECOM_CALLBACK_AGENT_ID, WECOM_CALLBACK_TOKEN, WECOM_CALLBACK_ENCODING_AES_KEY]
 version: 1.0.0
 description: >
   WeCom / Enterprise WeChat gateway adapter for Hermes Agent. Registers two

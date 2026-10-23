@@ -153,3 +153,84 @@ class TestEditOverflowCap:
         assert len(edits) == 1
         assert len(sends) <= CAP - 1
         assert "Response truncated" in (sends[-1] if sends else edits[-1])
+
+    @pytest.mark.asyncio
+    async def test_failed_continuation_owes_exact_tail_and_reports_only_acknowledged_chunks(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        content = _huge_content(5_500)
+        chunks = adapter._cap_split_chunks(
+            adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH))
+        msg = SimpleNamespace(id=42, edit=AsyncMock())
+        sends = []
+
+        async def fail_second_chunk(*, content, reference=None):
+            sends.append(content)
+            raise RuntimeError("transport unavailable")
+
+        channel = SimpleNamespace(id=555, send=AsyncMock(side_effect=fail_second_chunk))
+        result = await adapter._edit_overflow_split(channel, msg, "42", content)
+
+        assert result.success is False
+        assert result.delivered_text == chunks[0]
+        assert result.raw_response["message_ids"] == ("42",)
+        assert result.raw_response["remaining_content"] == "\n".join(chunks[1:])
+        assert result.raw_response["partial_overflow"] is True
+        assert len(sends) == 2  # anchored attempt and one bare-reference attempt
+
+    @pytest.mark.asyncio
+    async def test_timed_out_continuation_does_not_claim_the_unknown_chunk_unsent(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        msg = SimpleNamespace(id=42, edit=AsyncMock())
+        content = _huge_content(5_500)
+        chunks = adapter._cap_split_chunks(
+            adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH))
+        channel = SimpleNamespace(
+            id=555, send=AsyncMock(side_effect=TimeoutError("read timed out")))
+        result = await adapter._edit_overflow_split(
+            channel, msg, "42", content)
+        assert not result.success
+        assert result.raw_response["message_ids"] == ("42",)
+        # Timed-out continuation retains its exact uncertain remainder, not proof of non-delivery.
+        assert result.raw_response["delivery_ambiguous"] is True
+        assert result.raw_response["remaining_content"] == "\n".join(chunks[1:])
+        assert channel.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_real_consumer_hands_off_failed_final_overflow_without_duplicate_edit(
+        self, monkeypatch, tmp_path,
+    ):
+        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        content = _huge_content(5_500)
+        chunks = adapter._cap_split_chunks(
+            adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH))
+        msg = SimpleNamespace(id=42, edit=AsyncMock())
+        channel = SimpleNamespace(
+            id=555, get_partial_message=lambda _id: msg,
+            send=AsyncMock(side_effect=ConnectionError("transport unavailable")))
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+        adapter._resolve_channel = AsyncMock(return_value=channel)
+        consumer = GatewayStreamConsumer(adapter, "555", StreamConsumerConfig(buffer_only=True))
+        consumer._resolve_length_budget = lambda: (len, 20_000)
+        consumer._message_id = "42"
+        consumer._last_sent_text = "previous preview"
+        consumer._already_sent = True
+        consumer.on_delta(content)
+        consumer.finish(content)
+        await consumer.run()
+
+        handoff = consumer.delivery_handoff_for_final(content)
+        assert handoff.result.delivered_text == chunks[0]
+        assert handoff.result.raw_response["remaining_content"] == "\n".join(chunks[1:])
+        assert handoff.result.raw_response["message_ids"] == ["42"]
+        assert not consumer.final_response_sent
+        assert msg.edit.await_count == 1
+        assert channel.send.await_count == 2

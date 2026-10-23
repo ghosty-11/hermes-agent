@@ -46,7 +46,7 @@ from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put, cancel_task
 from utils import atomic_json_write
 
-from .auth import load_project_credentials
+from .auth import load_project_credentials, load_stored_project_credentials
 # Sidecar dir resolution is lazy (never at import): it probes the filesystem and may
 # mirror files. Tests monkeypatch sidecar_paths._SIDECAR_DIR.
 from .sidecar_paths import _NPM_ERROR_LOG_MAX_CHARS, _lock_newer_than_install, _npm_error_log, _sidecar_dir
@@ -311,12 +311,13 @@ def _reinstall_sidecar_deps() -> None:
 
 
 def validate_config(cfg: PlatformConfig) -> bool:
+    from gateway.platform_configuration import photon_credential_groups
+
     extra = cfg.extra or {}
-    if (extra.get("project_id") or _get_scoped_secret("PHOTON_PROJECT_ID")) and (
-            extra.get("project_secret") or _get_scoped_secret("PHOTON_PROJECT_SECRET")):
+    lookup = _get_scoped_secret
+    if photon_credential_groups(extra, lookup, (None, None)):
         return True
-    stored_id, stored_sec = load_project_credentials()  # auth.json fallback
-    return bool(stored_id and stored_sec)
+    return photon_credential_groups(extra, lookup, load_stored_project_credentials())
 
 
 def is_connected(cfg: PlatformConfig) -> bool:
@@ -537,11 +538,13 @@ class PhotonAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
         extra = config.extra or {}
-        # Project credentials: env wins, then config.extra, then auth.json.
-        stored_id, stored_sec = load_project_credentials()
-        self._project_id: str = _get_scoped_secret("PHOTON_PROJECT_ID") or extra.get("project_id") or stored_id or ""
-        self._project_secret: str = (
-            _get_scoped_secret("PHOTON_PROJECT_SECRET") or extra.get("project_secret") or stored_sec or "")
+        # Use the complete YAML/env pair first; otherwise the complete stored pair.
+        primary_id = _get_scoped_secret("PHOTON_PROJECT_ID") or extra.get("project_id")
+        primary_secret = _get_scoped_secret("PHOTON_PROJECT_SECRET") or extra.get("project_secret")
+        stored_id, stored_secret = load_stored_project_credentials() if not (
+            primary_id and primary_secret) else (None, None)
+        self._project_id: str = primary_id if primary_id and primary_secret else stored_id or ""
+        self._project_secret: str = primary_secret if primary_id and primary_secret else stored_secret or ""
         self._sidecar_port = _coerce_port(
             extra.get("sidecar_port") or _get_scoped_secret("PHOTON_SIDECAR_PORT"), _DEFAULT_SIDECAR_PORT)
         self._sidecar_bind = _DEFAULT_SIDECAR_BIND

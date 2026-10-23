@@ -213,7 +213,7 @@ class TestUpdateCommandPlatformGate:
 
 
     @pytest.mark.asyncio
-    async def test_allows_plugin_platform_via_registry_fallback(self, monkeypatch):
+    async def test_allows_plugin_platform_via_registry_fallback(self, monkeypatch, tmp_path):
         """A plugin-migrated platform (DISCORD) is no longer in
         ``_UPDATE_ALLOWED_PLATFORMS`` but must still pass the gate via
         the registry's ``allow_update_command=True`` flag.
@@ -234,6 +234,10 @@ class TestUpdateCommandPlatformGate:
         runner = _make_runner()
         event = _make_event(platform=Platform.DISCORD)
         monkeypatch.setenv("HERMES_MANAGED", "")
+        # Like every sibling test: the handler writes markers under the import-time home.
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
 
         with patch("subprocess.Popen"):
             result = await runner._handle_update_command(event)

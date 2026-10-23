@@ -36,6 +36,7 @@ from gateway.relay.egress import (
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
 from gateway.session import SessionSource
+from gateway.turn_refusals import record as record_turn_refusal, refused
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +84,18 @@ _LEN_FNS: Dict[str, Callable[[str], int]] = {"chars": len, "utf16": _utf16_len}
 
 def _send_result(result: Dict[str, Any], **extra: Any) -> SendResult:
     """Project a connector ``outbound_result`` dict onto a SendResult."""
+    extra.setdefault("raw_response", result)
     return SendResult(
         success=bool(result.get("success")), message_id=result.get("message_id"),
         error=result.get("error"), **extra,
     )
+
+
+def _refused_frame(receipt: SendResult) -> Dict[str, Any]:
+    raw = receipt.raw_response
+    return dict(raw) if isinstance(raw, dict) else {
+        "success": False, "code": EGRESS_DECLINE_CODE, "error": receipt.error,
+    }
 
 
 def _event_ids(event) -> Tuple[Optional[str], Optional[str]]:
@@ -395,6 +404,10 @@ class RelayAdapter(BasePlatformAdapter):
         indistinguishable from "op unsupported" in the logs. The return
         contract is unchanged; the refusal is recorded.
         """
+        platform = self._chat_platform(chat_id)
+        previous = refused(platform, chat_id)
+        if previous is not None:
+            return _refused_frame(previous)
         op = str(action.get("op", "?"))
         result = await self._transport.send_outbound(  # type: ignore[union-attr]
             action, platform=self._platform_by_chat.get(str(chat_id))
@@ -402,6 +415,7 @@ class RelayAdapter(BasePlatformAdapter):
         if isinstance(result, dict):
             if not result.get("success") and is_egress_decline(result):
                 log_decline(op, chat_id, result)
+                record_turn_refusal(platform, chat_id, _send_result(result))
         return result
 
     async def _gated_op(
@@ -421,6 +435,10 @@ class RelayAdapter(BasePlatformAdapter):
         structured connector decline (logged at ``decline_level``; None = silent).
         """
         op = action["op"]
+        destination = platform or self._chat_platform(chat_id)
+        previous = refused(destination, chat_id)
+        if previous is not None:
+            return _refused_frame(previous) if surface_declines else None
         if self._transport is None or not self.descriptor.supports_op(op):
             return None
         try:
@@ -446,6 +464,7 @@ class RelayAdapter(BasePlatformAdapter):
                 # degrade to None, but a silent degrade made a security refusal
                 # indistinguishable from "op unsupported" in the logs.
                 log_decline(op, chat_id if subject is None else subject, result)
+                record_turn_refusal(destination, chat_id, _send_result(result))
                 if surface_declines:
                     return result
                 return None
@@ -572,16 +591,21 @@ class RelayAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="no transport")
         seal_frame = self._draft_frame(chat_id, draft_id, content, True, metadata)
 
+        seal_platform = self._chat_platform(chat_id)
         _seal_platform = self._platform_by_chat.get(str(chat_id))
         _transport = self._transport  # narrowed by the None-guard above
 
         async def _attempt() -> Optional[Dict[str, Any]]:
             """One seal attempt; None means ambiguous (exception or lost ack)."""
+            previous = refused(seal_platform, chat_id)
+            if previous is not None:
+                return _refused_frame(previous)
             try:
                 r = await _transport.send_outbound(seal_frame, platform=_seal_platform)
             except Exception as e:
                 logger.warning("relay seal transport error (ambiguous): %s", e)
                 return None
+            record_turn_refusal(seal_platform, chat_id, _send_result(r))
             if r.get("ambiguous"):
                 logger.warning("relay seal ack lost (ambiguous): %s", r.get("error"))
                 return None
@@ -1360,6 +1384,9 @@ class RelayAdapter(BasePlatformAdapter):
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         self._stamp_slack_unfurl(platform_value, _sfp_metadata)
+        previous = refused(platform_value, chat_id)
+        if previous is not None:
+            return previous
         result = await self._transport.send_outbound(
             {
                 "op": "send",
@@ -1374,6 +1401,7 @@ class RelayAdapter(BasePlatformAdapter):
             },
             platform=platform_value,
         )
+        record_turn_refusal(platform_value, chat_id, _send_result(result))
         if isinstance(result, dict):
             if not result.get("success") and is_egress_decline(result):
                 log_decline("send", chat_id, result)
@@ -1731,6 +1759,7 @@ class RelayAdapter(BasePlatformAdapter):
             profile = _profile_from_session_key(session_key)
             if profile:
                 follow_up_metadata["profile"] = profile
+        # Session-key follow-ups have no chat destination identity or production caller; do not turn-gate them.
         result = await self._transport.send_follow_up(
             {
                 "op": "follow_up",

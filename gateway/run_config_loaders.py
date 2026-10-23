@@ -26,7 +26,8 @@ from gateway.restart import (
 )
 from gateway.session import SessionSource
 from gateway.session_state import SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET
-from hermes_cli.config import cfg_get, resolve_ephemeral_system_prompt_from_config
+from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from utils import is_truthy_value
 

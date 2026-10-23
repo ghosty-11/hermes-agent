@@ -8,13 +8,13 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.config import (
-    cfg_get,
     load_config,
     save_config,
     get_env_value,
     save_env_value,
     get_hermes_home,  # noqa: F401 — used by test mocks
 )
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.colors import Colors, color
 from hermes_constants import display_hermes_home
 from hermes_cli.mcp_security import validate_mcp_server_entry

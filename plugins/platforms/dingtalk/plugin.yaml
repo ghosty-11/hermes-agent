@@ -1,6 +1,10 @@
 name: dingtalk-platform
 label: DingTalk
 kind: platform
+platform_dependencies:
+  dingtalk:
+    extras: [dingtalk]
+    env: [DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET, DINGTALK_WEBHOOK_URL]
 version: 1.0.0
 description: >
   DingTalk gateway adapter for Hermes Agent.

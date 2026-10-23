@@ -284,9 +284,9 @@ def refuse_foreign_owned_venv(project_root: Path) -> None:
             )
 
 
-#: The completion tails import the CLI (so prepare_launch) while the pending marker is armed.
-#: The lock-ancestry check covers that only under a live claim; an unwritable, expired or
-#: absent one (an installer run) would start a tail inside the tail, recursively.
+#: A completion tail can import the CLI while the pending marker is armed.
+#: Exact script identity prevents recursive auto-completion even when an
+#: installer runs without a live update claim or marker.
 _TAIL_SCRIPTS = frozenset({"source_completion.py", "update_completion.py"})
 
 
@@ -325,7 +325,10 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     import os
     import sys
 
+    from hermes_cli._early_recovery import local_transaction_marker
     root = Path(project_root).resolve()
+    if os.name == "posix" and local_transaction_marker(root).exists():
+        return None  # only an explicit local completion/rollback may finish this tree
     # sys.argv[0] is this process's script identity; *argv* carries only the command.
     if _is_tail_script(root, sys.argv[0]):
         return None
@@ -351,6 +354,7 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     import pm
     from hermes_cli._launchers import resolve_store_python
     from hermes_cli.update_lock import UpdateLock, read_live_update
+    from pm.writer_claim import joined_claim
 
     current = pm.venv_is_current(project_root=root)
     pending = completion_pending_path(root)
@@ -370,22 +374,26 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
         # noise (the record's age tracks the wait), leaving the marker armed.
         pass
     elif not owed_to_cli and (not current or pending.is_file()):
-        lock = UpdateLock()
+        lock = UpdateLock(install_root=root) if os.name == "posix" else UpdateLock()
         if not lock.acquire():
             raise RuntimeError("an update is still running; wait for it to exit, then relaunch Hermes")
         try:
-            # Under the launching update's own claim (its pid is our ancestor) a process it
-            # spawned owes no tail: that obligation is the updater's.
-            if not lock.acquired and read_live_update() is not None:
-                if current:
-                    return None
-                # A process the update spawns before its dependencies are current (a restarted
-                # gateway) would boot on a tree built for another interpreter. Sync — never the
-                # tail, which is the updater's — then relaunch below into a current install.
-                _sync_source_dependencies(root, arm=False)
-                if not pm.venv_is_current(project_root=root):
-                    # Relaunching would land back here and sync again, forever.
-                    raise RuntimeError("dependency sync left this install out of date")
+            if os.name != "posix":
+                # Under the launching update's own claim (its pid is our ancestor) a process it
+                # spawned owes no tail: that obligation is the updater's.
+                if not lock.acquired and read_live_update() is not None:
+                    if current:
+                        return None
+                    _sync_source_dependencies(root, arm=False)
+                    if not pm.venv_is_current(project_root=root):
+                        raise RuntimeError("dependency sync left this install out of date")
+                else:
+                    _finish_source_update(root, current=current, pending=pending)
+            elif joined_claim():
+                # An inherited child may commit stale dependencies but never
+                # becomes the updater, even when its display marker has vanished.
+                if not current:
+                    _sync_source_dependencies(root, arm=False)
             else:
                 _finish_source_update(root, current=current, pending=pending)
         finally:
@@ -438,13 +446,16 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     # The tail's progress lines go to stderr: this is an automatic repair in
     # front of whatever command the user ran, and that command may be
     # emitting machine-readable stdout (a JSON probe, a piped query).
-    code = subprocess.call(
-        [sys.executable, "-I", "-B", "-u",
-         str(root / "hermes_cli/source_completion.py"),
-         "--source", str(root), "--finish-update",
-         *(("--desktop",) if desktop else ())],
-        cwd=root, env=activation_environment(root), stdout=sys.__stderr__,
-    )
+    from pm.writer_claim import child_spawn, writer_claim
+    with writer_claim(install=root):
+        environment = activation_environment(root)
+        with child_spawn(environment) as spawn:
+            code = subprocess.call(
+                [sys.executable, "-I", "-B", "-u",
+                 str(root / "hermes_cli/source_completion.py"),
+                 "--source", str(root), "--finish-update",
+                 *(("--desktop",) if desktop else ())],
+                cwd=root, env=environment, stdout=sys.__stderr__, **spawn)
     if code != 0:
         _record_completion_attempt(root, failed=True)
         raise RuntimeError(

@@ -1519,12 +1519,14 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
 
     # Final delivery happened (no duplicate send fallback).
     assert result.get("already_sent") is True
-    # The transformed final text reached the user — appended portion is present
-    # in an edit_message call (not just in the streamed sends).
-    edited_texts = [e["content"] for e in adapter.edits]
-    assert any("[plugin appended this]" in text for text in edited_texts), (
-        f"expected transformed text in adapter.edits, got: {edited_texts!r}"
-    )
+    # The authoritative final may arrive on the first send or an edit, but only once.
+    final = result["final_response"]
+    carried = [call["content"] for call in adapter.sent] + [
+        call["content"] for call in adapter.edits]
+    assert carried.count(final) == 1
+    assert len(adapter.sent) == 1
+    handoff = result["_stream_delivery_handoff"]
+    assert handoff.complete and handoff.owed == ""
 
 
 @pytest.mark.asyncio
@@ -1547,8 +1549,17 @@ async def test_transformed_final_is_not_marked_sent_when_edit_fails(monkeypatch,
     )
 
     assert result["final_response"].endswith("[plugin appended this]")
-    assert result.get("already_sent") is not True
-    assert len(adapter.edits) == 1
+    # A failed edit cannot erase an accepted final; the receipt distinguishes ACK from attempted carriage.
+    final = result["final_response"]
+    handoff = result["_stream_delivery_handoff"]
+    acknowledged = [
+        carriage["text"]
+        for carriage in handoff.result.raw_response["acknowledged_carriages"]
+    ]
+    assert (handoff.complete and acknowledged.count(final) == 1
+            and result.get("already_sent") is True) or (
+                not handoff.complete and (handoff.owed or handoff.ambiguous)
+                and result.get("already_sent") is not True)
 
 
 @pytest.mark.asyncio

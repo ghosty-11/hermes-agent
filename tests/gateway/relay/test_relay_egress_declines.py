@@ -647,6 +647,10 @@ def test_declined_INITIAL_draft_is_not_retried_as_a_plain_send():
             self._last_sent_text = ""
             self._edit_supported = True
 
+        def _retain_egress_decline(self, *_args, **_kwargs):
+            # Consumers bind a refusal to the turn owner, then latch; the latch is what this fake models.
+            self._egress_declined = True
+
         def _draft_metadata(self):
             return {}
 
@@ -717,6 +721,7 @@ def test_declined_stream_edit_does_not_send_the_unseen_tail():
             self.adapter = adapter
             self.chat_id = "C1"
             self._egress_declined = False
+            self._delivery_handoff = None
             self._edit_supported = True
             self._message_id = "m1"
             self._last_sent_text = ""
@@ -730,6 +735,10 @@ def test_declined_stream_edit_does_not_send_the_unseen_tail():
             self._last_edit_time = 0.0
             self.thread_id = None
             self.cfg = SimpleNamespace(cursor=None)
+
+        def _retain_egress_decline(self, *_args, **_kwargs):
+            # Consumers bind a refusal to the turn owner, then latch; the latch is what this fake models.
+            self._egress_declined = True
 
         # ── reached only when a guard is REMOVED; present so the mutant
         #    reaches the wire instead of dying inside the double ──
@@ -873,6 +882,10 @@ def test_declined_draft_frame_is_terminal_for_the_run():
             self._draft_failures = 0
             self._last_sent_text = None
             self._egress_declined = False
+
+        def _retain_egress_decline(self, *_args, **_kwargs):
+            # Consumers bind a refusal to the turn owner, then latch; the latch is what this fake models.
+            self._egress_declined = True
 
         def _draft_metadata(self):
             return {}

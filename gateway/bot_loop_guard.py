@@ -55,7 +55,7 @@ def _as_positive_int(raw, default: int) -> int:
 
 def settings_from_config(cfg) -> BotLoopGuardSettings:
     """Read ``gateway.bot_loop_guard`` from a loaded config dict. Unusable values keep the default."""
-    from hermes_cli.config import cfg_get
+    from hermes_cli.config_primitives import cfg_get
 
     block = cfg_get(cfg, "gateway", "bot_loop_guard", default=None)
     if not isinstance(block, dict):

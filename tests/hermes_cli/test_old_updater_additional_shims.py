@@ -64,7 +64,7 @@ def test_retired_ensure_reports_unavailable_without_installing(prompt, no_extern
 
 def test_live_dingtalk_dependencies_use_pm_not_retired_installer(monkeypatch):
     from plugins.platforms.dingtalk import adapter
-    from pm import extras
+    import pm
 
     requested = []
 
@@ -73,7 +73,7 @@ def test_live_dingtalk_dependencies_use_pm_not_retired_installer(monkeypatch):
         raise ImportError("dependency unavailable")
 
     monkeypatch.setattr(adapter, "DINGTALK_STREAM_AVAILABLE", False)
-    monkeypatch.setattr(extras, "ensure_import", unavailable)
+    monkeypatch.setattr(pm, "ensure_import", unavailable)
     assert adapter.ensure_dingtalk_deps() is False
     assert requested == ["dingtalk"]
 

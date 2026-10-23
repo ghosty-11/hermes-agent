@@ -69,10 +69,9 @@ _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, messa
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 
-# Actual-delivery records (plan S02/V10): the single ``delivery`` member merged into an
-# assistant row's display_metadata by ``record_message_delivery``. Dispositions are the
-# fixed vocabulary — a missing/crash-interrupted receipt is ``unknown`` or absent, never
-# success.
+# Actual-delivery records: one ``delivery`` member in assistant display metadata,
+# with text/media lanes and a flat client projection. A pre-lane flat row retains
+# unknown provenance on later text recovery rather than losing independent ACKs.
 DELIVERY_METADATA_KEY = "delivery"
 DELIVERY_DISPOSITIONS = frozenset({"text", "media", "silence", "failure", "unknown"})
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
@@ -580,16 +579,11 @@ class SessionMessagesMixin:
     def record_message_delivery(
         self, session_id: str, row_id, turn_id: str, outcome: Optional[Dict[str, Any]]
     ) -> bool:
-        """Record a turn's ACTUAL delivery on the assistant row that produced it (plan S02/V10).
+        """Merge an addressed turn receipt by carriage lane without rewriting row content.
 
-        Row-addressed (``row_id`` must be an assistant row in the session's visible
-        lineage) and turn-bound (``turn_id``): receipts from the SAME turn aggregate
-        idempotently into one ``delivery`` member of the existing ``display_metadata`` —
-        reactions and every other member survive, the row's content is never rewritten —
-        while a record from a DIFFERENT turn is refused, so a later turn can never
-        overwrite the earlier row's delivery. Dispositions are the fixed vocabulary
-        ``text``/``media``/``silence``/``failure``/``unknown``; a missing receipt stays
-        ``unknown`` (or absent = unknown), never success. Returns whether the write landed."""
+        A text owner resolves only its own lane. Flat pre-lane records retain unknown
+        provenance in a separate legacy lane until explicitly reconciled.
+        """
         if (
             not session_id or not isinstance(row_id, int) or not turn_id
             or not isinstance(turn_id, str) or not isinstance(outcome, dict)
@@ -617,22 +611,69 @@ class SessionMessagesMixin:
                 # delivery (the earlier outcome is history, not a scratchpad).
                 return False
             delivery = dict(existing)
+            lanes = dict(delivery.get("lanes") or {})
+            if not lanes and existing:
+                legacy = {key: existing[key] for key in (
+                    "disposition", "text", "message_ids", "error", "partial", "reason")
+                    if key in existing}
+                lanes["legacy"] = legacy
+            lane = outcome.get("lane") or (
+                "media" if outcome["disposition"] == "media" else "text")
+            if lane not in ("text", "media"):
+                return False
+            current = dict(lanes.get(lane) or {})
+            current["disposition"] = outcome["disposition"]
+            for key in ("text", "reason"):
+                if key in outcome:
+                    current[key] = outcome[key]
+            if outcome.get("error"):
+                current["error"] = outcome["error"]
+            elif outcome.get("resolved") is True or "error" not in current:
+                current.pop("error", None)
+            if outcome.get("partial") or (
+                current.get("error") and outcome["disposition"] in {"text", "media"}
+            ):
+                current["partial"] = True
+            elif outcome.get("resolved") is True or "partial" not in current:
+                current.pop("partial", None)
+            ids = ([] if outcome.get("resolved") is True else
+                   [str(mid) for mid in current.get("message_ids") or []])
+            for mid in outcome.get("message_ids") or []:
+                if str(mid) not in ids:
+                    ids.append(str(mid))
+            current["message_ids"] = ids
+            lanes[lane] = current
             delivery["turn_id"] = turn_id
-            delivery["disposition"] = outcome["disposition"]
-            if "text" in outcome:
-                delivery["text"] = outcome.get("text")
-            if "reason" in outcome:
-                delivery["reason"] = outcome.get("reason")
-            error = outcome.get("error")
-            if error:
-                delivery["error"] = error
-            else:
-                delivery.pop("error", None)
-            ids = [str(m) for m in (delivery.get("message_ids") or [])]
-            for message_id in outcome.get("message_ids") or []:
-                if str(message_id) not in ids:
-                    ids.append(str(message_id))
-            delivery["message_ids"] = ids
+            delivery["lanes"] = lanes
+            text_lane = lanes.get("text", {})
+            media_lane = lanes.get("media", {})
+            for key in ("text", "reason", "error", "partial"):
+                delivery.pop(key, None)
+            if "text" in text_lane:
+                delivery["text"] = text_lane["text"]
+            elif "text" in lanes.get("legacy", {}):
+                delivery["text"] = lanes["legacy"]["text"]
+            for key in ("reason", "error"):
+                value = next((item[key] for item in
+                              (text_lane, media_lane, lanes.get("legacy", {}))
+                              if item.get(key)), None)
+                if value:
+                    delivery[key] = value
+            if any(item.get("partial") for item in lanes.values()) or (
+                delivery.get("error") and any(item.get("message_ids") or item.get("text")
+                                              for item in lanes.values())):
+                delivery["partial"] = True
+            delivery["disposition"] = (
+                "text" if delivery.get("text") else
+                "media" if any(item.get("message_ids") for item in lanes.values()) else
+                "failure" if delivery.get("error") else outcome["disposition"])
+            active_ids = list(dict.fromkeys(
+                str(mid) for name in ("legacy", "text", "media")
+                for mid in lanes.get(name, {}).get("message_ids") or []))
+            retained = [str(mid) for mid in existing.get("message_ids") or []
+                        if str(mid) in active_ids]
+            delivery["message_ids"] = list(dict.fromkeys(
+                (*retained, *active_ids)))
             delivery["at"] = time.time()
             meta[DELIVERY_METADATA_KEY] = delivery
             conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta), row_id))

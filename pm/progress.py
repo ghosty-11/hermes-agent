@@ -137,6 +137,66 @@ def run_contained(command: Sequence[str], label: str, *, stream: Optional[IO[str
                   hide: Optional[Callable[[str], bool]] = None, indent: str = "",
                   **kwargs) -> subprocess.CompletedProcess:
     """``subprocess.run(check=True)`` under the output policy."""
+    if os.name != "posix":
+        return _run_contained(command, label, stream=stream, hide=hide, indent=indent, **kwargs)
+    from pm.writer_claim import child_spawn
+
+    environment = dict(kwargs.pop("env", os.environ))
+    with child_spawn(environment) as spawn:
+        runner = _run_contained_owned if spawn else _run_contained
+        return runner(command, label, stream=stream, hide=hide, indent=indent,
+                      env=environment, **kwargs, **spawn)
+
+
+def _run_contained_owned(command: Sequence[str], label: str, *,
+                         stream: Optional[IO[str]] = None,
+                         hide: Optional[Callable[[str], bool]] = None,
+                         indent: str = "", **kwargs) -> subprocess.CompletedProcess:
+    from pathlib import Path
+    from pm.process_scope import owned_spawn
+
+    retained = [Path(kwargs.get("cwd") or os.getcwd()).resolve()]
+    if verbose_output():
+        out = sys.stdout if stream is None else stream
+        out.write(f"{indent}→ {label}…\n")
+        out.flush()
+        captured = {}
+        tail = None
+    else:
+        tail = LiveTail(label, stream, hide=hide, indent=indent)
+        captured = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                        encoding="utf-8", errors="replace")
+    spawn = {key: kwargs.pop(key) for key in ("pass_fds", "startupinfo", "close_fds")
+             if key in kwargs}
+    environment = kwargs.setdefault("env", dict(os.environ))
+    with owned_spawn(spawn, environment, retained=retained) as scope:
+        try:
+            proc = scope.spawn(command, **captured, **kwargs)
+            try:
+                if tail is not None:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        tail.write(line)
+                code = proc.wait()
+                scope.finish()
+            finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+        except BaseException:
+            if tail is not None:
+                tail.close(False)
+            raise
+    if tail is not None:
+        tail.close(code == 0)
+    output = "\n".join(tail.tail) if tail is not None else None
+    if code:
+        raise subprocess.CalledProcessError(code, list(command), output=output)
+    return subprocess.CompletedProcess(list(command), code, output, None)
+
+
+def _run_contained(command: Sequence[str], label: str, *, stream: Optional[IO[str]] = None,
+                   hide: Optional[Callable[[str], bool]] = None, indent: str = "",
+                   **kwargs) -> subprocess.CompletedProcess:
     if verbose_output():
         out = sys.stdout if stream is None else stream
         out.write(f"{indent}→ {label}…\n")

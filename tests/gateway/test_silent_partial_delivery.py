@@ -13,20 +13,10 @@ process restart.
 without recording what was actually delivered produced the same false
 positive on a 624-char message truncated at 333 chars.
 
-Class contract under test:
-
-1. ``delivered_final_matches`` judges a payload-less delivery flag against
-   the FINAL content (via ``has_delivered_text``) instead of returning the
-   legacy-trust ``None`` — only the explicitly-marked ambiguous-timeout path
-   keeps legacy trust.
-2. Every flag-setting site records its delivered payload (fresh-final and
-   the optimistic native finalize were the record-less holdouts).
-3. Discord transport-shaped send failures are classified as
-   ``send_path_degraded`` (retryable) so the ledger reconnect sweep can
-   replay the stranded final response.
-
-Boundary tests drive the REAL ``GatewayRunner._run_agent`` with a live
-``GatewayStreamConsumer`` (pattern from test_stale_finalize_suppression.py).
+Boundary tests drive the real ``GatewayRunner._run_agent`` with a live
+``GatewayStreamConsumer``: an acknowledged prefix cannot swallow the final
+remainder, and a returned timeout cannot authorize another inline send.
+Discord transport-shaped failures remain retryable on reconnect.
 """
 
 import asyncio
@@ -48,117 +38,29 @@ MISSING_TAIL = ", another 135 over the past 4 days). All checks green."
 FULL_RESPONSE = STREAMED_PREFIX + MISSING_TAIL
 
 
-# ---------------------------------------------------------------------------
-# Unit coverage — delivered_final_matches tri-state tightening
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_returned_timeout_is_not_replayed_as_a_fresh_final():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
 
+    telegram = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={}))
+    timeout = telegram._classify_send_exception(
+        TimeoutError("Timed out"), ((), (), TimeoutError))
+    attempted = []
 
-def _make_consumer(adapter=None, **overrides):
-    adapter = adapter or SimpleNamespace(
-        MAX_MESSAGE_LENGTH=4096,
-        splits_long_messages=True,
-    )
-    consumer = GatewayStreamConsumer.__new__(GatewayStreamConsumer)
-    consumer.adapter = adapter
-    consumer.chat_id = "c1"
-    consumer.cfg = StreamConsumerConfig(cursor="▉")
-    consumer._final_response_sent = True
-    consumer._final_content_delivered = True
-    consumer._delivered_final_text = None
-    consumer._turn_split_delivery = False
-    consumer._delivery_ambiguous = False
-    consumer._delivered_commentary_texts = []
-    consumer._delivered_segment_texts = []
-    consumer._last_sent_text = ""
-    consumer._accumulated = ""
-    consumer._stream_ledger = ""
-    consumer._initial_reply_to_id = None
-    consumer.metadata = None
-    consumer._already_sent = True
-    for key, value in overrides.items():
-        setattr(consumer, key, value)
-    return consumer
+    class TimeoutAdapter(CaptureAdapter):
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            attempted.append(content)
+            return timeout
 
-
-class TestDeliveredFinalMatchesRecordless:
-    def test_recordless_flag_with_partial_visible_is_mismatch(self):
-        """#95382 core: flag set, no record, visible text is only a prefix —
-        the matcher must return False (recover), not None (legacy trust)."""
-        consumer = _make_consumer(_last_sent_text=STREAMED_PREFIX + "▉")
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is False
-
-    def test_recordless_flag_with_no_visible_text_is_mismatch(self):
-        """Flag set but nothing visibly delivered at all — mismatch."""
-        consumer = _make_consumer()
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is False
-
-    def test_recordless_flag_with_equal_visible_text_matches(self):
-        """Duplicate-suppression control: the visible text IS the final
-        answer — suppression must be retained (True)."""
-        consumer = _make_consumer(_last_sent_text=FULL_RESPONSE + "▉")
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is True
-
-    def test_ambiguous_timeout_keeps_legacy_trust(self):
-        """The explicitly-marked ambiguous full-final timeout is the ONE
-        record-less case that keeps legacy trust (None) — re-sending there
-        risks a duplicate, not a recovery."""
-        consumer = _make_consumer(_delivery_ambiguous=True)
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is None
-
-    def test_recorded_payload_still_wins_over_visible(self):
-        consumer = _make_consumer(
-            _delivered_final_text=FULL_RESPONSE,
-            _last_sent_text="something else entirely",
-        )
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is True
-
-    def test_payloadless_split_still_refuses_trust(self):
-        """#78541 behavior preserved by the tightening."""
-        consumer = _make_consumer(_turn_split_delivery=True)
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is False
-
-    def test_delivered_segment_text_matches(self):
-        """A segment-finalized delivery of the final text still suppresses."""
-        consumer = _make_consumer(
-            _delivered_segment_texts=[FULL_RESPONSE],
-        )
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is True
-
-
-class TestFlagSettingSitesRecordPayload:
-    @pytest.mark.asyncio
-    async def test_fresh_final_records_delivered_payload(self):
-        """_try_fresh_final must record what it sent (#95382 holdout)."""
-
-        class FreshAdapter:
-            MAX_MESSAGE_LENGTH = 4096
-            splits_long_messages = True
-
-            def __init__(self):
-                self.sent = []
-
-            async def send(self, chat_id, content, reply_to=None, metadata=None):
-                self.sent.append(content)
-                return SendResult(success=True, message_id="m-1")
-
-        adapter = FreshAdapter()
-        consumer = _make_consumer(adapter)
-        consumer._final_response_sent = False
-        consumer._final_content_delivered = False
-        consumer._preview_message_ids = set()
-        consumer._message_id = "m-0"
-        consumer._message_created_ts = None
-        consumer.metadata = None
-        consumer._already_sent = False
-
-        ok = await consumer._try_fresh_final(STREAMED_PREFIX, is_turn_final=True)
-        assert ok is True
-        assert consumer._final_response_sent is True
-        # The recorded payload lets the gateway detect a stale fresh-final.
-        assert consumer._delivered_final_text is not None
-        assert STREAMED_PREFIX in consumer._delivered_final_text
-        assert consumer.delivered_final_matches(FULL_RESPONSE) is False
-        assert consumer.delivered_final_matches(STREAMED_PREFIX) is True
+    adapter = TimeoutAdapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "c1", StreamConsumerConfig(cursor=""))
+    await consumer._send_empty_fallback_final(FULL_RESPONSE)
+    await consumer._send_fallback_final(FULL_RESPONSE)
+    assert attempted == [FULL_RESPONSE]
+    receipt = consumer.delivery_handoff_for_final(FULL_RESPONSE)
+    assert receipt.result.raw_response["remaining_content"] == FULL_RESPONSE
+    assert not receipt.complete
 
 
 # ---------------------------------------------------------------------------
@@ -370,32 +272,6 @@ async def test_normal_streaming_turn_still_suppresses_exactly_once(
     assert len(full_sends) <= 1, f"duplicate final delivery: {full_sends!r}"
 
 
-@pytest.mark.asyncio
-async def test_recordless_flag_with_dead_transport_leaves_normal_send(
-    monkeypatch, tmp_path
-):
-    """#95382 incident shape: the reconciliation edit ALSO fails (dead
-    transport). The gateway must NOT claim already_sent — the normal final
-    send (and, on failure there, the delivery ledger) owns recovery."""
-
-    class _DeadEditRecordlessConsumer(_RecordlessFlagConsumer):
-        async def run(self):
-            await super().run()
-            # Transport dies after the stream drained: every further edit
-            # fails, like a dropped Discord WebSocket.
-            self.adapter.fail_edits = True
-
-    adapter, result = await _run_turn(
-        monkeypatch,
-        tmp_path,
-        consumer_cls=_DeadEditRecordlessConsumer,
-        session_id="sess-95382-dead-transport",
-    )
-    assert result["final_response"] == FULL_RESPONSE
-    assert not result.get("already_sent"), (
-        "gateway claimed delivery although neither the stream nor the "
-        "reconciliation edit put the complete response on the wire"
-    )
 
 
 # ---------------------------------------------------------------------------

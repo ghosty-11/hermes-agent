@@ -13,15 +13,27 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.config import UNAUTHORIZED_DM_BEHAVIORS, Platform, PlatformConfig, _coerce_dict, _dict_slot, _normalize_choice
+from gateway.config import (
+    UNAUTHORIZED_DM_BEHAVIORS, Platform, PlatformConfig, _coerce_dict, _dict_slot,
+    _normalize_choice, normalize_platform_name,
+)
 
 # Logger name parity with the origin module: records stay under "gateway.config".
 logger = logging.getLogger("gateway.config")
 
 
-def load_legacy_gateway_json(home: Path) -> Any:
-    """Legacy ``gateway.json`` base layer (config.yaml keys always win). Malformed → ``{}`` + warning."""
+def load_legacy_gateway_json(home: Path, *, strict: bool = False) -> Any:
+    """Legacy gateway.json base layer; strict inspection refuses failed reads."""
     path = home / "gateway.json"
+    if strict:
+        from hermes_cli.config_paths import strict_file_present
+        if not strict_file_present(path):
+            return {}
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"gateway configuration is not a mapping: {path}")
+        return data
     if not path.exists():
         return {}
     try:
@@ -136,7 +148,9 @@ def bridge_toplevel_keys(yaml_cfg: dict, gateway_section: Any, gw_data: dict) ->
 
 # --- platform sections -----------------------------------------------------------
 
-def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> dict:
+def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict, *,
+                            known: set[str] | None = None,
+                            aliases: dict[str, str] | None = None) -> dict:
     """Merge every place a platform block may live into ``gw_data["platforms"]`` and return it.
 
     Order (later wins on shared keys, ``extra`` deep-merged so gateway.json defaults survive):
@@ -167,11 +181,15 @@ def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> 
     nested_gateway = gateway_cfg if isinstance(gateway_cfg, dict) else {}
     merge(nested_gateway.get("platforms"))
     merge(yaml_cfg.get("platforms"))
-    merge({k: v for k, v in nested_gateway.items() if k != "platforms" and isinstance(v, dict) and _is_platform_name(k)})
+    merge({k: v for k, v in nested_gateway.items() if k != "platforms" and isinstance(v, dict)
+           and _is_platform_name(k, known, aliases)})
     return platforms_data
 
 
-def _is_platform_name(key: Any) -> bool:
+def _is_platform_name(key: Any, known: set[str] | None = None,
+                      aliases: dict[str, str] | None = None) -> bool:
+    if known is not None:
+        return isinstance(key, str) and normalize_platform_name(key, aliases) in known
     try:
         Platform(key)
     except (ValueError, AttributeError):
@@ -289,16 +307,14 @@ def bridge_platform_shared_keys(
         extra.update(bridged)
 
 
-def apply_plugin_yaml_hooks(yaml_cfg: dict, gateway_platforms: Any, platforms_data: dict, registry) -> None:
-    """Plugin-owned YAML→env config bridges (``PlatformEntry.apply_yaml_config_fn``). Order: shared-key
-    loop → this dispatch → core-only bridges (require_mention/signal) → ``_apply_env_overrides()``."""
+def apply_plugin_yaml_hooks(
+    yaml_cfg: dict, gateway_platforms: Any, platforms_data: dict, registry, *,
+    strict: bool = False,
+) -> None:
+    """Plugin-owned YAML→env bridges; strict inspection rejects failed hooks."""
     if registry is None:
         return
     for entry in registry.all_entries():
-        # Plugin-owned YAML→env config bridges (#24836). See ``PlatformEntry.apply_yaml_config_fn`` for the
-        # hook contract. Order: shared-key loop (above) → this dispatch → legacy hardcoded blocks (below;
-        # no-op when a hook already set their env var) → ``_apply_env_overrides()`` after
-        # ``GatewayConfig.from_dict``.
         if entry.apply_yaml_config_fn is None:
             continue
         platform_cfg, _ = platform_section(yaml_cfg, entry.name, gateway_platforms)
@@ -307,6 +323,8 @@ def apply_plugin_yaml_hooks(yaml_cfg: dict, gateway_platforms: Any, platforms_da
         try:
             seeded = entry.apply_yaml_config_fn(yaml_cfg, platform_cfg)
         except Exception as e:
+            if strict:
+                raise
             logger.debug("apply_yaml_config_fn for %s raised: %s", entry.name, e)
             continue
         if isinstance(seeded, dict) and seeded:
@@ -330,9 +348,9 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
     sets ``GATEWAY_ALLOW_ALL_USERS`` in its own ``.env`` like every other scoped authorization gate.
     """
     global _BRIDGED_ALLOW_ALL_USERS
-    from gateway.platforms._shared import profile_scoped
+    from gateway.platforms._shared import yaml_env_bridge_suppressed
 
-    skip_env_bridge = profile_scoped()
+    skip_env_bridge = yaml_env_bridge_suppressed()
     gateway_section = yaml_cfg.get("gateway")
     allow_all = yaml_cfg.get("allow_all_users")
     if allow_all is None and isinstance(gateway_section, dict):
@@ -376,26 +394,27 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
             os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
 
 
-def read_yaml_layers(home: Path) -> dict:
-    """User ``config.yaml`` with the managed overlay applied — the YAML the gateway loader sees.
-
-    Raises on a malformed user file (the loader then falls back to env + gateway.json WITHOUT the
-    managed layer). An ABSENT user file is an empty layer, not a reason to skip the administrator's
-    values: a fleet host with no ``config.yaml`` must still honor them. Any pre-activation predicate
-    (``gateway.relay.relay_explicitly_disabled``) reads through here so it cannot disagree with
-    ``load_gateway_config()`` on which files count.
-    """
+def read_yaml_layers(home: Path, *, strict: bool = False) -> dict:
+    """Read the user YAML and managed overlay; strict inspection rejects invalid metadata."""
     config_yaml_path = home / "config.yaml"
     yaml_cfg: dict = {}
-    if config_yaml_path.exists():
-        # The installer seeds config.yaml by copying cli-config.yaml.example (~120 KB, almost all
-        # comments), and nothing caches this loader — so the pure-Python parser dominates the load.
+    if strict:
+        from hermes_cli.config_paths import strict_file_present
+        if strict_file_present(config_yaml_path):
+            from utils import fast_safe_load
+            with open(config_yaml_path, encoding="utf-8-sig") as f:
+                yaml_cfg = fast_safe_load(f)
+            if yaml_cfg is None:
+                yaml_cfg = {}
+            if not isinstance(yaml_cfg, dict):
+                raise ValueError(f"gateway configuration is not a mapping: {config_yaml_path}")
+    elif config_yaml_path.exists():
+        # The installer seeds a large, mostly commented example.
         from utils import fast_safe_load
-
         with open(config_yaml_path, encoding="utf-8-sig") as f:
             yaml_cfg = fast_safe_load(f) or {}
 
-    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.config_primitives import _expand_env_vars
 
     # ${VAR} / ${env:VAR} expansion — the same primitive the CLI loader applies, so platform
     # adapter settings (webhook secret, api_server key, teams credentials) arrive resolved
@@ -406,12 +425,13 @@ def read_yaml_layers(home: Path) -> dict:
     # Managed scope: overlay administrator-pinned values (this loader bypasses
     # hermes_cli.config.load_config, so managed quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope
-    return managed_scope.apply_managed_overlay(yaml_cfg)
+    return (managed_scope.apply_managed_overlay(yaml_cfg, strict=True) if strict
+            else managed_scope.apply_managed_overlay(yaml_cfg))
 
 
-def load_yaml_layer(home: Path, gw_data: dict) -> None:
-    """Overlay ``read_yaml_layers`` onto *gw_data* in place. Raises on any failure (caller warns + falls back)."""
-    yaml_cfg = read_yaml_layers(home)
+def load_yaml_layer(home: Path, gw_data: dict, *, strict: bool = False) -> None:
+    """Overlay YAML onto *gw_data*; strict inspection rejects partial discovery."""
+    yaml_cfg = read_yaml_layers(home, strict=True) if strict else read_yaml_layers(home)
     if not yaml_cfg:
         return
 
@@ -425,10 +445,15 @@ def load_yaml_layer(home: Path, gw_data: dict) -> None:
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry as registry
     except Exception as e:
+        if strict:
+            raise
         logger.debug("plugin discovery skipped: %s", e)
         registry = None
 
     targets = shared_loop_targets(registry)
     bridge_platform_shared_keys(yaml_cfg, gateway_platforms, gw_data, platforms_data, targets)
-    apply_plugin_yaml_hooks(yaml_cfg, gateway_platforms, platforms_data, registry)
+    if strict:
+        apply_plugin_yaml_hooks(yaml_cfg, gateway_platforms, platforms_data, registry, strict=True)
+    else:
+        apply_plugin_yaml_hooks(yaml_cfg, gateway_platforms, platforms_data, registry)
     bridge_core_env_settings(yaml_cfg, platforms_data)

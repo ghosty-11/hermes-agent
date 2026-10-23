@@ -18,11 +18,15 @@ import secrets
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
+from gateway.delivery_handoff import (
+    StreamDeliveryHandoff, delivery_handoff_from_receipt, reconcile_stream_delivery_handoff,
+    normalize_delivery_result,
+)
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
-from gateway.platforms.base import _custom_unit_to_cp
+from gateway.platforms.base import SendResult, _custom_unit_to_cp
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -158,6 +162,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._flood_strikes = 0
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
+        # A known failed carriage transfers ownership to final delivery for this turn.
+        # Segment resets must not clear it.
+        self._delivery_handoff: Optional[StreamDeliveryHandoff] = None
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
@@ -196,6 +203,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # overflow splits seal head chunks (reconcilable turn-final payload).
         self._accumulated = self._stream_ledger = ""
         self._last_sent_text = ""    # skip redundant edits
+        self._last_sent_cursor_appended = False
         self._fallback_final_send = False
         self._fallback_prefix = ""
         # Fallback sends only the missing tail after a partial overflow delivery.
@@ -207,12 +215,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._clear_turn_final_flags()
 
     def _clear_turn_final_flags(self) -> None:
-        """Reset every turn-final delivery flag to "nothing delivered yet".
-        ``_delivered_final_text`` is the cleaned turn-final payload the gateway compares to
-        the completed final_response before trusting the flags (a successful finalize edit
-        may carry a stale preview); None = legacy trust.  A payload-less
-        ``_turn_split_delivery`` must NOT inherit legacy trust; ``_delivery_ambiguous`` (a
-        full-final send timed out but MAY have landed) is the only case that does."""
+        """Reset per-message delivery flags; the turn receipt survives segment resets."""
         # #29346: a tool/segment boundary means what we delivered was an interim preamble, not the final
         # answer — clear the flags so a premature setter can't fool the gateway. Safe: got_done returns
         # before any reset, and run.py reads these only after the consumer task exits.
@@ -220,11 +223,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_content_delivered = False  # content landed even if the cosmetic edit failed
         self._delivered_final_text: Optional[str] = None
         self._turn_split_delivery = False
-        # True when a full-final send timed out in a way that MAY have reached the platform
-        # (``_send_empty_fallback_final`` → "ambiguous"). The only case where a payload-less delivery flag
-        # keeps legacy trust in ``delivered_final_matches`` (#95382 tightening) — re-sending there risks a
-        # duplicate rather than recovering a loss.
-        self._delivery_ambiguous = False
 
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message: per-chat probe
@@ -271,6 +269,72 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     final_response_sent = property(lambda self: self._final_response_sent)
     message_id = property(lambda self: self._message_id)
     final_content_delivered = property(lambda self: self._final_content_delivered)
+
+    def _retain_delivery_remainder(
+        self, source_content: str, receipt: SendResult, *,
+        acknowledged: tuple[SendResult, ...] = (), later_chunks: tuple[str, ...] = (),
+        edited_message_id: Optional[str] = None, attempted_content: Optional[str] = None,
+        resolve_attempt: bool = False,
+    ) -> bool:
+        """Advance the turn's receipt after every real send or edit."""
+        receipt = normalize_delivery_result(receipt)
+        self._delivery_handoff = delivery_handoff_from_receipt(
+            source_content, receipt, previous=self._delivery_handoff,
+            acknowledged=acknowledged, later_chunks=later_chunks,
+            cursor=self.cfg.cursor, edited_message_id=edited_message_id,
+            attempted_content=attempted_content, resolve_attempt=resolve_attempt,
+            active_model_frame=(self._clean_for_display(self._accumulated)
+                                if self._turn_split_delivery else None))
+        if not self._delivery_handoff.complete:
+            self._final_response_sent = self._final_content_delivered = False
+        return not self._delivery_handoff.complete
+
+    def _retain_egress_decline(
+        self, receipt: SendResult, *,
+        attempted_content: str,
+        source_content: Optional[str] = None,
+        edited_message_id: Optional[str] = None,
+        later_chunks: tuple[str, ...] = (),
+    ) -> None:
+        """Bind a destination refusal to the turn owner before suppressing further sends.
+
+        The owner's source defaults to the cleaned stream ledger (or the attempted text)."""
+        if source_content is None:
+            source_content = self._clean_for_display(self._stream_ledger or attempted_content)
+        self._retain_delivery_remainder(
+            source_content, receipt, attempted_content=attempted_content,
+            edited_message_id=edited_message_id, later_chunks=later_chunks)
+        self._egress_declined = True
+
+    def delivery_handoff_for_final(self, final_text: str) -> Optional[StreamDeliveryHandoff]:
+        """Reconcile the authoritative final without losing adapter-added owed content."""
+        handoff = self._delivery_handoff
+        if handoff is None:
+            return None
+        return reconcile_stream_delivery_handoff(handoff, self._clean_for_display(final_text))
+
+    def accept_final_delivery_result(
+        self, final_text: str, result: SendResult, *, edited_message_id: Optional[str] = None,
+    ) -> None:
+        """Advance this turn's receipt after a queued attempt."""
+        result = normalize_delivery_result(result)
+        raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+        if raw.get("stream_handoff"):
+            owner = StreamDeliveryHandoff(self._clean_for_display(final_text), result)
+            prior = self._delivery_handoff
+            self._delivery_handoff = replace(
+                owner, address=dict(prior.address) if prior and prior.address else None,
+                settled=prior.settled if prior else False)
+        else:
+            self._retain_delivery_remainder(
+                self._clean_for_display(final_text), result,
+                edited_message_id=edited_message_id,
+                attempted_content=(self._clean_for_display(final_text) if edited_message_id else
+                                   self._delivery_handoff.owed if self._delivery_handoff else
+                                   self._clean_for_display(final_text)),
+                resolve_attempt=True)
+        if self._delivery_handoff.complete:
+            self._mark_final_delivered(record=final_text)
 
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
@@ -328,11 +392,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._delivered_final_text = self._display_payload(text)
 
     def delivered_final_matches(self, final_text: str) -> Optional[bool]:
-        """Tri-state reconcile of the recorded turn-final payload against ``final_text`` (a
-        *successful* finalize edit can still carry a stale preview, so call success alone
-        must not confirm delivery).  True: recorded payload (or an earlier segment /
-        commentary) matches.  False: payload differs, or payload-less split.  None: nothing
-        recorded on a legacy/ambiguous path (caller trusts flags)."""
+        """Compare the recorded turn-final payload to the authoritative final.
+
+        An unknown acknowledgement belongs to the receipt owner, never a flag."""
         target = self._display_payload(final_text)
         if not target:
             return None
@@ -354,8 +416,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # so draft-only visibility must not count as durable delivery.
         if self._already_sent and self.has_delivered_text(final_text):
             return True
-        # Only a timed-out full-final send that MAY have landed keeps legacy trust.
-        return None if self._delivery_ambiguous else False
+        return False
 
     def has_delivered_text(self, text: str) -> bool:
         """Return True if *text* was already delivered as visible chat content."""
@@ -570,8 +631,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
                         await self._suppress_silence_marker()
                         return
-
-                if self._should_edit(tick) and (
+                if (self._delivery_handoff is None or not self._delivery_handoff.blocked) and self._should_edit(tick) and (
                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)
                 ):
                     # Seal first: it clears the message id, so a remainder still over the limit
@@ -594,10 +654,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._push_update(tick)
 
                 if tick.got_done:
-                    await self._finalize_turn(tick)
+                    if self._delivery_handoff is None or not self._delivery_handoff.blocked:
+                        await self._finalize_turn(tick)
                     return
 
-                if tick.commentary_text is not None:
+                if tick.commentary_text is not None and (self._delivery_handoff is None or not self._delivery_handoff.blocked):
                     await self._deliver_commentary(tick.commentary_text)
                 if tick.got_segment_break:
                     await self._end_segment(tick)
@@ -759,8 +820,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             chunks = self._split_text_chunks(self._accumulated, self._safe_limit, self._len_fn)
         reply_to = self._initial_reply_to_id
         heads_delivered = len(chunks) > 1
-        for chunk in chunks[:-1]:
-            new_id = await self._send_new_chunk(chunk, reply_to, final=tick.got_done)
+        for index, chunk in enumerate(chunks[:-1]):
+            new_id = await self._send_new_chunk(
+                chunk, reply_to, final=tick.got_done,
+                later_chunks=tuple(chunks[index + 1:]))
+            if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+                return tick.got_done
             if new_id is None or new_id == reply_to:
                 heads_delivered = False  # keep the full text intact for the gateway fallback
                 break
@@ -781,10 +846,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._message_id = None
         self._message_created_ts = None
         self._last_sent_text = ""
+        self._last_sent_cursor_appended = False
         self._last_edit_time = time.monotonic()
         if tick.got_done:
             tail_delivered = (not self._accumulated
-                              or await self._send_or_edit(self._accumulated, finalize=True))
+                              or await self._send_or_edit(
+                                  self._accumulated, finalize=True))
             # ``_already_sent`` may be True from prior state — only heads + tail count.
             self._final_response_sent = heads_delivered and tail_delivered
             if self._final_response_sent:
@@ -817,8 +884,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             if self._fallback_final_send or not ok:
                 break  # keep the full text intact for the fallback final send
             self._accumulated = self._accumulated[split_at:].lstrip("\n")
+            if self._delivery_handoff is not None:
+                self._delivery_handoff = self._delivery_handoff.reserve_model(
+                    self._accumulated, self._clean_for_display(self._stream_ledger))
             self._message_id = None
             self._last_sent_text = ""
+            self._last_sent_cursor_appended = False
             self._turn_split_delivery = True
 
     async def _push_update(self, tick: "_Tick") -> None:

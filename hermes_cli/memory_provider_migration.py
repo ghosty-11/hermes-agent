@@ -52,17 +52,20 @@ def catalog_source(name: str) -> Optional[str]:
     return entry.name if entry is not None else None
 
 
-def migrate_home(home: Path, *, install: Callable[[str], dict], say: Callable[[str], None] = print) -> Optional[str]:
-    """Install the configured provider's catalog plugin into *home* when the provider is gone.
+def migrate_home(home: Path, *, install: Callable[[str], dict], say: Callable[[str], None] = print,
+                 offline: bool = False) -> Optional[str]:
+    """Install a missing configured provider or refuse an unavailable offline migration.
 
-    Returns the installed plugin name, or None when nothing needed doing or the install could not
-    happen (already reported through *say*). Never raises: memory being down must not take the
-    update or the agent down with it.
+    Online recovery reports missing catalog entries without aborting the update.
     """
     name = configured_provider(home)
     from agent.memory_provider import is_core_memory_provider
     if is_core_memory_provider(name) or provider_present(name, home):
         return None
+    if offline:
+        raise RuntimeError(
+            f"Configured memory provider '{name}' is unavailable locally for {home}; "
+            "offline completion cannot install a catalog plugin")
     if catalog_source(name) is None:
         say(f"  ⚠ Memory provider '{name}' is configured but not installed and not in the plugin catalog. "
             f"Install it with `hermes plugins install <source>` or change memory.provider.")
@@ -92,16 +95,19 @@ def _install_into(home: Path) -> Callable[[str], dict]:
     return _install
 
 
-def migrate_all_homes(*, say: Callable[[str], None] = print) -> list[str]:
+def migrate_all_homes(*, say: Callable[[str], None] = print, offline: bool = False) -> list[str]:
     """``hermes update`` hook: every profile home sharing this venv. Returns installed plugin names."""
     from pm.plugins_state import dependency_homes
     installed: list[str] = []
     for home in dependency_homes():
-        try:
-            name = migrate_home(home, install=_install_into(home), say=say)
-        except Exception as exc:
-            logger.debug("memory provider migration skipped for %s: %s", home, exc)
-            continue
+        if offline:
+            name = migrate_home(home, install=_install_into(home), say=say, offline=True)
+        else:
+            try:
+                name = migrate_home(home, install=_install_into(home), say=say)
+            except Exception as exc:
+                logger.debug("memory provider migration skipped for %s: %s", home, exc)
+                continue
         if name:
             installed.append(name)
     return installed

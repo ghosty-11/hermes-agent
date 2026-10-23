@@ -472,7 +472,9 @@ def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, **run_kwargs)
         fetch_filter = "tree:0"
     try:
         subprocess.run(
-            ["git", "fetch", "--quiet", *(["--unshallow"] if shallow else []),
+            # Automatic gc/maintenance would detach and outlive the update lock.
+            ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+             "fetch", "--quiet", *(["--unshallow"] if shallow else []),
              *([f"--filter={fetch_filter}"] if fetch_filter else []),
              "--no-tags", "origin", "refs/tags/v*:refs/tags/v*", *extra_refspecs],
             cwd=str(repo_root), check=True, capture_output=True, text=True,

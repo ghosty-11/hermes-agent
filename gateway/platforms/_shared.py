@@ -10,6 +10,8 @@ import contextlib
 import json
 import logging
 import os
+from contextvars import ContextVar
+from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Optional
 
 # Profile-scoped secret reader for multiplexing support (PR #50094)
@@ -17,6 +19,25 @@ from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
 
 logger = logging.getLogger(__name__)
+_SUPPRESS_YAML_ENV_BRIDGES: ContextVar[bool] = ContextVar(
+    "_SUPPRESS_YAML_ENV_BRIDGES", default=False,
+)
+
+
+@contextmanager
+def suppress_yaml_env_bridges():
+    """Inspect another home's YAML without publishing its policy into process env."""
+    token = _SUPPRESS_YAML_ENV_BRIDGES.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_YAML_ENV_BRIDGES.reset(token)
+
+
+def yaml_env_bridge_suppressed() -> bool:
+    return _SUPPRESS_YAML_ENV_BRIDGES.get() or profile_scoped()
+
+
 
 
 def get_scoped_secret(name: str, default: Any = None, *, external_fallback: bool = False) -> Any:
@@ -157,7 +178,7 @@ def yaml_env_setter() -> Callable[[str, Any], None]:
     Hooks seed the same values into the returned ``extra`` so each profile's adapter reads its own.
     Lists are comma-joined; ``None`` is skipped.
     """
-    skip = profile_scoped()
+    skip = yaml_env_bridge_suppressed()
 
     def set_env(name: str, value: Any) -> None:
         if value is None or skip or os.getenv(name):
@@ -237,7 +258,8 @@ def env_is_connected(*names: str) -> Callable[[Any], bool]:
 
     def is_connected(config: Any) -> bool:
         import hermes_cli.gateway as gateway_mod
-        return all((gateway_mod.get_env_value(name) or "").strip() for name in names)
+        from gateway.platform_configuration import credential_groups_present
+        return credential_groups_present(names, lambda name: (gateway_mod.get_env_value(name) or "").strip())
 
     return is_connected
 

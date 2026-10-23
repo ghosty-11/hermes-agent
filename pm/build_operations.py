@@ -192,13 +192,14 @@ def verified_tools(names: Sequence[str], *, source_store: Path, target: str,
     return VerifiedTools(MappingProxyType(entries), tuple(envs))
 
 
-def stage_tools(names: Sequence[str], *, source_store: Path, out: Path, target: str) -> Path:
+def stage_tools(names: Sequence[str], *, source_store: Path, out: Path, target: str,
+                lock: Lockfile | None = None) -> Path:
     """Copy a current, verified tool closure without acquisition or live selection.
 
-    Stores must be disjoint. Both publication locks cover admission and copying;
-    the ordinary installer owns verification, independent copies and fresh facts.
+    Writable stores are locked during verification and copying. A sealed source
+    is immutable; the destination publication lock still covers each copy.
     """
-    from contextlib import ExitStack
+    from contextlib import ExitStack, nullcontext
     from pm.install import _entry_verified, _install, _lockfile
     from pm.lock import Facts
     from pm.package import StatePackage
@@ -216,10 +217,11 @@ def stage_tools(names: Sequence[str], *, source_store: Path, out: Path, target: 
     if any(isinstance(package, StatePackage) for package in packages):
         raise ValueError("stage_tools accepts tool packages, not application state")
     source, destination = Store(source_store), Store(out)
-    lock = _lockfile()
+    lock = lock if lock is not None else _lockfile()
     with ExitStack() as stack:
-        for store in sorted((source, destination), key=lambda store: str(store.root)):
-            stack.enter_context(store.install_lock())
+        for item in sorted((source, destination), key=lambda store: str(store.root)):
+            immutable = item.root == source.root and (source.root.parent / "manifest.json").is_file()
+            stack.enter_context(nullcontext() if immutable else item.install_lock())
         selection = verified_tools(names, source_store=source_store, target=target, lock=lock)
         facts = Facts(source_store / "facts.json", strict=True)
         for package in packages:

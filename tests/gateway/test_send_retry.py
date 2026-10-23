@@ -47,6 +47,11 @@ class _StubAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id):
         return {"name": "test", "type": "direct", "chat_id": chat_id}
 
+class _ResumableAdapter(_StubAdapter):
+    async def _resume_partial_send(self, chat_id, result, *, reply_to, metadata):
+        return await self.send(
+            chat_id, result.raw_response["remaining_content"], reply_to=reply_to, metadata=metadata)
+
 
 # ---------------------------------------------------------------------------
 # _is_retryable_error
@@ -104,6 +109,52 @@ class TestSendWithRetryNetworkRetry:
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
         assert result.success
         assert len(adapter._send_calls) == 2  # initial + 1 retry
+
+    @pytest.mark.asyncio
+    async def test_partial_retry_classifies_original_transport_error(self):
+        adapter = _ResumableAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="partially sent",
+                       raw_response={"partial_overflow": True, "remaining_content": "tail",
+                                     "delivery_error": "flood_control:2"}),
+            SendResult(success=True, message_id="tail-landed"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "head\ntail", max_retries=1, base_delay=0)
+        assert result.success
+        assert [content for _, content in adapter._send_calls] == ["head\ntail", "tail"]
+
+    @pytest.mark.asyncio
+    async def test_total_transport_failure_retries_complete_attached_remainder(self):
+        adapter = _StubAdapter()
+        original = "answer"
+        owed = original + "\nhttps://example.com/attached.gif"
+        adapter._send_results = [
+            SendResult(success=False, error="transport failed", retryable=True,
+                       raw_response={"partial_overflow": False, "remaining_content": owed,
+                                     "delivery_error": "flood_control:2"}),
+            SendResult(success=True, message_id="landed"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", original, max_retries=1, base_delay=0)
+        assert result.success
+        assert [content for _, content in adapter._send_calls] == [original, owed]
+
+    @pytest.mark.asyncio
+    async def test_subsequent_partial_retry_uses_its_transport_error(self):
+        adapter = _ResumableAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="ConnectError", retryable=True),
+            SendResult(success=False, error="partially sent",
+                       raw_response={"partial_overflow": True, "remaining_content": "tail",
+                                     "delivery_error": "flood_control:2"}),
+            SendResult(success=True, message_id="tail-landed"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "head\ntail", max_retries=2, base_delay=0)
+        assert result.success
+        assert [content for _, content in adapter._send_calls] == ["head\ntail", "head\ntail", "tail"]
+
 
     @pytest.mark.asyncio
     async def test_timeout_not_retried_to_prevent_duplicates(self):

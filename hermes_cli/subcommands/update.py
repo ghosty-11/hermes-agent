@@ -111,4 +111,14 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Update code and dependencies but defer the fleet restart. Use for updates "
              "running inside a gateway cgroup, then restart gateways separately.",
     )
+    update_parser.add_argument("--source-repo", type=str, metavar="PATH",
+                               help="Fetch an exact reviewed commit from a local Git worktree only")
+    update_parser.add_argument("--target", type=str, metavar="SHA",
+                               help="Full lowercase 40-hex descendant commit for --source-repo")
+    update_parser.add_argument("--required-extra", action="append", default=[], metavar="EXTRA",
+                               help="Required frozen-lock extra for a local source transaction (repeatable)")
+    update_parser.add_argument("--rollback-local-update", type=str, metavar="MANIFEST",
+                               help="Restore a sealed local-update capsule without discarding later history")
+    update_parser.add_argument("--acknowledge-data-rollback", action="store_true",
+                               help="Explicitly acknowledge restoration of recorded mutable data")
     update_parser.set_defaults(func=cmd_update)

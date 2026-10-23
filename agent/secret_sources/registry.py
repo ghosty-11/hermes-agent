@@ -16,7 +16,7 @@ import concurrent.futures
 import logging
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, MutableMapping, Optional
 
@@ -24,6 +24,7 @@ from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION, ErrorKind, FetchResult, SecretSource, is_valid_env_name,
     reset_source_environment, set_source_environment,
 )
+from agent.secret_sources.policy import source_policy
 from hermes_constants import hermes_home_key, normalize_scope
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,14 @@ class ApplyReport:
     sources: List[SourceReport] = field(default_factory=list)
     provenance: Dict[str, AppliedVar] = field(default_factory=dict)
     conflicts: List[str] = field(default_factory=list)  # human-readable warnings
+    # Activation is a decision about every configured section, not just sources fetched.
+    activation_decisions: Dict[str, bool] = field(default_factory=dict)
+    activation_failures: set[str] = field(default_factory=set)
+    _fetches: List[tuple[SecretSource, dict, FetchResult]] = field(default_factory=list, repr=False)
+    _protected: Dict[str, str] = field(default_factory=dict, repr=False)
+    _preserve: frozenset[str] = field(default_factory=frozenset, repr=False)
+    _profile: str = ""
+    _supplied_directly: set[str] = field(default_factory=set, repr=False)
 
     @property
     def applied_any(self) -> bool:
@@ -264,7 +273,9 @@ def _section(secrets_cfg: dict, name: str) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def _ordered_enabled_sources(secrets_cfg: dict, *, scope: Optional[str] = None) -> List[SecretSource]:
+def _ordered_enabled_sources(secrets_cfg: dict, *, scope: Optional[str] = None,
+                             decisions: Optional[Dict[str, bool]] = None,
+                             failures: Optional[set[str]] = None) -> List[SecretSource]:
     """Enabled sources: ``secrets.sources`` order first, then registration order
     (mapped-vs-bulk precedence is applied on top by :func:`apply_all`)."""
     sources = {source.name: source for source in list_sources(scope=scope)}
@@ -280,9 +291,14 @@ def _ordered_enabled_sources(secrets_cfg: dict, *, scope: Optional[str] = None) 
     enabled: List[SecretSource] = []
     for name in order:
         try:
-            if sources[name].is_enabled(_section(secrets_cfg, name)):
+            active = bool(sources[name].is_enabled(_section(secrets_cfg, name)))
+            if decisions is not None and name in secrets_cfg:
+                decisions[name] = active
+            if active:
                 enabled.append(sources[name])
         except Exception:  # noqa: BLE001
+            if failures is not None and name in secrets_cfg:
+                failures.add(name)
             logger.warning("Secret source '%s' is_enabled() raised; skipping", name, exc_info=True)
     return enabled
 
@@ -291,8 +307,13 @@ def enabled_source_names(secrets_cfg: dict, home_path: Path) -> frozenset:
     """Names of the sources :func:`apply_all` would fetch for *home_path* right now (registered
     and enabled). A source missing here was removed or disabled, so a value it injected earlier
     is no longer backed by anything and must be revoked, not kept as process residue."""
-    secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
-    return frozenset(s.name for s in _ordered_enabled_sources(secrets_cfg, scope=hermes_home_key(home_path)))
+    failures: set[str] = set()
+    enabled = _ordered_enabled_sources(
+        secrets_cfg, scope=hermes_home_key(home_path), failures=failures,
+    )
+    if failures:
+        raise RuntimeError(f"cannot resolve secret source activation: {', '.join(sorted(failures))}")
+    return frozenset(s.name for s in enabled)
 
 
 def _active_profile_name(home_path: Optional[Path]) -> str:
@@ -378,6 +399,24 @@ class _Applier:
         return True
 
 
+def reconcile_application(report: ApplyReport, environ: MutableMapping[str, str]) -> ApplyReport:
+    """Reapply fetched results without fetching, against the environment at publication time."""
+    committed = ApplyReport(
+        activation_decisions=report.activation_decisions,
+        activation_failures=report.activation_failures,
+        _fetches=report._fetches,
+        _protected=report._protected,
+        _preserve=report._preserve,
+        _profile=report._profile,
+        _supplied_directly=report._supplied_directly,
+    )
+    applier = _Applier(environ, committed, report._protected, report._preserve)
+    for source, cfg, result in report._fetches:
+        applier.apply_source(source, cfg, replace(result, warnings=list(result.warnings)),
+                             report._profile, report._supplied_directly)
+    return committed
+
+
 def apply_all(secrets_cfg: dict, home_path: Path,
               environ: Optional[MutableMapping[str, str]] = None) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to ``environ``
@@ -401,14 +440,15 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     env = environ if environ is not None else os.environ
     report = ApplyReport()
     secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
-    enabled = _ordered_enabled_sources(secrets_cfg, scope=hermes_home_key(home_path))
+    enabled = _ordered_enabled_sources(
+        secrets_cfg, scope=hermes_home_key(home_path),
+        decisions=report.activation_decisions, failures=report.activation_failures,
+    )
     if not enabled:
         return report
 
-    preserve_raw = secrets_cfg.get("preserve_existing")
-    preserve = frozenset(n.strip() for n in preserve_raw if isinstance(n, str) and n.strip()
-                         ) if isinstance(preserve_raw, list) else frozenset()
-    profile = _active_profile_name(home_path) if secrets_cfg.get("profile_alias", True) else ""
+    preserve, alias = source_policy(secrets_cfg)
+    profile = _active_profile_name(home_path) if alias else ""
 
     # Mapped outranks bulk regardless of list order.
     ordered = [s for s in enabled if s.shape == "mapped"] + [s for s in enabled if s.shape == "bulk"]
@@ -428,7 +468,9 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     # An alias never shadows a var some source supplies by its real name.
     supplied_directly = {v for _, _, r in fetches if r.ok for v in r.secrets if isinstance(v, str)}
 
-    applier = _Applier(env, report, protected, preserve)
-    for source, cfg, result in fetches:
-        applier.apply_source(source, cfg, result, profile, supplied_directly)
-    return report
+    report._fetches = fetches
+    report._protected = protected
+    report._preserve = preserve
+    report._profile = profile
+    report._supplied_directly = supplied_directly
+    return reconcile_application(report, env)

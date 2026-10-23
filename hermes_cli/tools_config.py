@@ -8,7 +8,8 @@ from typing import Dict, List, NoReturn, Optional, Set
 
 from hermes_cli.cli_output import print_info as _print_info
 from hermes_cli.colors import Colors, color
-from hermes_cli.config import cfg_get, load_config, save_config, get_env_value
+from hermes_cli.config import load_config, save_config, get_env_value
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.nous_subscription import (
     NousSubscriptionFeatures, apply_nous_managed_defaults, get_nous_subscription_features)
 from hermes_cli.platforms import PLATFORMS as _PLATFORMS_REGISTRY

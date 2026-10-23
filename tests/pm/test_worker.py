@@ -98,7 +98,7 @@ def test_currency_probe_preserves_union_and_candidate_inputs(client, tmp_path, m
     root_args = {"project_root": repo} if route != "worker" else {}
     acquisitions = []
 
-    def ready_runtime(*, bootstrap, cache):
+    def ready_runtime(*, bootstrap, cache, offline=False):
         assert bootstrap is False, "currency probe attempted to bootstrap PM"
         acquisitions.append(bootstrap)
         return isolated_python
@@ -581,6 +581,73 @@ def test_worker_side_environment_reuses_and_keeps_selection_on_failed_tool(clien
         client.ensure_environment("proof", ["absent-dependency==0"], root=root)
     assert (root / "active.json").read_bytes() == selection
 
+
+def test_export_into_shared_state_requires_a_retained_claim(client, tmp_path, isolated_python):
+    import json
+    from pm.worker_operations import writes_shared_state
+
+    home = tmp_path / "home"
+    output = home / "installs" / "export.txt"
+    private_cache = tmp_path / "private-cache"
+    arguments = {"source": str(tmp_path / "source"), "out": str(output),
+                 "cache": str(private_cache), "explicit": True}
+    assert writes_shared_state("export_requirements", arguments)
+    assert writes_shared_state("export_requirements",
+                               {**arguments, "out": str(paths.install_root() / "export.txt")})
+    assert writes_shared_state("export_requirements",
+                               {**arguments, "out": str(tmp_path / "store" / "export.txt")})
+    assert writes_shared_state("export_requirements",
+                               {**arguments, "out": str(tmp_path / "private-out"),
+                                "cache": str(home / "cache" / "uv")})
+    assert writes_shared_state("build_requirements_environment",
+                               {"out": str(tmp_path / "private-out"), "cache": None})
+    assert not writes_shared_state("build_requirements_environment",
+                                   {"out": str(tmp_path / "private-out"), "cache": str(private_cache)})
+    alias = tmp_path / "alias"
+    home.mkdir()
+    alias.symlink_to(home, target_is_directory=True)
+    assert writes_shared_state("export_requirements", {**arguments, "out": str(alias / "export.txt")})
+    final_link = tmp_path / "linked-output"
+    final_link.symlink_to(tmp_path / "private-out")
+    assert writes_shared_state("export_requirements", {**arguments, "out": str(final_link)})
+
+    request = {"id": "shared-export", "operation": "export_requirements", "arguments": arguments,
+               "callbacks": [], "packages": [],
+               "context": {"repo": str(paths.repo_root()), "lockfile": str(paths.lockfile_path())}}
+    worker = Path(client.__file__).with_name("worker.py")
+    result = subprocess.run([str(isolated_python), "-I", "-B", str(worker)],
+                            input=json.dumps(request) + "\n", capture_output=True, text=True,
+                            encoding="utf-8", timeout=30, env=client.runtime_environment())
+    assert result.returncode != 0
+    assert "mutating child received no retained writer claim" in result.stderr
+    assert not output.exists()
+
+
+
+def test_claimless_worker_refuses_unresolved_parent_escape(client, tmp_path, isolated_python):
+    import json
+    from pm.worker_operations import writes_shared_state
+
+    private = tmp_path / "private"
+    private.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    output = private / "missing" / ".." / ".." / "home" / "export.txt"
+    arguments = {"source": str(tmp_path / "source"), "out": str(output),
+                 "cache": str(tmp_path / "private-cache"), "explicit": True}
+    assert writes_shared_state("export_requirements", arguments)
+    assert writes_shared_state("export_requirements", {**arguments, "out": "relative/export.txt"})
+
+    request = {"id": "escape-export", "operation": "export_requirements", "arguments": arguments,
+               "callbacks": [], "packages": [],
+               "context": {"repo": str(paths.repo_root()), "lockfile": str(paths.lockfile_path())}}
+    worker = Path(client.__file__).with_name("worker.py")
+    result = subprocess.run([str(isolated_python), "-I", "-B", str(worker)],
+                            input=json.dumps(request) + "\n", capture_output=True, text=True,
+                            encoding="utf-8", timeout=30, env=client.runtime_environment())
+    assert result.returncode != 0
+    assert "mutating child received no retained writer claim" in result.stderr
+    assert not (home / "export.txt").exists()
 
 @pytest.mark.parametrize("operation", ["activate", "stage_manager_runtime"])
 @pytest.mark.parametrize("route", ["client", "wire"])

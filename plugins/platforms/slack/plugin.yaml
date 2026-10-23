@@ -1,6 +1,10 @@
 name: slack-platform
 label: Slack
 kind: platform
+platform_dependencies:
+  slack:
+    extras: [slack]
+    env: [SLACK_BOT_TOKEN, SLACK_APP_TOKEN]
 version: 1.0.0
 description: >
   Slack gateway adapter for Hermes Agent.

@@ -55,6 +55,8 @@ def test_env_enablement_reads_only_through_scoped_getter(plugin, monkeypatch):
         return fake_scope.get(name, default)
 
     monkeypatch.setattr(shared, "get_scoped_secret", spy)
+    if plugin == "google_chat":
+        monkeypatch.setattr(mod, "_get_scoped_secret", spy)
     monkeypatch.setattr(shared, "_scoped_get_secret", lambda name, default=None: fake_scope.get(name, default))
     monkeypatch.setattr(cli_config, "get_env_value", lambda key: raw_hits.append(key))
     monkeypatch.setattr(os, "getenv", lambda key, default=None: raw_hits.append(key) or default)

@@ -307,8 +307,17 @@ def profile_tombstone_path(profile_home: Path) -> Path:
     return profile_home.parent / _DELETED_PROFILES_DIR / profile_home.name
 
 
-def named_profile_is_deleted(profile_home: str | Path) -> bool:
-    return profile_tombstone_path(Path(profile_home)).exists()
+def named_profile_is_deleted(profile_home: str | Path, *, strict: bool = False) -> bool:
+    marker = profile_tombstone_path(Path(profile_home))
+    if strict:
+        try:
+            mode = marker.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(mode):
+            raise ValueError(f"Invalid profile tombstone: {marker}")
+        return True
+    return marker.exists()
 
 
 # A directory under profiles/ is a profile only when something identifies it as one.
@@ -320,11 +329,30 @@ _PROFILE_IDENTITY_MARKERS = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
-def named_profile_has_identity(profile_home: str | Path) -> bool:
-    # A dangling symlinked marker (clone/migration leftover) is still an identity claim:
-    # ``is_file()`` follows links, so it alone would make such a profile unlistable.
+def named_profile_has_identity(profile_home: str | Path, *, strict: bool = False) -> bool:
+    # Dangling symlinked markers still identify a profile; failed metadata reads do not
+    # make a live profile disappear during strict dependency inspection.
     home = Path(profile_home)
-    return any((home / marker).is_file() or (home / marker).is_symlink() for marker in _PROFILE_IDENTITY_MARKERS)
+    if not strict:
+        return any((home / marker).is_file() or (home / marker).is_symlink()
+                   for marker in _PROFILE_IDENTITY_MARKERS)
+    identified = False
+    for marker in _PROFILE_IDENTITY_MARKERS:
+        path = home / marker
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+        if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+            identified = True
+        elif stat.S_ISLNK(path.lstat().st_mode):
+            identified = True
+        else:
+            raise ValueError(f"Invalid profile identity marker: {path}")
+    return identified
 
 
 def named_profile_has_servable_identity(profile_home: str | Path) -> bool:
@@ -349,11 +377,17 @@ def named_profile_has_servable_identity(profile_home: str | Path) -> bool:
     return False
 
 
-def named_profile_is_live(profile_home: str | Path) -> bool:
-    """A resolvable named profile: an existing dir with identity that has not been deleted.
-    ``-p``/``--profile`` resolution and ``profile_exists`` share this so a stale ghost shell can
-    never be started as a backend (whose ``ensure_hermes_home`` would rebuild the full tree)."""
+def named_profile_is_live(profile_home: str | Path, *, strict: bool = False) -> bool:
+    """A named profile with an identity marker and no tombstone."""
     home = Path(profile_home)
+    if strict:
+        try:
+            mode = home.stat().st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(mode):
+            raise ValueError(f"Profile home is not a directory: {home}")
+        return named_profile_has_identity(home, strict=True) and not named_profile_is_deleted(home, strict=True)
     return home.is_dir() and named_profile_has_identity(home) and not named_profile_is_deleted(home)
 
 

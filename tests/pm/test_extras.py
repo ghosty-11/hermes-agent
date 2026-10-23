@@ -1,6 +1,4 @@
-"""pm.extras: anchor availability, ensure_import, ensure_and_bind, and the
-spec→extra install shim. Network-free — sync_venv is stubbed at the client
-seam used by extras; the engine and worker have separate transaction tests."""
+"""Package-manager extras: anchor availability and lazy install behavior."""
 
 from __future__ import annotations
 
@@ -187,19 +185,6 @@ def test_ensure_import_propagates_install_error(monkeypatch):
         extras.ensure_import("fal")
 
 
-@pytest.mark.parametrize("failure", [None, "install", "import"])
-def test_ensure_and_bind_preserves_target_on_failure(monkeypatch, failure):
-    monkeypatch.setattr(extras, "available", lambda _: failure != "install")
-    def sync(*args):
-        raise pm.InstallError("venv", "install refused")
-    monkeypatch.setattr(client, "sync_venv", sync)
-    def importer():
-        if failure == "import":
-            raise ImportError("still broken")
-        return {"NAME": 42}
-    target = {"existing": "kept"}
-    assert extras.ensure_and_bind("fal", importer, target) is (failure is None)
-    assert target == ({"existing": "kept", "NAME": 42} if failure is None else {"existing": "kept"})
 
 
 

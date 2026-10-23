@@ -738,7 +738,8 @@ def _configured_custom_provider_ids() -> set[str]:
 
 def _provider_has_credentials(pid: str) -> bool:
     try:
-        from hermes_cli.auth import get_auth_status, has_usable_secret
+        from hermes_cli.auth import get_auth_status
+        from hermes_cli.secret_validation import has_usable_secret
 
         if pid == "custom":
             return bool((_get_custom_base_url() or "").strip())

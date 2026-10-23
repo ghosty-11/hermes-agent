@@ -23,7 +23,7 @@ def test_install_selection_is_committed_only_after_its_tree_is_flushed(tmp_path,
 
     store = tmp_path / "tools"
     store.mkdir()
-    monkeypatch.setattr("pm.paths.store_root", lambda: store)
+    monkeypatch.setattr("pm.paths.store_root", lambda project_root=None: store)
     repo = tmp_path / "repo"
     repo.mkdir()
     monkeypatch.setattr(paths, "repo_root", lambda: repo)

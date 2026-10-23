@@ -30,7 +30,7 @@ def _profile_scoped_rpc(
 
     The scope is the same home + secret + terminal composition a turn binds
     (``_session_profile_runtime_scope``), not HERMES_HOME alone: these bodies read config.yaml,
-    whose ``${VAR}`` refs (``config._env_ref_lookup``) and the MCP probe's own header/env
+    whose ``${VAR}`` refs (``config_primitives._env_ref_lookup``) and the MCP probe's own header/env
     interpolation resolve through ``get_secret`` — with only the home bound they read plain
     ``os.environ``, i.e. the launch profile's values, so ``mcp.servers.test`` for a secondary
     reported green against the default profile's token (or the literal placeholder). External

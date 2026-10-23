@@ -330,3 +330,111 @@ def test_removing_the_last_plugin_source_revokes_its_process_env_value(
         os.environ.pop("REVIEW_PLUGIN_SECRET", None)
         reg._reset_registry_for_tests()
         env_loader.reset_secret_source_cache()
+
+
+def test_custom_activation_cold_authority_refuses_and_successful_route_stays_cached(
+    monkeypatch, tmp_path,
+):
+    from agent.secret_sources.registry import register_source, restore_registration, snapshot_registration
+    from hermes_cli import env_loader
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "secrets:\n  myvault:\n    vault_id: fixture-vault\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("FIXTURE_CUSTOM_VAULT_TOKEN", raising=False)
+
+    class Source(_CustomActivationSource):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def fetch(self, cfg, home_path):
+            self.calls += 1
+            assert cfg["vault_id"] == "fixture-vault"
+            return FetchResult(secrets={"FIXTURE_CUSTOM_VAULT_TOKEN": "fixture-secret"})
+
+    source = Source()
+    previous = snapshot_registration(source.name, scope=str(home))
+    assert register_source(source, scope=str(home))
+    try:
+        with pytest.raises((OSError, RuntimeError, ValueError)):
+            env_loader.get_authoritative_secret_source_values(home)
+        assert source.calls == 0
+        assert env_loader.hydrate_profile_secret_sources(home) == {
+            "FIXTURE_CUSTOM_VAULT_TOKEN": "fixture-secret",
+        }
+        assert env_loader.get_authoritative_secret_source_values(home) == {
+            "FIXTURE_CUSTOM_VAULT_TOKEN": "fixture-secret",
+        }
+        assert env_loader.hydrate_profile_secret_sources(home) == {
+            "FIXTURE_CUSTOM_VAULT_TOKEN": "fixture-secret",
+        }
+        assert source.calls == 1
+        assert os.environ.get("FIXTURE_CUSTOM_VAULT_TOKEN") is None
+    finally:
+        env_loader.reset_secret_source_cache(home)
+        assert restore_registration(source.name, source, previous, scope=str(home))
+
+@pytest.mark.parametrize("mode", ["activation-error", "unregistered"])
+def test_mixed_custom_activation_cannot_certify_incomplete_evaluation(
+    monkeypatch, tmp_path, mode,
+):
+    from agent.secret_sources.registry import register_source, restore_registration, snapshot_registration
+    from hermes_cli import env_loader
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "secrets:\n  myvault:\n    vault_id: fixture-vault\n"
+        "  fixture_other:\n    enabled: true\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    class Broken(_CustomActivationSource):
+        def __init__(self):
+            super().__init__()
+            self.fails = True
+
+        def is_enabled(self, cfg):
+            if self.fails:
+                raise RuntimeError("fixture activation failure")
+            return super().is_enabled(cfg)
+
+    class Other(_StubSource):
+        def __init__(self):
+            super().__init__("fixture_other")
+
+        def fetch(self, cfg, home_path):
+            return FetchResult(secrets={"FIXTURE_OTHER_TOKEN": "fixture-value"})
+
+    other = Other()
+    broken = Broken()
+    prior_other = snapshot_registration(other.name, scope=str(home))
+    prior_broken = snapshot_registration(broken.name, scope=str(home))
+    assert register_source(other, scope=str(home))
+    if mode == "activation-error":
+        assert register_source(broken, scope=str(home))
+    try:
+        assert env_loader.hydrate_profile_secret_sources(home) == {
+            "FIXTURE_OTHER_TOKEN": "fixture-value",
+        }
+        with pytest.raises((OSError, RuntimeError, ValueError)):
+            env_loader.get_authoritative_secret_source_values(home)
+        # An incomplete routed evaluation is retryable, even though another source succeeded.
+        assert str(home.resolve()) not in env_loader._APPLIED_HOMES
+        broken.fails = False
+        if mode == "unregistered":
+            assert register_source(broken, scope=str(home))
+        assert env_loader.hydrate_profile_secret_sources(home) == {
+            "FIXTURE_OTHER_TOKEN": "fixture-value",
+        }
+        assert env_loader.get_authoritative_secret_source_values(home) == {
+            "FIXTURE_OTHER_TOKEN": "fixture-value",
+        }
+    finally:
+        env_loader.reset_secret_source_cache(home)
+        assert restore_registration(broken.name, broken, prior_broken, scope=str(home))
+        assert restore_registration(other.name, other, prior_other, scope=str(home))

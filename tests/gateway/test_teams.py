@@ -172,12 +172,8 @@ _teams_mod.AIOHTTP_AVAILABLE = True
 # microsoft-teams-apps.
 
 
-def _bind_mock_sdk(feature, importer, target_globals, **kwargs):
-    target_globals.update(importer())
-    return True
 
-
-with patch("pm.extras.ensure_and_bind", _bind_mock_sdk):
+with patch("pm.ensure_import", lambda _extra: None):
     assert _teams_mod.check_teams_requirements() is True
 _teams_mod.TEAMS_SDK_AVAILABLE = True
 
@@ -314,16 +310,19 @@ class TestTeamsInteractiveSetup:
 class TestTeamsConnect:
     @pytest.mark.anyio
     async def test_connect_fails_without_sdk(self, monkeypatch):
+        import pm
         monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", False)
         monkeypatch.setattr(_teams_mod, "App", None)
         monkeypatch.setattr(_teams_mod, "ClientOptions", None)
+
         # Simulate the SDK being unavailable AND not installable (offline /
         # locked-down env): the lazy-installer can't rebind the globals, so
         # App stays None and connect() must fail without calling it.
-        monkeypatch.setattr(
-            "pm.extras.ensure_and_bind",
-            lambda *_a, **_k: False,
-        )
+
+        def unavailable(_extra):
+            raise pm.InstallError("venv", "fixture Teams SDK unavailable")
+
+        monkeypatch.setattr(pm, "ensure_import", unavailable)
         adapter = TeamsAdapter(_make_config(
             client_id="id", client_secret="secret", tenant_id="tenant",
         ))
@@ -336,14 +335,17 @@ class TestTeamsConnect:
         without microsoft-teams-apps. connect() must not call App() while
         it is still None — that was ``'NoneType' object is not callable``.
         """
+        import pm
+
         monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", True)
         monkeypatch.setattr(_teams_mod, "App", None)
         monkeypatch.setattr(_teams_mod, "ClientOptions", None)
         monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", True)
-        monkeypatch.setattr(
-            "pm.extras.ensure_and_bind",
-            lambda *_a, **_k: False,
-        )
+
+        def unavailable(_extra):
+            raise pm.InstallError("venv", "fixture Teams SDK unavailable")
+
+        monkeypatch.setattr(pm, "ensure_import", unavailable)
         adapter = TeamsAdapter(_make_config(
             client_id="id", client_secret="secret", tenant_id="tenant",
         ))

@@ -42,13 +42,8 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
-def get_managed_dir() -> Optional[Path]:
-    """Resolve the managed-scope directory, or None when no scope is present.
-
-    Priority: ``$HERMES_MANAGED_DIR`` (IT-only bootstrap override; never persisted to any .env;
-    honored only when non-empty AND the directory exists), then ``/etc/hermes`` when it exists.
-    A missing directory resolves to None — the common case, so it must be cheap + side-effect-free.
-    """
+def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
+    """Resolve the administrator scope; strict reads distinguish absence from bad metadata."""
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
         p = Path(override)
@@ -56,6 +51,9 @@ def get_managed_dir() -> Optional[Path]:
         return None
     else:
         p = _DEFAULT_MANAGED_DIR
+    if strict:
+        from hermes_cli.config_paths import strict_directory_present
+        return p if strict_directory_present(p) else None
     return p if p.is_dir() else None
 
 
@@ -66,17 +64,19 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
-    """Shared stat-signature-keyed read; returns a deepcopy of the parsed value.
-
-    ``None`` when the file is absent or fails to parse (fail-open). A parse failure is logged
-    LOUDLY — the admin needs to know their policy isn't applied — but never raises, so a malformed
-    managed file can't brick startup.
-    """
+def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, strict: bool = False):
+    """Stat-keyed read; strict readers refuse unreadable or invalid input."""
+    if strict:
+        from hermes_cli.config_paths import strict_file_present
+        return parse(path) if strict_file_present(path) else None
     try:
         st = path.stat()
+    except FileNotFoundError:
+        return None
     except OSError:
-        return None  # absent
+        if strict:
+            raise
+        return None
     key = file_signature(st)
     path_key = str(path)
     with _CACHE_LOCK:
@@ -85,7 +85,9 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
             return copy.deepcopy(hit[len(key)])
     try:
         parsed = parse(path)
-    except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
+    except Exception as exc:
+        if strict:
+            raise
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
             "Admin policy from this file is NOT being applied. Fix and restart.",
@@ -96,46 +98,50 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
     return parsed
 
 
-def _load_managed_file(name: str, cache: Dict[str, tuple], parse) -> dict:
-    managed_dir = get_managed_dir()
+def _load_managed_file(name: str, cache: Dict[str, tuple], parse, *, strict: bool = False) -> dict:
+    managed_dir = get_managed_dir(strict=True) if strict else get_managed_dir()
     if managed_dir is None:
         return {}
-    parsed = _cached_read(managed_dir / name, cache, parse)
+    path = managed_dir / name
+    parsed = _cached_read(path, cache, parse, strict=strict)
+    if strict and parsed is not None and not isinstance(parsed, dict):
+        raise ValueError(f"Managed configuration is not a mapping: {path}")
     return parsed if isinstance(parsed, dict) else {}
 
 
-def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")) or {})
+def load_managed_config(*, strict: bool = False) -> dict:
+    """Parsed administrator config; strict reads refuse failed inspection."""
+    return _load_managed_file(
+        "config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")),
+        strict=strict,
+    )
 
 
-def load_managed_env() -> Dict[str, str]:
-    """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
-    return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env)
+def load_managed_env(*, strict: bool = False) -> Dict[str, str]:
+    """Parsed managed environment; strict reads refuse failed inspection."""
+    return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env, strict=strict)
 
 
 def _parse_managed_env(path: Path) -> Dict[str, str]:
-    from agent.secret_scope import load_env_file
+    from agent.secret_scope import _parse_env_text
 
-    path.read_text(encoding="utf-8-sig")  # load_env_file swallows decode errors; an admin file must fail LOUD
-    return load_env_file(path)
+    return _parse_env_text(path.read_text(encoding="utf-8-sig"))
 
 
-def apply_managed_overlay(config: dict) -> dict:
+def apply_managed_overlay(config: dict, *, strict: bool = False) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
     shadow a managed literal via a ref they control; a bare root ``model: x/y`` string is promoted
     to ``model.default`` so it can't clobber the dict shape callers expect; managed values
-    deep-merge ON TOP per leaf while sibling keys stay user-controlled. Fail-open: returns
-    ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
+    deep-merge ON TOP per leaf while sibling keys stay user-controlled. Ordinary readers
+    fail open; strict inspection raises instead of silently dropping administrator policy.
     """
     try:
-        managed = load_managed_config()
+        managed = load_managed_config(strict=True) if strict else load_managed_config()
         if not managed:
             return config
-        # Imported lazily to avoid an import cycle (config imports managed_scope).
-        from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
+        from hermes_cli.config_primitives import _deep_merge, _expand_env_vars, _normalize_root_model_keys
         managed_expanded = _normalize_root_model_keys(_expand_env_vars(managed))
         # _normalize_root_model_keys only promotes the string when root provider/base_url
         # keys exist to migrate; handle the bare case here (matches cli.py) so _deep_merge
@@ -144,7 +150,9 @@ def apply_managed_overlay(config: dict) -> dict:
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
         return _deep_merge(config, managed_expanded)
-    except Exception:  # noqa: BLE001 — overlay must never break a caller
+    except Exception:  # noqa: BLE001 — ordinary runtime must remain available
+        if strict:
+            raise
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
 

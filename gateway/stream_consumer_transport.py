@@ -12,6 +12,7 @@ import time
 from typing import Any, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
+from gateway.delivery_handoff import normalize_delivery_result
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from hermes_cli.observability.shared_metrics_gateway import stops_reply_clock
 
@@ -104,26 +105,25 @@ class StreamTransportMixin:
         return stale_ids
 
     async def _delete_previews(self, stale_ids, *, skip=None, label: str,
-                               retry_on_false: bool = False, skip_sentinel: bool = True) -> None:
-        """Best-effort delete of stale previews; never the message just sent (``skip``)."""
+                               retry_on_false: bool = False, skip_sentinel: bool = True) -> set[str]:
+        """Return only IDs whose deletion the adapter confirmed."""
+        deleted_ids: set[str] = set()
         delete_fn = getattr(self.adapter, "delete_message", None)
         if delete_fn is None:
-            return
+            return deleted_ids
         for stale_id in stale_ids:
             if not stale_id or stale_id == skip or (skip_sentinel and stale_id == "__no_edit__"):
                 continue
             try:
                 deleted = await delete_fn(self.chat_id, stale_id)
                 if retry_on_false and deleted is False:
-                    # Telegram's delete_message reports failure by returning False, not raising. The same
-                    # flood window that broke the finalize edit can reject this delete too, leaving the
-                    # preview bubble next to the fresh final (#71047 Problem B). One short bounded retry
-                    # clears the common transient case; a second failure stays best-effort.
                     await asyncio.sleep(1.0)
-                    await delete_fn(self.chat_id, stale_id)
+                    deleted = await delete_fn(self.chat_id, stale_id)
+                if deleted is True:
+                    deleted_ids.add(str(stale_id))
             except Exception as e:
                 logger.debug("%s preview cleanup failed (%s): %s", label, stale_id, e)
-
+        return deleted_ids
     def _resolve_draft_streaming(self) -> bool:
         """cfg.transport "draft"/"auto" → the adapter's supports_draft_streaming probe
         ("draft" logs the downgrade); "edit"/"off" → False."""
@@ -179,6 +179,7 @@ class StreamTransportMixin:
         else:
             if getattr(result, "success", False):
                 self._last_sent_text = text  # parity with the edit-based no-op skip
+                self._last_sent_cursor_appended = False
                 return True
             # P5(b): an AUTHORIZATION decline is terminal for the whole run, not
             # merely "drafts are unusable". Disabling drafts alone routes the
@@ -192,7 +193,7 @@ class StreamTransportMixin:
                     "suppressing every later send for this run (the destination "
                     "is not approved for this connection)"
                 )
-                self._egress_declined = True
+                self._retain_egress_decline(result, attempted_content=text)
             logger.debug("send_draft returned success=False, disabling draft transport: %s",
                          getattr(result, "error", "unknown"))
         self._draft_failures += 1
@@ -279,22 +280,46 @@ class StreamTransportMixin:
         # after a split, deleting sealed heads would erase delivered text.
         if self._turn_split_delivery:
             return False
+        if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+            return False
         stale_ids = self._stale_preview_ids()
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+            result = normalize_delivery_result(result)
         except Exception as e:
+            from gateway.platforms.base import SendResult
+            uncertain = normalize_delivery_result(
+                SendResult(success=False, error=str(e) or type(e).__name__), exception=e)
+            if (uncertain.raw_response or {}).get("delivery_ambiguous"):
+                self._retain_delivery_remainder(
+                    self._clean_for_display(text),
+                    SendResult(success=False, error=uncertain.error, raw_response={
+                        "delivery_ambiguous": True, "remaining_content": text,
+                        "model_remaining_content": text, "attachment_remaining_content": ""}))
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
         if not getattr(result, "success", False):
+            from gateway.relay.egress import declined_send
+            if declined_send(result):
+                self._retain_egress_decline(result, attempted_content=text)
+                return False
+            raw = result.raw_response if isinstance(getattr(result, "raw_response", None), dict) else {}
+            if raw.get("remaining_content") or raw.get("delivery_ambiguous"):
+                self._retain_delivery_remainder(self._clean_for_display(text), result)
             return False
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
-        await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
+        deleted = await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
+        if self._delivery_handoff is not None:
+            self._delivery_handoff = self._delivery_handoff.without_deleted(deleted)
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
+        self._retain_delivery_remainder(
+            self._clean_for_display(text), result, attempted_content=text)
         self._already_sent = True
         self._last_sent_text = text
+        self._last_sent_cursor_appended = False
         if is_turn_final:
             self._final_response_sent = True
             self._record_turn_final_payload(text)
@@ -311,10 +336,13 @@ class StreamTransportMixin:
 
     @stops_reply_clock
     async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True) -> bool:
+        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+    ) -> bool:
         """Send or edit the streaming message; True if delivered.  ``finalize`` marks the
         last edit.  Transport order: native frame → draft frame → edit existing → first
         send; a transport returns None to fall through to the next."""
+        if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+            return False  # the final bracket owns the failed or uncertain remainder
         text = self._clean_for_display(text)
         # Stream-is-the-message draft frames must stay prefix-stable: a closing ```
         # on a mid-code-block frame makes frame N not a prefix of N+1 and the
@@ -367,6 +395,13 @@ class StreamTransportMixin:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
         except Exception as e:
+            from gateway.platforms.base import SendResult
+            self._retain_delivery_remainder(
+                self._clean_for_display(self._stream_ledger or text),
+                SendResult(success=False, error=str(e) or type(e).__name__, raw_response={
+                    "delivery_ambiguous": True, "remaining_content": text,
+                    "model_remaining_content": text, "attachment_remaining_content": ""}),
+                attempted_content=text)
             logger.error("Stream send/edit error: %s", e)
             return False
 
@@ -394,26 +429,55 @@ class StreamTransportMixin:
         # renders the bytes before the ack, so a gateway join-cancel mid-wait must not
         # strand final_content_delivered=False and duplicate the send (docs/rca-wecom-
         # stream-final-ack-timeout-duplicate.md).  A definitive failure rolls it back.
+        prior_handoff = self._delivery_handoff
         if finalize:
-            self._mark_final_delivered(record=text)  # recorded: stale frame can't suppress
-        if await self._try_frame(self._send_frame(text, finalize=finalize),
-                                 "send_stream_frame raised, disabling native streaming: %s"):
+            from gateway.platforms.base import SendResult
+            self._retain_delivery_remainder(
+                self._clean_for_display(text),
+                SendResult(success=False, error="native final frame acknowledgement pending",
+                           raw_response={"delivery_ambiguous": True,
+                                         "remaining_content": text,
+                                         "model_remaining_content": text,
+                                         "attachment_remaining_content": ""}))
+            self._mark_final_delivered(record=text)
+        if finalize:
+            try:
+                frame_ok = bool(await self._send_frame(text, finalize=True))
+            except Exception as exc:
+                logger.debug("send_stream_frame raised, final ACK unknown: %s", exc)
+                frame_ok = None
+        else:
+            frame_ok = await self._try_frame(
+                self._send_frame(text, finalize=False),
+                "send_stream_frame raised, disabling native streaming: %s")
+        if frame_ok:
+            if finalize:
+                from gateway.platforms.base import SendResult
+                self._retain_delivery_remainder(
+                    self._clean_for_display(text),
+                    SendResult(success=True, delivered_text=self._clean_for_display(text)),
+                    resolve_attempt=True)
             self._already_sent = True
             self._last_sent_text = text
+            self._last_sent_cursor_appended = False
             self._native_last_pushed_len = len(text)
             if finalize:
                 self._mark_final_delivered()
             return True
 
-        # Definitive failure: roll back the optimistic mark so the edit/send
-        # fallback delivers exactly once.
+        # A returned False is a definitive rejection; an exception or cancellation
+        # cannot revoke the uncertain receipt for a possibly rendered final frame.
         if finalize:
             self._final_response_sent = False
             self._final_content_delivered = False
             self._delivered_final_text = None
+            if frame_ok is False:
+                self._delivery_handoff = prior_handoff
         # Subsequent frames take the edit/send fallback; the adapter marks the chat
         # expired so it doesn't retry the dead stream.
         self._use_native_streaming = False
+        if finalize and frame_ok is None:
+            return False  # unknown ACK: no second inline send
         # Best-effort close of an opened bubble (the seed frame has zero length but
         # still opens it).  DO NOT mark delivered: the frame closes the bubble but
         # WeCom may not render the content (errcode 6000 race).
@@ -460,11 +524,27 @@ class StreamTransportMixin:
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
             metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+        result = normalize_delivery_result(result)
         if not result.success:
+            from gateway.relay.egress import declined_send
+            if declined_send(result):
+                self._retain_egress_decline(result, attempted_content=text)
+            else:
+                self._retain_delivery_remainder(
+                    self._clean_for_display(self._stream_ledger or text), result,
+                    attempted_content=text)
             self._edit_supported = False
             return False
+        self._retain_delivery_remainder(
+            self._clean_for_display(self._stream_ledger or text), result,
+            attempted_content=text)
         self._already_sent = True
         self._last_sent_text = text
+        self._last_sent_cursor_appended = bool(
+            not finalize and self.cfg.cursor and text.endswith(self.cfg.cursor)
+            and (model_frame := self._clean_for_display(
+                self._accumulated if self._turn_split_delivery else self._stream_ledger or "")) != text
+            and model_frame.startswith(text[:-len(self.cfg.cursor)]))
         if result.message_id:
             self._adopt_message_id(result.message_id)
             self._track_preview_ids_from_result(result)
@@ -494,8 +574,11 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
+        if self._delivery_handoff is not None and self._delivery_handoff.blocked:
+            return False
         result = await self._edit_message(message_id=self._message_id, content=text,
                                           finalize=finalize)
+        result = normalize_delivery_result(result)
         if not result.success:
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
@@ -505,6 +588,9 @@ class StreamTransportMixin:
             # changed on screen, so the visible prefix and flood state stay as they were and the
             # next tick retries with the newer text.
             return True
+        self._retain_delivery_remainder(
+            self._clean_for_display(self._stream_ledger or text), result,
+            edited_message_id=str(self._message_id), attempted_content=text)
         self._already_sent = True
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
@@ -516,9 +602,15 @@ class StreamTransportMixin:
             self._turn_split_delivery = True
             self._adopt_message_id(str(result.message_id))
             self._last_sent_text = ""
+            self._last_sent_cursor_appended = False
             self._notify_new_message()
         else:
             self._last_sent_text = text
+            self._last_sent_cursor_appended = bool(
+                not finalize and self.cfg.cursor and text.endswith(self.cfg.cursor)
+                and (model_frame := self._clean_for_display(
+                    self._accumulated if self._turn_split_delivery else self._stream_ledger or "")) != text
+                and model_frame.startswith(text[:-len(self.cfg.cursor)]))
         self._flood_strikes = 0
         return True
 
@@ -546,8 +638,14 @@ class StreamTransportMixin:
                 "every later send for this run (the destination is not "
                 "approved for this connection)"
             )
-            self._egress_declined = True
+            self._retain_egress_decline(
+                result, attempted_content=text, edited_message_id=str(self._message_id))
             self._edit_supported = False
+            return False
+        raw_response = result.raw_response if isinstance(getattr(result, "raw_response", None), dict) else {}
+        if (raw_response.get("remaining_content") or raw_response.get("delivery_ambiguous")) and self._retain_delivery_remainder(
+            self._clean_for_display(self._stream_ledger or text), result,
+            edited_message_id=str(self._message_id), attempted_content=text):
             return False
         turn_final = finalize and is_turn_final
         if (turn_final and self.cfg.cursor and self._last_sent_text.endswith(self.cfg.cursor)
@@ -570,6 +668,7 @@ class StreamTransportMixin:
             delivered_prefix = raw_response.get("delivered_prefix")
             if isinstance(delivered_prefix, str) and delivered_prefix:
                 self._last_sent_text = delivered_prefix
+                self._last_sent_cursor_appended = False
                 self._fallback_preserve_partial_messages = text.startswith(delivered_prefix)
                 self._enter_fallback_mode(delivered_prefix)
             else:

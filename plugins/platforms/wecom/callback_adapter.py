@@ -7,6 +7,7 @@ import asyncio
 import logging
 import socket as _socket
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Untrusted pre-auth bodies are parsed with defusedxml (billion-laughs / XXE).
@@ -70,11 +71,17 @@ def ensure_wecom_callback_requirements() -> bool:
         import defusedxml.ElementTree as _ET
         return {"ET": _ET, "DEFUSEDXML_AVAILABLE": True}
 
+    from pm.platform_requirements import ensure_platform_dependencies
+
     try:
-        from pm.extras import ensure_and_bind
-    except Exception:  # pragma: no cover — defensive
+        ensure_platform_dependencies("wecom_callback", Path(__file__).with_name("plugin.yaml"))
+    except Exception as exc:
+        logger.warning("WeCom callback dependencies unavailable: %s", exc)
         return False
-    if not ensure_and_bind("wecom", _import, globals()):
+    try:
+        globals().update(_import())
+    except ImportError as exc:
+        logger.warning("WeCom callback import after installing dependencies failed: %s", exc)
         return False
     return check_wecom_callback_requirements()
 

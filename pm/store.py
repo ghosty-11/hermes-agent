@@ -361,12 +361,39 @@ class Store:
                                progress=tick, pause_event=pause_event)[0]
 
     def fetch_many(self, artifacts: list[dict], scratch: Path, *, progress=None,
-                   pause_event: threading.Event | None = None) -> list[Path]:
+                   pause_event: threading.Event | None = None, offline: bool = False) -> list[Path]:
         """Fetch a pinned plan with one aggregate progress stream.
 
         Completed archives enter the cache even if a later source pauses.
         The downloader owns partial bytes outside this disposable scratch.
         """
+        if offline:
+            import hashlib
+            from pm.package import InstallError
+            from pm.paths import store_root
+
+            cached = []
+            for artifact in artifacts:
+                if pause_event is not None and pause_event.is_set():
+                    from pm.downloader import DownloadPaused
+                    raise DownloadPaused("download paused")
+                found = None
+                for root in dict.fromkeys((self.root, store_root())):
+                    entry = root / f"fetch-{artifact['sha256']}"
+                    files = list(entry.iterdir()) if entry.is_dir() else []
+                    if len(files) != 1 or not files[0].is_file():
+                        continue
+                    digest = hashlib.sha256()
+                    with files[0].open("rb") as stream:
+                        for block in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(block)
+                    if digest.hexdigest() == artifact["sha256"]:
+                        found = files[0]
+                        break
+                if found is None:
+                    raise InstallError("pm", f"offline cache misses verified archive {artifact['sha256']}")
+                cached.append(found)
+            return cached
         from pm.downloader import Download, DownloadPaused
         from pm.artifact_mirror import pinned_source
 

@@ -26,9 +26,7 @@ from urllib.parse import urlparse
 
 from agent.i18n import t
 from agent.secret_scope import is_multiplex_active
-from gateway.platforms._shared import (
-    get_scoped_secret as _get_scoped_secret, seed_extra_from_env as _seed_extra_from_env, send_error
-)
+from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
 
 from .cards import card_spec_to_cards_v2, format_message as _format_message
 
@@ -201,18 +199,8 @@ def ensure_google_chat_deps() -> bool:
     global _google_modules_loaded, GOOGLE_CHAT_AVAILABLE
     if GOOGLE_CHAT_AVAILABLE:
         return True
-    from pm import InstallError, ensure_import
-    # Request BOTH extras before surfacing a failure: a successful install raises
-    # InstallError("restart Hermes to activate…") for the first extra, and aborting
-    # there would leave the second uninstalled — the restart would land back here.
-    failures: list[InstallError] = []
-    for extra in ("google", "google-chat"):
-        try:
-            ensure_import(extra)
-        except InstallError as exc:
-            failures.append(exc)
-    if failures:
-        raise failures[0]
+    from pm.platform_requirements import ensure_platform_dependencies
+    ensure_platform_dependencies("google_chat", _Path(__file__).with_name("plugin.yaml"))
     _google_modules_loaded = False
     return _load_google_modules()
 
@@ -1557,20 +1545,15 @@ class GoogleChatAdapter(BasePlatformAdapter):
 # -- plugin entry point -----------------------------------------------------
 def _validate_config(config: PlatformConfig) -> bool:
     """Plugin-side config gate for HTTP callback or Pub/Sub inbound modes."""
-    extra = getattr(config, "extra", {}) or {}
-    return bool(extra.get("http_events_url") or (extra.get("project_id") and extra.get("subscription_name")))
+    from gateway.platform_configuration import google_chat_inbound
+    return google_chat_inbound(getattr(config, "extra", {}) or {}, lambda _name: None)
 
 
-def _env_inbound_settings() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """(project, subscription, http_events_url) from the scoped env, with legacy fallbacks."""
-    project = _get_scoped_secret("GOOGLE_CHAT_PROJECT_ID") or _get_scoped_secret("GOOGLE_CLOUD_PROJECT")
-    subscription = _get_scoped_secret("GOOGLE_CHAT_SUBSCRIPTION_NAME") or _get_scoped_secret("GOOGLE_CHAT_SUBSCRIPTION")
-    return project, subscription, _get_scoped_secret("GOOGLE_CHAT_HTTP_EVENTS_URL")
 
 
 def _env_inbound_configured() -> bool:
-    project, subscription, http_events_url = _env_inbound_settings()
-    return bool(http_events_url or (project and subscription))
+    from gateway.platform_configuration import google_chat_seed
+    return bool(google_chat_seed(_get_scoped_secret))
 
 
 def _check_for_registry() -> bool:
@@ -1584,27 +1567,10 @@ def _is_connected(config: PlatformConfig) -> bool:
     return bool(getattr(config, "enabled", False)) and _validate_config(config)
 
 
-_ENV_SEED_KEYS = (  # (env var, extra key, conv) for seed_extra_from_env
-    ("GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", "http_events_audience", None),
-    ("GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL", "http_events_service_account_email", None),
-    ("GOOGLE_CHAT_MAX_MESSAGES", "max_messages", None), ("GOOGLE_CHAT_MAX_BYTES", "max_bytes", None),
-    ("GOOGLE_CHAT_BOOTSTRAP_SPACES", "bootstrap_spaces", None), ("GOOGLE_CHAT_DEBUG_RAW", "debug_raw", None),
-)
-
-
 def _env_enablement() -> Optional[Dict[str, Any]]:
-    """``env_enablement_fn``: seed ``PlatformConfig.extra`` from the profile's env before the adapter exists
-    (so ``gateway status`` reflects env-only config); ``None`` when the minimum inbound settings are absent."""
-    if not _env_inbound_configured():
-        return None
-    project, subscription, http_events_url = _env_inbound_settings()
-    values = [("project_id", project), ("subscription_name", subscription), ("http_events_url", http_events_url),
-              ("service_account_json", _get_scoped_secret("GOOGLE_CHAT_SERVICE_ACCOUNT_JSON")
-               or _get_scoped_secret("GOOGLE_APPLICATION_CREDENTIALS"))]
-    seed = {extra_name: value for extra_name, value in values if value}
-    seed.update(_seed_extra_from_env(_ENV_SEED_KEYS, home_env="GOOGLE_CHAT_HOME_CHANNEL"))
-    return seed
-
+    """Seed only when a complete environment inbound mode exists."""
+    from gateway.platform_configuration import google_chat_seed
+    return google_chat_seed(_get_scoped_secret) or None
 
 
 _SETUP_WALKTHROUGH = """Google Chat needs a GCP project, a Pub/Sub topic + subscription,

@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from plugins import plugin_loader as _loader
 
 if TYPE_CHECKING:

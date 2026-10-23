@@ -2,9 +2,11 @@ name: Lazy-deps import guard
 
 # Rejects any tracked production code that imports tools/lazy_deps.py.
 # The pm migration reduced it to an old-updater stub that only raises or
-# stops for relaunch (pm.extras — available / ensure_import /
-# ensure_and_bind — is the only lazy-install surface), so a production
-# import never gets its dependencies.
+# stops for relaunch. Use pm.extras.passive_available() with selected search
+# paths for nonexecuting inspection; pm.extras.available() is an ordinary
+# finder-backed runtime probe. An active pm.extras.ensure_import install must
+# relaunch before importing dependencies; bundled install paths use explicit
+# platform manifests and adapter-owned rebinding.
 #
 # Runs unconditionally (no change-classifier gate): the stub
 # must stay unimported on every change, in any kind of PR — the same

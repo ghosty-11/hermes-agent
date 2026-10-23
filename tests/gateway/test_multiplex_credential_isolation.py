@@ -260,6 +260,7 @@ def test_cold_profile_hydrates_external_source_without_global_env(
                     overrode_env=False,
                 )
             },
+            activation_decisions={"fake-source": True},
         )
 
     monkeypatch.setattr(registry, "apply_all", _fake_apply_all)

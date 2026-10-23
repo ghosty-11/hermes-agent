@@ -79,15 +79,19 @@ def _enabled_from_config(config: dict[str, Any]) -> list[str]:
     return out
 
 
-def _is_directory(path: Path) -> bool:
+def _is_directory(path: Path, *, strict: bool = False) -> bool:
     import stat
-
     try:
-        return stat.S_ISDIR(path.stat().st_mode)
-    except FileNotFoundError:
+        directory = stat.S_ISDIR(path.stat().st_mode)
+    except FileNotFoundError as exc:
+        if strict:
+            raise ValueError(f"profile directory disappeared or has no readable target: {path}") from exc
         return False
     except OSError as exc:
         raise ValueError(f"could not inspect plugin directory: {path}") from exc
+    if strict and not directory:
+        raise ValueError(f"profile home is not a directory: {path}")
+    return directory
 
 
 def dependency_homes() -> list[Path]:
@@ -103,6 +107,9 @@ def dependency_homes() -> list[Path]:
 
     homes = [dependency_home_root()]
     root = _profiles_root()
+    from hermes_cli.config_paths import strict_directory_present
+    if not strict_directory_present(root):
+        return homes
     try:
         profiles = sorted(root.iterdir(), key=str)
     except FileNotFoundError:
@@ -110,8 +117,8 @@ def dependency_homes() -> list[Path]:
     except OSError as exc:
         raise ValueError(f"could not enumerate profiles: {root}") from exc
     homes.extend(profile for profile in profiles
-                 if _is_directory(profile) and profile.name != "default"
-                 and PROFILE_ID_RE.match(profile.name) and named_profile_is_live(profile))
+                 if profile.name != "default" and PROFILE_ID_RE.match(profile.name)
+                 and _is_directory(profile, strict=True) and named_profile_is_live(profile, strict=True))
     return homes
 
 

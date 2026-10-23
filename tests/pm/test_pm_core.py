@@ -404,7 +404,6 @@ def test_concurrent_installs_do_not_clobber(pm_env):
 
 def test_single_flight_one_store_entry(pm_env, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
-    from contextlib import contextmanager
     from http.server import SimpleHTTPRequestHandler
     from pm.install import ensure
 
@@ -412,13 +411,11 @@ def test_single_flight_one_store_entry(pm_env, monkeypatch):
     contenders = threading.Barrier(6)
     body_started, release_body = threading.Event(), threading.Event()
     bodies, stages = [], []
-    install_lock, do_get, stage = Store.install_lock, SimpleHTTPRequestHandler.do_GET, FakeTool.stage
+    do_get, stage = SimpleHTTPRequestHandler.do_GET, FakeTool.stage
 
-    @contextmanager
-    def contending(self):
-        contenders.wait(timeout=15)
-        with install_lock(self):
-            yield
+    def race():
+        contenders.wait(timeout=15)  # Meet before entering the serialized writer claim.
+        return ensure("faketool", base_env={})
 
     def body(self):
         if self.headers.get("Range") == "bytes=0-0":
@@ -432,11 +429,10 @@ def test_single_flight_one_store_entry(pm_env, monkeypatch):
         stages.append(self.name)
         return stage(self, *args)
 
-    monkeypatch.setattr(Store, "install_lock", contending)
     monkeypatch.setattr(SimpleHTTPRequestHandler, "do_GET", body)
     monkeypatch.setattr(FakeTool, "stage", staged)
     with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = [pool.submit(ensure, "faketool", base_env={}) for _ in range(6)]
+        futures = [pool.submit(race) for _ in range(6)]
         try:
             assert body_started.wait(15)
         finally:

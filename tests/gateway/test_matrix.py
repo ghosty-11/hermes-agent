@@ -684,8 +684,7 @@ class TestMatrixRequirements:
 
         import plugins.platforms.matrix.adapter as matrix_mod
         with patch.object(matrix_mod, "_check_e2ee_deps", return_value=False), \
-             patch("pm.extras.missing", return_value=()), \
-             patch("pm.extras.ensure_and_bind", return_value=True):
+             patch("pm.extras.missing", return_value=()):
             assert matrix_mod.check_matrix_requirements() is True
 
     def test_check_requirements_encryption_false_no_e2ee_deps_ok(self, monkeypatch):
@@ -750,38 +749,26 @@ class TestMatrixRequirements:
         with patch.object(builtins, "__import__", _blocking_import):
             assert _check_e2ee_deps() is False
 
-    def test_check_requirements_runs_lazy_install_when_partial(self, monkeypatch):
-        """When mautrix is installed but asyncpg/aiosqlite are missing,
-        check_matrix_requirements must still run the lazy installer.
+    def test_check_requirements_rejects_partial_sdk_when_install_refused(self, monkeypatch):
+        """A usable mautrix import cannot mask a missing crypto-store dependency."""
+        import pm
+        from pm import extras
+        import plugins.platforms.matrix.adapter as matrix_mod
 
-        Regression for #31116: the previous ``try: import mautrix`` gate
-        short-circuited the install of the OTHER 4 platform.matrix packages,
-        so a partial install (mautrix only) was treated as fully installed.
-        """
         monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
         monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
         monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
+        monkeypatch.delenv("MATRIX_E2EE_MODE", raising=False)
+        monkeypatch.setattr(extras, "missing", lambda _extra: ())
+        assert matrix_mod.check_matrix_requirements() is True
 
-        import plugins.platforms.matrix.adapter as matrix_mod
+        monkeypatch.setattr(extras, "missing", lambda _extra: ("asyncpg",))
 
-        # Simulate "mautrix installed, asyncpg missing" → extras.missing
-        # returns a non-empty tuple → ensure_and_bind MUST be called.
-        called = {"ensure_and_bind": False}
+        def refuse_install(_extra):
+            raise pm.InstallError("venv", "fixture dependency unavailable")
 
-        def _fake_ensure_and_bind(extra, importer, target_globals):
-            called["ensure_and_bind"] = True
-            assert extra == "matrix"
-            return True  # Pretend install succeeded.
-
-        with patch("pm.extras.missing", return_value=("asyncpg",)), \
-             patch("pm.extras.ensure_and_bind", side_effect=_fake_ensure_and_bind):
-            matrix_mod.check_matrix_requirements()
-
-        assert called["ensure_and_bind"], (
-            "check_matrix_requirements must call ensure_and_bind whenever ANY "
-            "platform.matrix dep is missing, not just when mautrix itself is "
-            "missing (#31116)"
-        )
+        monkeypatch.setattr(pm, "ensure_import", refuse_install)
+        assert matrix_mod.check_matrix_requirements() is False
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ test patches on ``update_cmd`` stay effective).
 """
 
 import logging
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 import os
 import shutil
 import subprocess
@@ -451,13 +451,17 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     return bool(restored.get("valid"))
 
 
-def _verify_and_restore_one_state_db(home: Path, *, label: str) -> None:
-    """Integrity check + auto-restore for ONE home's state.db from its newest valid snapshot.
-    Never raises: a guard that crashes the update tail is worse than what it detects."""
+def _verify_and_restore_one_state_db(home: Path, *, label: str, strict: bool = False) -> None:
+    """Integrity check and restore for one home; strict callers require recovery."""
     try:
         from hermes_cli.backup import _quick_snapshot_root, verify_sqlite_integrity
         state_path = home / "state.db"
-        if not state_path.exists():
+        if strict:
+            try:
+                state_path.stat()
+            except FileNotFoundError:
+                return
+        elif not state_path.exists():
             return
         ok = verify_sqlite_integrity(state_path, check_header=True, run_pragma=True)
         if ok.get("valid"):
@@ -466,12 +470,29 @@ def _verify_and_restore_one_state_db(home: Path, *, label: str) -> None:
         print()
         print(f"⚠ state.db is corrupted after update ({label}): " + ok.get("message", "unknown error"))
         snap_root = _quick_snapshot_root(home)
-        if not snap_root.exists():
+        if strict:
+            try:
+                snap_root.stat()
+            except FileNotFoundError:
+                print("  ⚠ No pre-update snapshot for this home")
+                raise RuntimeError("No pre-update state.db snapshot")
+        elif not snap_root.exists():
             print("  ⚠ No pre-update snapshot for this home")
             return
-        for snap_dir in sorted((d for d in snap_root.iterdir() if d.is_dir()), reverse=True):
+        for snap_dir in sorted(snap_root.iterdir(), reverse=True):
+            if strict:
+                import stat
+                if not stat.S_ISDIR(snap_dir.stat().st_mode):
+                    continue
+            elif not snap_dir.is_dir():
+                continue
             snap_state = snap_dir / "state.db"
-            if not snap_state.exists():
+            if strict:
+                try:
+                    snap_state.stat()
+                except FileNotFoundError:
+                    continue
+            elif not snap_state.exists():
                 continue
             if not verify_sqlite_integrity(snap_state, check_header=True, run_pragma=True).get("valid"):
                 continue
@@ -479,28 +500,32 @@ def _verify_and_restore_one_state_db(home: Path, *, label: str) -> None:
                 if _restore_state_db_from_snapshot(state_path, snap_state):
                     print(f"  ✓ Auto-restored from snapshot {snap_dir.name} ({label})")
                 else:
-                    print("  ✗ Auto-restore FAILED — restored copy also failed integrity")
+                    print("  ✗ Auto-restore refused or failed integrity")
+                    if strict:
+                        raise RuntimeError("State database snapshot restore refused or failed integrity")
             except OSError as exc:
                 print(f"  ✗ Auto-restore file copy failed: {exc}")
+                if strict:
+                    raise
             return
         print("  ⚠ No valid pre-update snapshot found for this home")
+        if strict:
+            raise RuntimeError("No valid pre-update state.db snapshot")
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"Post-update state.db guard failed ({label})") from exc
         logger.debug("Post-update state.db guard (%s) failed: %s", label, exc)
 
 
-def _verify_and_restore_state_dbs_post_update() -> None:
-    """Integrity guard for the ROOT state.db AND every sibling profile's (the snapshot covers
-    siblings, so the guard must too or a corrupt profile DB goes undetected).
-
-    See #97994.
-    """
+def _verify_and_restore_state_dbs_post_update(*, strict: bool = False) -> None:
+    """Guard root and every sibling database; strict sweeps refuse partial coverage."""
     from hermes_cli.update_cmd import get_hermes_home
     home = get_hermes_home()
-    _verify_and_restore_one_state_db(home, label="default home")
-    with _best_effort('Sibling-profile state.db guard sweep failed: %s'):
+    _verify_and_restore_one_state_db(home, label="default home", strict=strict)
+    with nullcontext() if strict else _best_effort('Sibling-profile state.db guard sweep failed: %s'):
         from hermes_cli.backup import _sibling_profile_homes
-        for name, profile_home in _sibling_profile_homes(home):
-            _verify_and_restore_one_state_db(profile_home, label=f"profile {name}")
+        for name, profile_home in _sibling_profile_homes(home, strict=strict):
+            _verify_and_restore_one_state_db(profile_home, label=f"profile {name}", strict=strict)
 
 
 def _invalidate_live_plugin_catalog_caches() -> None:
@@ -832,8 +857,8 @@ def _profile_skill_sync_status(r) -> str:
     return ", ".join(parts) if parts else "up to date"
 
 
-def _sync_profiles_after_update() -> None:
-    """Best-effort per-profile syncs: bundled skills, ``.env`` backfill, Honcho profiles."""
+def _sync_profiles_after_update(*, offline: bool = False) -> None:
+    """Best-effort local per-profile syncs; offline never creates remote Honcho peers."""
     # All profiles incl. the active one: seed_profile_skills() subprocesses with an explicit
     # HERMES_HOME, so sync_skills()'s module-level HERMES_HOME cache can't skew it.
     with suppress(Exception):
@@ -858,11 +883,15 @@ def _sync_profiles_after_update() -> None:
             print()
             print(f"→ Seeded .env for {len(backfilled)} profile(s) (copied from default): {', '.join(backfilled)}")
 
-    with suppress(Exception):
-        from plugins.memory import import_provider_module
-        synced = import_provider_module("honcho", "cli").sync_honcho_profiles_quiet()
-        if synced:
-            print(f"\n-> Honcho: synced {synced} profile(s)")
+    if not offline:
+        with suppress(Exception):
+            from plugins.memory import import_provider_module
+            synced = import_provider_module("honcho", "cli").sync_honcho_profiles_quiet()
+            if synced:
+                print(f"\n-> Honcho: synced {synced} profile(s)")
+    else:
+        from hermes_cli.update_receipt import record_skip
+        record_skip("honcho_profiles", "offline: remote profile peers not attempted")
 
 
 def _refresh_cua_driver_after_update() -> None:
@@ -929,7 +958,7 @@ def _print_checkpoint_footprint_notice() -> None:
         print(f"\n\033[1;33mℹ  {notice}\033[0m")
 
 
-def _print_post_update_notices_and_self_heals() -> None:
+def _print_post_update_notices_and_self_heals(*, offline: bool = False) -> None:
     """Best-effort notices (FTS optimize, curator) and self-heals (FHS PATH, ACP launcher,
     Windows bin launchers, cua-driver refresh) that run after the summary."""
     from hermes_cli.update_cmd import _m, _print_curator_first_run_notice, _print_curator_recent_run_notice
@@ -956,6 +985,11 @@ def _print_post_update_notices_and_self_heals() -> None:
         # generate each profile's relay-plugins.toml instead of leaving exports silently dead.
         ('Relay exporter migration failed: %s', _migrate_relay_exporter_env),
     ):
+        if offline and step in (_refresh_cua_driver_after_update, _install_default_tools_after_update):
+            from hermes_cli.update_receipt import record_skip
+            record_skip("cua_driver_refresh" if step is _refresh_cua_driver_after_update else "optional_default_tools",
+                        "offline: optional remote acquisition not attempted")
+            continue
         with _best_effort(message):
             step()
 
@@ -967,7 +1001,7 @@ def _migrate_relay_exporter_env() -> None:
 
 def _run_post_update_maintenance(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, had_desktop_app_before_update,
-    pre_update_version, completion_message=None,
+    pre_update_version, completion_message=None, offline: bool = False,
 ) -> bool:
     """Post-build housekeeping and completion, returning the SQLite runtime verdict.
 
@@ -999,19 +1033,23 @@ def _run_post_update_maintenance(
         logger.debug("macOS TCC anchor refresh skipped", exc_info=True)
 
     # state.db integrity guard for root home AND every profile; restore from own snapshot.
-    with _best_effort('Post-update state.db integrity check failed: %s'):
-        _verify_and_restore_state_dbs_post_update()
+    with nullcontext() if offline else _best_effort('Post-update state.db integrity check failed: %s'):
+        _verify_and_restore_state_dbs_post_update(strict=offline)
 
     # Both shallow history and missing tags can hide the release identity.
     # Refresh them before the completion line and install stamp read it.
-    try:
-        from hermes_cli.gitlock import fetch_full_commit_graph
-        from hermes_cli.update_cmd import _no_prompt_git_kwargs
-        if fetch_full_commit_graph(Path(_m().PROJECT_ROOT), **_no_prompt_git_kwargs()):
-            print("  ✓ Fetched release history (commits only) for version identity")
-    except (OSError, subprocess.SubprocessError) as exc:
-        detail = (getattr(exc, "stderr", None) or str(exc)).strip().splitlines()[-1:] or [type(exc).__name__]
-        print(f"  ⚠ Could not refresh release history ({detail[0]}); the version label may be stale or unknown until the next update")
+    if offline:
+        from hermes_cli.update_receipt import record_skip
+        record_skip("release_history", "offline: origin history refresh not attempted")
+    else:
+        try:
+            from hermes_cli.gitlock import fetch_full_commit_graph
+            from hermes_cli.update_cmd import _no_prompt_git_kwargs
+            if fetch_full_commit_graph(Path(_m().PROJECT_ROOT), **_no_prompt_git_kwargs()):
+                print("  ✓ Fetched release history (commits only) for version identity")
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail = (getattr(exc, "stderr", None) or str(exc)).strip().splitlines()[-1:] or [type(exc).__name__]
+            print(f"  ⚠ Could not refresh release history ({detail[0]}); the version label may be stale or unknown until the next update")
 
     # Seed the model-catalog cache from the checkout instead of a bot-gated, flaky fetch.
     with _best_effort('Model catalog seed during update failed: %s'):
@@ -1030,10 +1068,11 @@ def _run_post_update_maintenance(
         print("→ Syncing bundled skills...")
         _print_bundled_skills_sync_report()
 
-    _sync_profiles_after_update()
+    _sync_profiles_after_update(**({"offline": True} if offline else {}))
 
     _check_and_apply_config_migration(
         assume_yes=assume_yes, gateway_mode=gateway_mode, pre_update_snapshot_id=pre_update_snapshot_id,
+        **({"offline": True} if offline else {}),
     )
 
     print()
@@ -1045,5 +1084,5 @@ def _run_post_update_maintenance(
         for line in [*consume_rewritten_notice(), *recorded_standalone_warning_lines()]:
             print(line)
 
-    _print_post_update_notices_and_self_heals()
+    _print_post_update_notices_and_self_heals(**({"offline": True} if offline else {}))
     return update_complete

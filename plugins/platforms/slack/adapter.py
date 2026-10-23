@@ -327,11 +327,7 @@ class _NativeTaskCardStream:
 
 
 def check_slack_requirements() -> bool:
-    """Check if Slack dependencies are available.
-
-    Lazy-installs the ``slack`` pyproject extra via ``pm.extras.ensure_and_bind``
-    on first call if not present. Rebinds all module-level globals on success.
-    """
+    """Install Slack's declared dependencies and rebind SDK globals."""
     if SLACK_AVAILABLE:
         return True
 
@@ -344,9 +340,20 @@ def check_slack_requirements() -> bool:
             "AsyncApp": AsyncApp, "AsyncSocketModeHandler": AsyncSocketModeHandler,
             "AsyncWebClient": AsyncWebClient, "aiohttp": aiohttp, "SLACK_AVAILABLE": True}
 
-    from pm.extras import ensure_and_bind
+    from pm.platform_requirements import ensure_platform_dependencies
 
-    return ensure_and_bind("slack", _import, globals())
+    try:
+        ensure_platform_dependencies("slack", _Path(__file__).with_name("plugin.yaml"))
+    except Exception as exc:
+        logger.warning("Slack dependencies unavailable: %s", exc)
+        return False
+    try:
+        bindings = _import()
+    except ImportError as exc:
+        logger.warning("Slack import after installing dependencies failed: %s", exc)
+        return False
+    globals().update(bindings)
+    return True
 
 
 def _collect_slack_block_mentions(blocks: list) -> list:

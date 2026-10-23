@@ -26,7 +26,7 @@ from hermes_cli.update_channel import adopt_retired_channel
 from pm.receipt import accept_worker_receipt as _accept_completion_pm_receipt
 from hermes_cli import update_receipt as _completion_receipt, update_cmd_config as _completion_config
 from hermes_cli._old_updater import stop_for_relaunch
-from hermes_cli._early_recovery import git_operation_in_progress, interrupted_pull_marker
+from hermes_cli._early_recovery import git_operation_in_progress, interrupted_pull_marker, local_transaction_marker
 from hermes_cli import update_cmd_check as _check
 
 # Re-exports: every split-module name stays reachable (and monkeypatchable) as update_cmd.<name>.
@@ -578,10 +578,13 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
 
     child_env = dict(os.environ if env is None else env)
     child_env.setdefault("PYTHONUNBUFFERED", "1")
-    spawn = {"creationflags": windows_hide_flags()} if os.name == "nt" else {"process_group": 0}
-    proc = subprocess.Popen(
-        cmd, cwd=cwd, env=child_env, stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **spawn)
+    from pm.writer_claim import child_spawn
+    spawn = ({"creationflags": windows_hide_flags()} if os.name == "nt" else
+             {} if os.environ.get("HERMES_LOCAL_UPDATE_CONTEXT") == "1" else {"process_group": 0})
+    with child_spawn(child_env) as handed:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=child_env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **spawn, **handed)
     # read1 delivers partial lines too; incremental decoding preserves split UTF-8
     # and the universal-newline behavior callers previously got from text=True.
     decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), True)
@@ -687,11 +690,13 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
 
 
 def _base_git_cmd() -> list[str]:
-    """``git`` argv; Windows adds ``-c windows.appendAtomically=false`` (git can fail "unable to
-    write loose object file: Invalid argument" on non-atomic appends)."""
+    """``git`` argv. On POSIX automatic gc/maintenance is off: started by a fetch it
+    detaches and keeps writing the checkout after the update lock is released.
+    Windows keeps upstream's ``-c windows.appendAtomically=false`` only (git can fail
+    "unable to write loose object file: Invalid argument" on non-atomic appends)."""
     if sys.platform == "win32":
         return ["git", "-c", "windows.appendAtomically=false"]
-    return ["git"]
+    return ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0"]
 
 
 def _is_shallow_checkout(git_cmd) -> bool:
@@ -732,6 +737,7 @@ def _source_completion_request(opts, plan, snapshot_id, windows_resume, desktop,
         "sibling_snapshots": deepcopy(_completion_config._LAST_SIBLING_SNAPSHOTS),
         "plan": plan.to_dict() if plan is not None else None,
         "receipt": deepcopy(current.data), "windows_resume": windows_resume,
+        "offline": False,
     }
 
 
@@ -1239,9 +1245,7 @@ def _begin_update_receipt_and_plan(args):
 
 
 def _record_update_initiator() -> None:
-    """We hold the update lock, so a claim naming another pid is our orchestrator's: the Desktop
-    hand-off (posix shim, windows script, Tauri updater) — the metric's ``kind``. Read the marker
-    raw: a liveness probe or stale-marker cleanup is lock policy, not a metrics side effect."""
+    """Record the updater origin from the display marker without changing lock state."""
     with _best_effort('Update initiator unavailable: %s'):
         from hermes_cli.update_lock import update_marker_path
         first = update_marker_path().read_text(encoding="utf-8-sig").partition("\n")[0].strip()
@@ -1430,12 +1434,157 @@ def _apply_pulled_update(
     _complete_source_update(completion_request)
 
 
+def _cmd_local_update(args, *, gateway_mode: bool) -> None:
+    """One locked local transaction; never use the channel/fetch/ZIP path."""
+    from hermes_cli.update_local import (
+        prepare_local_source, transfer_local_source, local_git, refuse_active_backups)
+    from hermes_cli.local_update_rollback import (
+        capture_local_update_capsule, seal_local_update_capsule, restore_local_update_capsule)
+
+    root = _m().PROJECT_ROOT.resolve()
+    home = get_hermes_home()
+    if getattr(args, "source_repo", None) and os.environ.get("HERMES_LOCAL_UPDATE_CONTEXT") != "1":
+        from hermes_cli.local_update_snapshot import freeze_target
+        from pm.writer_claim import child_spawn
+        from pm.process_scope import retained_directory, owned_spawn, require_child_quiescence
+
+        source, target = Path(args.source_repo).resolve(), args.target
+        prepare_local_source(root, source, target)
+        with retained_directory(prefix="hermes-target-snapshot-") as temporary:
+            snapshot = freeze_target(source, target, Path(temporary) / "snapshot")
+            command = [sys.executable, "-I", "-S", str(snapshot / "hermes_cli/local_update_entry.py"),
+                       str(root), str(home), str(snapshot), target, *getattr(args, "required_extra", [])]
+            environment = dict(os.environ, HERMES_INSTALL_ROOT=str(root))
+            status = snapshot.parent / "not-quiescent.json"
+            environment["HERMES_LOCAL_RETAINED_STATUS"] = str(status)
+            with child_spawn(environment) as spawn, \
+                    owned_spawn(spawn, environment, retained=[snapshot]) as scope:
+                proc = scope.spawn(command, cwd=root, env=environment)
+                result = proc.wait()
+                scope.finish()
+            require_child_quiescence(status, [snapshot])
+            if result:
+                raise RuntimeError(f"frozen local update exited {result}")
+        return
+    operation = git_operation_in_progress(root)
+    if operation:
+        raise RuntimeError(f"Git {operation} is in progress; local update refused")
+    if getattr(args, "rollback_local_update", None):
+        plan = _begin_update_receipt_and_plan(args)
+        if plan is None or plan.runtimes:
+            raise RuntimeError("stop affected fleet runtimes before local rollback")
+        refuse_active_backups(home)
+        outcome = restore_local_update_capsule(
+            Path(args.rollback_local_update), expected_install_root=root, expected_hermes_home=home,
+            acknowledge_data_rollback=args.acknowledge_data_rollback)
+        _write_fleet_restart_pending_marker(expected_sha=outcome["before"])
+        _completion_receipt.record_stage("apply", "success", mode="local-rollback")
+        from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON, finalize_pending_update_receipt
+        if finalize_pending_update_receipt(0, COMMAND_BOUNDARY_STOP_REASON) is None:
+            raise RuntimeError("local rollback receipt was not published; recovery marker retained")
+        from pm.filesystem import durable_unlink
+        pending = local_transaction_marker(root)
+        if pending.exists() or pending.is_symlink():
+            durable_unlink(pending)
+        print(f"✓ Local rollback verified at {outcome['before']}; fleet restart remains pending")
+        return
+
+    source, target = Path(args.source_repo).resolve(), args.target
+    before = prepare_local_source(root, source, target)
+    plan = _begin_update_receipt_and_plan(args)
+    if plan is None or plan.runtimes:
+        raise RuntimeError("stop affected fleet runtimes before local update")
+    refuse_active_backups(home)
+    # Quick snapshots are maintenance safety nets, not the full rollback image.
+    backup_mode = _resolve_pre_update_backup_mode(args)
+    if backup_mode == "full":
+        from hermes_cli.update_cmd_maint import _run_quick_snapshots
+        from hermes_cli.backup import create_pre_update_backup
+        snapshot_id = _run_quick_snapshots()
+        if not snapshot_id or create_pre_update_backup() is None:
+            raise RuntimeError("full pre-update backup failed; checkout unchanged")
+    else:
+        snapshot_id = _m()._run_pre_update_backup(args)
+    _record_pre_update_backup_outcome(args, snapshot_id)
+    _record_snapshot_stage(args, snapshot_id)
+    if not snapshot_id:
+        raise RuntimeError("local update requires a successful quick snapshot before checkout")
+    import tempfile
+    from hermes_cli.local_update_preflight import stage_local_inputs
+    from hermes_cli.local_update_rollback import (
+        _capsule_authority, _read_manifest, verify_local_update_preimage)
+
+    opts = _resolve_update_options(args, gateway_mode)
+    from pm.process_scope import ProcessStillRunning, retained_directory
+    with retained_directory(prefix="hermes-local-preflight-") as temporary:
+        extras = stage_local_inputs(source, root, Path(temporary),
+                                    getattr(args, "required_extra", []))
+        # Object transfer changes no branch or active selection. Keep the
+        # validated private bytes until the selected worker has finished.
+        transfer_local_source(root, source, target)
+        if prepare_local_source(root, source, target) != before:
+            raise RuntimeError("installed checkout changed during local object transfer")
+        capsule = capture_local_update_capsule(root, home, source, target)
+        _completion_receipt.record_fact("local_rollback_manifest", str(capsule))
+        request = _source_completion_request(opts, plan, snapshot_id, None, False, gateway_mode)
+        request.update(offline=True, no_gateway_restart=True, expected_sha=target,
+                       apply_mode="local", branch=_current_branch_name(_base_git_cmd()),
+                       local_rollback_manifest=str(capsule), required_extras=extras,
+                       staged_tools=str(Path(temporary) / "tools"))
+        pending = local_transaction_marker(root)
+        verify_local_update_preimage(capsule, expected_install_root=root, expected_hermes_home=home)
+        if pending.exists():
+            raise RuntimeError("an earlier local transaction requires explicit recovery")
+        from pm.filesystem import durable_write_bytes
+        import json
+        durable_write_bytes(pending, json.dumps({
+            "install": str(root), "home": str(home), "target": target,
+            "capsule": str(capsule),
+        }).encode("utf-8"))
+        try:
+            if prepare_local_source(root, source, target) != before:
+                raise RuntimeError("installed checkout changed before local apply")
+            refuse_active_backups(home)
+            if before != target:
+                local_git(root, "merge", "--ff-only", target)
+            if local_git(root, "rev-parse", "HEAD").stdout.strip() != target:
+                raise RuntimeError("checkout did not reach exact target; completion refused")
+            syntax_ok, failing_path, detail = _validate_critical_files_syntax(root)
+            if not syntax_ok:
+                raise RuntimeError(f"selected code has invalid syntax in {failing_path}: {detail}")
+            _complete_source_update(request)
+            from pm.filesystem import durable_unlink
+            durable_unlink(pending)
+        finally:
+            # A child with unproved quiescence still owns the postimage. Keep
+            # the captured capsule and pending marker for explicit recovery.
+            failure = sys.exc_info()[1]
+            if (not isinstance(failure, ProcessStillRunning)
+                    and getattr(failure, "retained_paths", None) is None
+                    and (failure is None or
+                         isinstance(failure, Exception) and type(failure).__name__ != "CancelledError")):
+                with _capsule_authority(capsule) as authority:
+                    state = _read_manifest(authority)["state"]
+                if state == "captured":
+                    seal_local_update_capsule(capsule, expected_install_root=root, expected_hermes_home=home)
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Apply the update; the command boundary owns errors, receipts and stdio."""
     # Marks this frame as the CURRENT updater for
     # _old_updater.in_historical_update(); historical on-disk updaters do not
     # declare this local, so only they hand off through retired shims.
     _hermes_current_updater_frame = True
+    if getattr(args, "source_repo", None) or getattr(args, "rollback_local_update", None):
+        if os.name != "posix":
+            raise OSError("local source update and rollback require POSIX")
+        from pm.process_scope import ProcessStillRunning
+        try:
+            return _cmd_local_update(args, gateway_mode=gateway_mode)
+        except ProcessStillRunning:
+            raise
+        except (RuntimeError, ValueError) as exc:
+            raise OSError(str(exc)) from exc
     git_operation = git_operation_in_progress(_m().PROJECT_ROOT)
     if git_operation:
         root = _m().PROJECT_ROOT

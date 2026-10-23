@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from tools.browser_tool_origin import origin as _bt
 from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_lightpanda_fallback as _lp

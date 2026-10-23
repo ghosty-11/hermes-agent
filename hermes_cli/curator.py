@@ -422,7 +422,8 @@ def _cmd_purge(args) -> int:
     entry, so even a purge is auditable and blob-recoverable."""
     import shutil
     import time
-    from hermes_cli.config import cfg_get, load_config
+    from hermes_cli.config import load_config
+    from hermes_cli.config_primitives import cfg_get
     from tools import skill_ledger, skill_usage
     ttl_days = getattr(args, "days", None)
     if ttl_days is None:

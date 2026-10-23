@@ -10,7 +10,8 @@ from pm.registry import get_package
 from pm.store import Store, current_target
 
 
-def _toolchain(*, realize: bool = True, explicit: bool = False) -> tuple[Path, Path] | None:
+def _toolchain(*, realize: bool = True, explicit: bool = False,
+               offline: bool = False) -> tuple[Path, Path] | None:
     """Resolve uv and Python without host discovery or recursive worker dispatch.
 
     A read-only probe never installs. Windows bundle builds need a verified
@@ -22,7 +23,7 @@ def _toolchain(*, realize: bool = True, explicit: bool = False) -> tuple[Path, P
     )
 
     if realize:
-        ensure("uv", explicit=explicit)
+        ensure("uv", explicit=explicit, offline=True) if offline else ensure("uv", explicit=explicit)
 
     lockfile = _lockfile()
     target = current_target()
@@ -33,7 +34,8 @@ def _toolchain(*, realize: bool = True, explicit: bool = False) -> tuple[Path, P
         if location is None:
             if not realize:
                 return None
-            raise InstallError(name, "pinned tool is unavailable", "run `hermes pm install`")
+            raise InstallError(name, "pinned tool is unavailable" +
+                               (" in the offline cache" if offline else ""), "run `hermes pm install`")
         if name == "python" and target.startswith("win32") and sealed():
             writable = paths.writable_store_root()
             if location[1].root != writable:
@@ -45,7 +47,8 @@ def _toolchain(*, realize: bool = True, explicit: bool = False) -> tuple[Path, P
                         raise _refuse_lazy(name, "a writable Python is required for bundled builds")
                     copy_store = Store(writable)
                     copy_facts = Facts(writable / "facts.json")
-                    _install(package, lockfile, copy_facts, copy_store, target, copy_from=location)
+                    _install(package, lockfile, copy_facts, copy_store, target,
+                             copy_from=location, offline=offline)
                     copied = copy_facts, copy_store
                 location = copied
         facts, store = location

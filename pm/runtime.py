@@ -107,12 +107,10 @@ def _validate(python: Path, env: dict[str, str]) -> str:
     return checked.stderr.strip() or f"exit {checked.returncode}" if checked.returncode else ""
 
 
-# Generations this process resolved for a child. The lease is taken under
-# .prepare.lock, which the collector also holds, so a publish + `pm gc` between
-# this return and the child's own lease cannot remove the child's generation.
-# It lives as long as this process (one lease per generation, not per call):
-# children may still be starting from an older generation after a newer one
-# is chosen.
+# A resolved generation stays leased while children may still be starting from it.
+# Publication and ready lookup use .prepare.lock to exclude collection until leased.
+# A claim-free lookup opens the existing lock without creating state.
+# Keep one lease per generation for this process, including superseded selections.
 _HELD: dict[Path, Callable[[], None]] = {}
 
 
@@ -134,28 +132,52 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
     from pm.filesystem import lock_fd
     from pm.lock import _write
     from pm.runtime_stage import stage_runtime
-
+    from pm.worker_operations import private_write_destination
+    from pm.writer_claim import has_writer_claim
     project = project or Path(__file__).resolve().parent
     identity = _inputs(project, python)
     env = runtime_environment()
+    selected = root / "selected.json"
+    if not bootstrap:
+        from contextlib import nullcontext
+
+        try:
+            lock = (root / ".prepare.lock").open("r+b")
+        except FileNotFoundError:
+            lock = None  # No PM-published generation exists without this lock.
+        with lock if lock is not None else nullcontext():
+            if lock is not None:
+                lock_fd(lock.fileno(), wait=True)
+            try:
+                fact = json.loads(selected.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                fact = {}
+            if fact.get("inputs") in (identity, _inputs(project, python, as_spelled=True)):
+                environment = root / fact["generation"]
+                executable = _python(environment)
+                if ((environment / "pm-runtime.json").is_file()
+                        and not _validate(executable, env) and executable.is_file()):
+                    _hold_for_children(environment)
+                    return executable
+        raise InstallError("pm-runtime", "not installed or outdated and lazy installs are disabled",
+                           "run `hermes pm install` to prepare the independent PM runtime")
+    if os.name == "posix" and not has_writer_claim() and not (
+        private_write_destination(root) and private_write_destination(cache)
+    ):
+        raise RuntimeError("shared PM runtime publication requires a retained writer claim")
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".prepare.lock").open("a+b") as lock:
         lock_fd(lock.fileno(), wait=True)
-        selected = root / "selected.json"
         try:
             fact = json.loads(selected.read_text(encoding="utf-8"))
         except FileNotFoundError:
             fact = {}
-        # Records from before canonicalization spell the path as launched; for a
-        # home under a symlink (/home -> /var/home) that is still this interpreter.
+        # Older selected records may spell a symlinked interpreter differently.
         if fact.get("inputs") in (identity, _inputs(project, python, as_spelled=True)):
             environment = root / fact["generation"]
             if (environment / "pm-runtime.json").is_file() and not _validate(_python(environment), env):
                 _hold_for_children(environment)
                 return _python(environment)
-        if not bootstrap:
-            raise InstallError("pm-runtime", "not installed or outdated and lazy installs are disabled",
-                               "run `hermes pm install` to prepare the independent PM runtime")
         generation = Path("generations") / uuid.uuid4().hex
         environment = root / generation
         try:
@@ -212,8 +234,8 @@ def collect_runtime_generations(root: Path) -> list[Path]:
     return removed
 
 
-
-def runtime_python(*, bootstrap: bool = True, cache: Path | None = None) -> Path:
+def runtime_python(*, bootstrap: bool = True, cache: Path | None = None,
+                   offline: bool = False) -> Path:
     """Resolve PM without selecting, repairing, or importing the app environment."""
     if is_runtime():
         return Path(sys.executable)
@@ -225,40 +247,55 @@ def runtime_python(*, bootstrap: bool = True, cache: Path | None = None) -> Path
     resident = _resident_runtime()
     if resident is not None:
         return resident[0]
+    from pm.writer_claim import has_writer_claim, writer_claim
+    if bootstrap and os.name == "posix" and not has_writer_claim():
+        # Ready lookup stays claim-free. Publishing a cold or outdated runtime
+        # is a shared-state write: take the writer claim for it, waiting like
+        # any independent writer, and never publish without it.
+        try:
+            return runtime_python(bootstrap=False, cache=cache, offline=offline)
+        except InstallError:
+            pass
+        with writer_claim():
+            return runtime_python(bootstrap=True, cache=cache, offline=offline)
     tools = _toolchain(realize=False)
     if tools is None:
         if not bootstrap:
             raise InstallError("pm-runtime", "not installed and lazy installs are disabled",
                                "run `hermes pm install` to prepare the independent PM runtime")
-        from pm.lock import Lockfile
-        from pm.paths import lockfile_path, store_root
-        from pm.registry import get_package
-        from pm.store import current_target
-
-        # Setup has already verified/extracted uv, but there are no PM facts
-        # yet. Use it to acquire PM's TLS support BEFORE downloading Python.
-        package = get_package("uv")
-        version = Lockfile(lockfile_path()).version("uv")
-        target = current_target()
-        staged = package.binary(store_root() / package.store_entry(version, target), target) if version else None
-        if staged is not None and staged.is_file():
-            tools = staged, Path(sys.executable)
+        if offline:
+            tools = _toolchain(realize=True, explicit=True, offline=True)
         else:
-            # Non-shell bootstrap callers (CI) already have a host interpreter.
-            tools = _toolchain(explicit=True)
+            from pm.lock import Lockfile
+            from pm.paths import lockfile_path, store_root
+            from pm.registry import get_package
+            from pm.store import current_target
+
+            # Setup has already verified/extracted uv, but there are no PM facts
+            # yet. Use it to acquire PM's TLS support BEFORE downloading Python.
+            package = get_package("uv")
+            version = Lockfile(lockfile_path()).version("uv")
+            target = current_target()
+            staged = package.binary(store_root() / package.store_entry(version, target), target) if version else None
+            if staged is not None and staged.is_file():
+                tools = staged, Path(sys.executable)
+            else:
+                # Non-shell bootstrap callers (CI) already have a host interpreter.
+                tools = _toolchain(explicit=True)
     if tools is None:
         raise InstallError("pm-runtime", "pinned uv and Python are unavailable")
     uv, python = tools
     return prepare_runtime(uv, python, install_state_dir(project) / "pm-runtime",
-                           bootstrap=bootstrap, cache=cache)
+                           bootstrap=bootstrap, cache=cache, offline=offline)
 
 
 def runtime_command(script: Path, args: tuple[str, ...] | list[str] = (), *,
-                    bootstrap: bool = True, cache: Path | None = None) -> list[str]:
+                    bootstrap: bool = True, cache: Path | None = None,
+                    offline: bool = False) -> list[str]:
     """One launch contract for mutable venvs and resident signed payloads."""
     resident = _resident_runtime()
     if resident is None:
-        python = runtime_python(bootstrap=bootstrap, cache=cache)
+        python = runtime_python(bootstrap=bootstrap, cache=cache, offline=offline)
         return [str(python), "-I", "-B", str(script), *args]
     python, site = resident
     launcher = (
@@ -269,6 +306,11 @@ def runtime_command(script: Path, args: tuple[str, ...] | list[str] = (), *,
 
 
 def run_cli(argv: list[str]) -> int:
-    result = subprocess.run(runtime_command(Path(__file__).with_name("launch.py"), argv),
-                            env=runtime_environment())
+    from pm.writer_claim import child_spawn, writer_claim
+
+    with writer_claim():
+        environment = runtime_environment()
+        command = runtime_command(Path(__file__).with_name("launch.py"), argv)
+        with child_spawn(environment) as spawn:
+            result = subprocess.run(command, env=environment, **spawn)
     return result.returncode

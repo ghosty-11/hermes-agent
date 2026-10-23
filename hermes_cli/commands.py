@@ -489,7 +489,8 @@ def _resolve_config_gates() -> set[str]:
     if not gated:
         return set()
     try:
-        from hermes_cli.config import cfg_get, read_raw_config
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.config_primitives import cfg_get
         cfg = read_raw_config()
     except Exception:
         return set()

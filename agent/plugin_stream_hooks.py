@@ -160,8 +160,9 @@ def stream_reasoning_deltas_enabled() -> bool:
     should still cache the result per stream (``_fire_reasoning_delta`` does)."""
     try:
         from hermes_cli import config as config_mod
+        from hermes_cli.config_primitives import cfg_get
         config = config_mod.load_config_readonly()
-        return bool(config_mod.cfg_get(config, "plugins", "stream_reasoning_deltas", default=False))
+        return bool(cfg_get(config, "plugins", "stream_reasoning_deltas", default=False))
     except Exception:
         logger.debug("failed to read plugins.stream_reasoning_deltas", exc_info=True)
         return False

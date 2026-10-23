@@ -16,7 +16,7 @@ def runtime_env(tmp_path, monkeypatch):
     store = home / "tools"
     lock_path = tmp_path / "lock.json"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(paths, "store_root", lambda: store)
+    monkeypatch.setattr(paths, "store_root", lambda project_root=None: store)
     monkeypatch.setattr(paths, "lockfile_path", lambda: lock_path)
     lock = Lockfile(lock_path)
     lock.set_pin("llamacpp-cpu", "10412", {pm.current_target(): {

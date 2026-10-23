@@ -16,7 +16,7 @@ def test_missing_bundle_tool_is_installed_in_writable_store(pm_env, tmp_path, mo
     shipped = tmp_path / "payload" / "tools"
     shipped.mkdir(parents=True)
     (shipped.parent / "manifest.json").write_text('{"repo":"core","store":"tools","venv":"venv"}')
-    monkeypatch.setattr(paths, "store_root", lambda: shipped)
+    monkeypatch.setattr(paths, "store_root", lambda project_root=None: shipped)
     monkeypatch.setattr(paths, "facts_path", lambda: shipped / "facts.json")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     ensure_module = importlib.import_module("pm.install")

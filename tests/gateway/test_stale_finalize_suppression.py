@@ -386,11 +386,29 @@ class TestDeliveredFinalMatches:
         consumer._last_sent_text = FULL_RESPONSE
         assert consumer.delivered_final_matches(FULL_RESPONSE) is True
 
-    def test_no_record_ambiguous_timeout_returns_none(self):
-        """The explicitly-marked ambiguous timeout keeps legacy trust."""
-        consumer = _consumer()
-        consumer._delivery_ambiguous = True
-        assert consumer.delivered_final_matches("anything") is None
+
+    @pytest.mark.asyncio
+    async def test_returned_timeout_commentary_is_not_replayed_by_final_fallback(self):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        telegram = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={}))
+        timeout = telegram._classify_send_exception(
+            TimeoutError("Timed out"), ((), (), TimeoutError))
+        adapter = FinalizeCaptureAdapter()
+        attempts = []
+
+        async def send(chat_id, content, reply_to=None, metadata=None):
+            attempts.append(content)
+            return timeout
+
+        adapter.send = send
+        consumer = GatewayStreamConsumer(adapter, "chat-1", StreamConsumerConfig(cursor=""))
+        await consumer._send_commentary(FULL_RESPONSE)
+        await consumer._send_fallback_final(FULL_RESPONSE)
+        assert attempts == [FULL_RESPONSE]
+        receipt = consumer.delivery_handoff_for_final(FULL_RESPONSE)
+        assert receipt.result.raw_response["remaining_content"] == FULL_RESPONSE
+        assert not receipt.complete
 
     def test_matching_record_returns_true(self):
         consumer = _consumer()
@@ -580,11 +598,11 @@ async def test_failed_final_edit_after_split_records_visible_payload():
         ),
     )
     full = "The complete answer. " * 8
+    consumer._stream_ledger = full
     # Streaming already put the whole answer on screen, cursor and all.
     await consumer._send_or_edit(full + cursor)
     assert consumer._last_sent_text.endswith(cursor)
     consumer._turn_split_delivery = True
-    consumer._stream_ledger = full
     adapter.fail_edits = True
 
     # The cosmetic cursor-strip edit is rate-limited and fails.

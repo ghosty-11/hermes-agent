@@ -22,7 +22,7 @@ def _exercise_relocated_pm_runtime(tmp_path, monkeypatch):
     source = Path(__file__).resolve().parents[2]
     shutil.copytree(source / "pm", repo / "pm", ignore=shutil.ignore_patterns("__pycache__", ".hermes-tmp.*"))
     (repo / "hermes_cli").mkdir()
-    for name in ("__init__.py", "runtime_state.py"):
+    for name in ("__init__.py", "runtime_state.py", "_early_recovery.py"):
         shutil.copy2(source / "hermes_cli" / name, repo / "hermes_cli" / name)
     shutil.copy2(source / "hermes_constants.py", repo / "hermes_constants.py")
     # Copy the base executable, not a venv's launcher. The test host provides
@@ -69,10 +69,14 @@ print(json.dumps(YAML(typ='safe').load('isolated: true')))
     assert checked.returncode == 0, checked.stderr
     assert json.loads(checked.stdout) == {"isolated": True}
     from pm import runtime as runtime_api, paths
+    from pm.writer_claim import child_spawn, writer_claim
     monkeypatch.setattr(paths, "repo_root", lambda: moved / "hermes-agent")
     command = runtime_api.runtime_command(moved / "hermes-agent/pm/launch.py", ["status"])
-    checked = subprocess.run(command, cwd=tmp_path, env=runtime_api.runtime_environment(),
-                             capture_output=True, text=True, timeout=30)
+    with writer_claim(install=moved / "hermes-agent"):
+        environment = runtime_api.runtime_environment()
+        with child_spawn(environment) as spawn:
+            checked = subprocess.run(command, cwd=tmp_path, env=environment,
+                                     capture_output=True, text=True, timeout=30, **spawn)
     assert checked.returncode == 0, checked.stderr
     assert "no pm sync receipt" in checked.stdout
     assert str(root) not in (runtime / "pyvenv.cfg").read_text()

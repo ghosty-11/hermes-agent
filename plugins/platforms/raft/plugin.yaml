@@ -1,6 +1,10 @@
 name: raft-platform
 label: Raft
 kind: platform
+platform_dependencies:
+  raft:
+    extras: []
+    env: [RAFT_PROFILE]
 version: 1.0.0
 description: >
   Raft gateway adapter for Hermes Agent.

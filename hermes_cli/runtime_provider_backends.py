@@ -1,7 +1,7 @@
 """Provider-specific runtime builders for :mod:`hermes_cli.runtime_provider`: Azure Foundry, the
 OpenRouter / bare-custom fallback resolver, Bedrock, and external-process providers. Origin-internal
 collaborators are resolved on the origin module at call time via :func:`_rp` so test patches on
-``hermes_cli.runtime_provider.*`` (``_get_model_config``, ``load_config``, ``has_usable_secret``,
+``hermes_cli.runtime_provider.*`` (``_get_model_config``, ``load_config``,
 ``_try_resolve_from_custom_pool``, …) still apply."""
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 from agent.azure_identity_adapter import is_token_provider
 from agent.secret_scope import get_secret_str
 from hermes_constants import OPENROUTER_BASE_URL
+from hermes_cli.secret_validation import has_usable_secret
 from utils import base_url_host_matches, base_url_hostname
 
 
@@ -175,7 +176,7 @@ def _resolve_openrouter_runtime(
         candidates = [explicit_api_key, (cfg_api_key if use_config_base_url else ""),
                       (_model_cfg_key_env_for(model_cfg, base_url) if use_config_base_url else ""),
                       *rp._host_gated_env_key_candidates(base_url, ollama=True)]
-    api_key = next((str(c or "").strip() for c in candidates if rp.has_usable_secret(c)), "")
+    api_key = next((str(c or "").strip() for c in candidates if has_usable_secret(c)), "")
     source = "explicit" if (explicit_api_key or explicit_base_url) else "env/config"
     cfg_api_mode = rp._parse_api_mode(model_cfg.get("api_mode"))
     # Explicit "custom" stays "custom" rather than relabeling to "openrouter".

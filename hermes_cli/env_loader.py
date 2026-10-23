@@ -48,6 +48,9 @@ _LOADED_DOTENV_KEYS: set[str] = set()
 _MANAGED_DOTENV_KEYS: set[str] = set()
 # Immutable per-home snapshots: os.environ is shared across profiles and a later home's apply may overwrite it.
 _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
+# A value snapshot alone cannot distinguish a successful empty evaluation from a failed fetch.
+# Revisions cover declarations, not filesystem timestamps or source-returned secret values.
+_SECRET_SOURCE_AUTHORITY_BY_HOME: dict[str, str] = {}
 # Per home: the subset of the snapshot a dotenv reload may re-assert — see ``AppliedVar.authoritative`` (#74265).
 _SECRET_SOURCE_RESTORE_BY_HOME: dict[str, dict[str, str]] = {}
 # Per home: what the process-global path WROTE into ``os.environ`` for an external source — name →
@@ -63,6 +66,12 @@ _SECRET_SOURCE_WRITES_BY_HOME: dict[str, dict[str, tuple[str, str, str | None]]]
 # re-parse + ASCII sweep re-run each time (Bitwarden's own cache only saves the network call).
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
+# Fetches execute without this lock. Generation only fences per-home resets; a later
+# completion (including failure) may outrank an earlier completion from a newer start.
+# A global reset advances the epoch so old attempts cannot publish after it.
+_SECRET_SOURCE_FETCH_GENERATION_BY_HOME: dict[str, int] = {}
+_SECRET_SOURCE_RESET_GENERATION_BY_HOME: dict[str, int] = {}
+_SECRET_SOURCE_RESET_EPOCH = 0
 
 # What THIS process has published from dotenv files, per variable: (value before our first publish, or
 # None if absent; last value we published; load pass that published it). Reloads run per gateway turn and
@@ -160,35 +169,149 @@ def managed_dotenv_keys() -> frozenset[str]:
 
 
 def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
-    """Return the external-secret value snapshot for ``hermes_home``."""
-    return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(str(Path(hermes_home).resolve()), {}))
+    """Return a copy of one home's external-secret value snapshot."""
+    with _SECRET_SOURCE_CACHE_LOCK:
+        return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(str(Path(hermes_home).resolve()), {}))
 
+def _secret_source_revision(config: dict) -> str:
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def _strict_secret_declarations(home: Path) -> dict:
+    from hermes_cli.config_paths import strict_file_present
+    from hermes_yaml import safe_load
+
+    path = home / "config.yaml"
+    if not strict_file_present(path):
+        return {}
+    with path.open(encoding="utf-8-sig") as stream:
+        data = safe_load(stream)
+    if data is None:
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("secrets", {}), dict):
+        raise ValueError(f"cannot inspect secret source declarations: {path}")
+    return data.get("secrets", {})
+
+
+def _secret_source_certificate(config: dict, report) -> str | None:
+    """Certify successful orchestrator decisions against their complete declarations."""
+    from agent.secret_sources.policy import normalized_declarations
+
+    try:
+        normalized, expected = normalized_declarations(config)
+        observed = {source.name for source in report.sources}
+        sections = set(config) - {"sources", "preserve_existing", "profile_alias"}
+        decisions = report.activation_decisions
+        if (observed and not report.activation_failures
+                and sections <= decisions.keys()
+                and set(normalized["sources"]) <= decisions.keys()
+                and expected <= observed
+                and observed == {name for name, enabled in decisions.items() if enabled}
+                and all(source.result.ok for source in report.sources)):
+            return _secret_source_revision(normalized)
+    except (ValueError, TypeError):
+        pass  # startup stays fail-open; passive inspection refuses the missing certificate
+    return None
+
+
+def _begin_secret_source_fetch(home_key: str) -> tuple[int, int] | None:
+    """Invalidate the old certificate and reserve an attempt without holding the lock for fetch."""
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if home_key in _APPLIED_HOMES:
+            return None
+        generation = _SECRET_SOURCE_FETCH_GENERATION_BY_HOME.get(home_key, 0) + 1
+        _SECRET_SOURCE_FETCH_GENERATION_BY_HOME[home_key] = generation
+        _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_AUTHORITY_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
+        return generation, _SECRET_SOURCE_RESET_EPOCH
+
+
+def _fetch_can_publish(home_key: str, attempt: tuple[int, int]) -> bool:
+    generation, epoch = attempt
+    return (epoch == _SECRET_SOURCE_RESET_EPOCH
+            and generation > _SECRET_SOURCE_RESET_GENERATION_BY_HOME.get(home_key, 0))
+
+
+def _publish_secret_source_snapshot(
+    home_key: str, attempt: tuple[int, int], config: dict, report,
+    values: dict[str, str], restore: dict[str, str], *, mark_applied: bool,
+) -> bool:
+    """Caller holds the cache lock; the latest completed attempt wins, including failure."""
+    if not _fetch_can_publish(home_key, attempt):
+        return False
+    # Completion order, not start order, determines publication.
+    _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+    certificate = _secret_source_certificate(config, report)
+    if certificate is None:
+        _SECRET_SOURCE_AUTHORITY_BY_HOME.pop(home_key, None)
+    else:
+        _SECRET_SOURCE_AUTHORITY_BY_HOME[home_key] = certificate
+    _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = restore
+    if mark_applied:
+        _APPLIED_HOMES.add(home_key)
+    else:
+        _APPLIED_HOMES.discard(home_key)
+    return True
+
+
+def _finalize_failed_secret_source_fetch(home_key: str, attempt: tuple[int, int], *,
+                                         routed: bool) -> None:
+    """Complete failed work in its reset epoch; a later completion outranks older success."""
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if not _fetch_can_publish(home_key, attempt):
+            return
+        _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_AUTHORITY_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
+        if routed:
+            _APPLIED_HOMES.discard(home_key)
+
+
+def get_authoritative_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
+    """Read a complete, still-current per-home publication; never evaluate a source."""
+    from agent.secret_sources.policy import normalized_declarations
+
+    home = Path(hermes_home)
+    cfg = _strict_secret_declarations(home)
+    normalized, enabled = normalized_declarations(cfg)
+    key = str(home.resolve())
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if _SECRET_SOURCE_AUTHORITY_BY_HOME.get(key) == _secret_source_revision(normalized):
+            return dict(_SECRET_SOURCE_VALUES_BY_HOME[key])
+    # No declaratively enabled source and no ambiguous custom activation: empty is certain.
+    sections = (value for name, value in cfg.items()
+                if name not in {"sources", "preserve_existing", "profile_alias"})
+    if not enabled and all(value == {"enabled": False} for value in sections):
+        return {}
+    raise RuntimeError(f"secret source snapshot is not authoritative for {home}")
 
 def hydrate_profile_secret_sources(hermes_home: str | os.PathLike) -> dict[str, str]:
     """Resolve one profile's configured sources without mutating ``os.environ``: multiplex gateways route
     turns to profiles that never ran the process-global dotenv path, so resolve against a private mapping
     seeded from that ``.env`` and record the per-home snapshot for ``build_profile_secret_scope()``.
     Fail-open / once-per-home like ``_apply_external_secret_sources``; never returns plaintext .env entries."""
-    with _SECRET_SOURCE_CACHE_LOCK:
-        return _hydrate_profile_secret_sources(Path(hermes_home))
+    return _hydrate_profile_secret_sources(Path(hermes_home))
 
 
 def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
-    """Locked implementation for :func:`hydrate_profile_secret_sources`."""
+    """Fetch outside the lock; publish only a current completed attempt."""
     home_key = str(home.resolve())
-    if home_key in _APPLIED_HOMES:
+    attempt = _begin_secret_source_fetch(home_key)
+    if attempt is None:
         return get_secret_source_values(home)
-
-    # A retry must not keep serving a partial result after the source is removed, disabled, or can no
-    # longer be evaluated. Publish only the snapshot established by this attempt.
-    _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
-    _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
 
     try:
         cfg = _load_secrets_config(home)
     except Exception:  # noqa: BLE001 — external sources must not block routing
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=True)
         return {}
     if not cfg:
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=True)
         return {}
 
     try:
@@ -208,28 +331,35 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
         local_env["HERMES_HOME"] = str(home)
         report = apply_all(cfg, home, environ=local_env)
     except Exception:  # noqa: BLE001 — preserve fail-open startup behavior
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=True)
         return {}
 
     if not report.sources:
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=True)
         return {}
 
     # Routed profiles have no runtime reset path. Keep a failed source retryable so correcting its
     # profile-local bootstrap credentials takes effect on the next turn; successful sources from a
     # mixed report are still snapshotted below and can be used while the failed source recovers.
-    if all(src.result.ok for src in report.sources):
-        _APPLIED_HOMES.add(home_key)
     # Same ownership bookkeeping as the process-global path: a name this profile's source supplied — applied,
     # or skipped because the private mapping already had it — is a source-owned name the routed-child scrub
     # must know about, or a sibling still inherits the launch value for it (review on f5f88d5058).
-    _record_supplied_names(report)
     values: dict[str, str] = {}
-    for name, applied in report.provenance.items():
+    for name in report.provenance:
         value = local_env.get(name)
-        if value is None:
-            continue
-        _SECRET_SOURCES[name] = applied.source
-        values[name] = value
-    _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        if value is not None:
+            values[name] = value
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if not _fetch_can_publish(home_key, attempt):
+            return {}
+        _record_supplied_names(report)
+        for name, applied in report.provenance.items():
+            if name in values:
+                _SECRET_SOURCES[name] = applied.source
+        _publish_secret_source_snapshot(
+            home_key, attempt, cfg, report, values, {},
+            mark_applied=_secret_source_certificate(cfg, report) is not None,
+        )
     return dict(values)
 
 
@@ -240,18 +370,26 @@ def reset_secret_source_cache(hermes_home: str | os.PathLike | None = None) -> N
     this process, and a per-fire cron re-pull or a plugin-discovery refresh for one home must not wipe
     a sibling's hydrated snapshot — the sibling's next scope build would run empty until it re-hydrated
     (#102041)."""
-    if hermes_home is None:
-        _APPLIED_HOMES.clear()
-        _SECRET_SOURCES.clear()
-        _SOURCE_SUPPLIED_NAMES.clear()
-        _SECRET_SOURCE_VALUES_BY_HOME.clear()
-        _SECRET_SOURCE_RESTORE_BY_HOME.clear()
-        _SECRET_SOURCE_WRITES_BY_HOME.clear()
-        return
-    home_key = str(Path(hermes_home).resolve())
-    _APPLIED_HOMES.discard(home_key)
-    _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
-    _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
+    global _SECRET_SOURCE_RESET_EPOCH
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if hermes_home is None:
+            _SECRET_SOURCE_RESET_EPOCH += 1
+            _APPLIED_HOMES.clear()
+            _SECRET_SOURCES.clear()
+            _SOURCE_SUPPLIED_NAMES.clear()
+            _SECRET_SOURCE_VALUES_BY_HOME.clear()
+            _SECRET_SOURCE_AUTHORITY_BY_HOME.clear()
+            _SECRET_SOURCE_RESTORE_BY_HOME.clear()
+            _SECRET_SOURCE_WRITES_BY_HOME.clear()
+            return
+        home_key = str(Path(hermes_home).resolve())
+        generation = _SECRET_SOURCE_FETCH_GENERATION_BY_HOME.get(home_key, 0) + 1
+        _SECRET_SOURCE_FETCH_GENERATION_BY_HOME[home_key] = generation
+        _SECRET_SOURCE_RESET_GENERATION_BY_HOME[home_key] = generation
+        _APPLIED_HOMES.discard(home_key)
+        _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_AUTHORITY_BY_HOME.pop(home_key, None)
+        _SECRET_SOURCE_RESTORE_BY_HOME.pop(home_key, None)
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -637,7 +775,8 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     live in ``registry.apply_all``; this wrapper owns the once-per-home guard, the post-apply ASCII sweep,
     the ``_SECRET_SOURCES`` map and status lines."""
     home_key = str(Path(home_path).resolve())
-    if home_key in _APPLIED_HOMES:
+    attempt = _begin_secret_source_fetch(home_key)
+    if attempt is None:
         return
 
     # Neither early return marks the home applied: a malformed config.yaml would otherwise permanently
@@ -646,25 +785,37 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     try:
         cfg = _load_secrets_config(home_path)
     except Exception:  # noqa: BLE001 — config errors must not block startup
-        # See #40597.
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=False)
         return
     # No source configured / enabled any more: whatever one wrote earlier is no longer backed (#126982
     # review). A config READ failure above keeps them — fail-open, same as the fetch-failure path below.
     if not cfg:
-        _revoke_secret_source_writes(home_path, keep=lambda _name, _source: False)
+        with _SECRET_SOURCE_CACHE_LOCK:
+            if _fetch_can_publish(home_key, attempt):
+                _revoke_secret_source_writes(home_path, keep=lambda _name, _source: False)
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=False)
         return
 
-    # Defer the registry import until a source is enabled — bitwarden eagerly loads cryptography._rust.pyd,
-    # which makes the Windows updater self-lock before its preflight. Detect by *shape* (dict with enabled
-    # flag), not names, so plugin/test sources pass and a plain dict entry never forces the crypto load.
-    any_enabled = any(isinstance(v, dict) and v.get("enabled") is True for v in cfg.values())
-    if not any_enabled:
-        _revoke_secret_source_writes(home_path, keep=lambda _name, _source: False)
+    # Keep import-time startup free of the registry for clearly disabled declarations.
+    # A custom source can activate without ``enabled``; its non-flag section requires
+    # the orchestrator's is_enabled decision rather than a shape-only veto.
+    possible_source = any(
+        isinstance(value, dict) and (value.get("enabled") is True or
+                                     bool(set(value) - {"enabled"}))
+        for name, value in cfg.items()
+        if name not in {"sources", "preserve_existing", "profile_alias"}
+    )
+    if not possible_source:
+        with _SECRET_SOURCE_CACHE_LOCK:
+            if _fetch_can_publish(home_key, attempt):
+                _revoke_secret_source_writes(home_path, keep=lambda _name, _source: False)
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=False)
         return
 
     try:
         from agent.secret_sources.registry import apply_all, enabled_source_names
     except ImportError:
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=False)
         return
 
     # Revoke a removed/disabled source's writes BEFORE the pass: left in place, its stale value would make
@@ -673,45 +824,75 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         active = enabled_source_names(cfg, home_path)
     except Exception:  # noqa: BLE001 — cannot tell which sources remain: keep everything (fail-open)
         active = None
-    if active is not None:
-        _revoke_secret_source_writes(home_path, keep=lambda _name, source: source in active)
-    environ_before = dict(os.environ)
-
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if not _fetch_can_publish(home_key, attempt):
+            return
+        if active is not None:
+            _revoke_secret_source_writes(home_path, keep=lambda _name, source: source in active)
+        environ_before = dict(os.environ)
+    # The private mapping supplies fetch bootstrap state; commit decisions use the
+    # current environment, which a dotenv reload may have changed while fetching.
+    staged_env = environ_before.copy()
     try:
-        report = apply_all(cfg, home_path)
+        report = apply_all(cfg, home_path, environ=staged_env)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=False)
         return
 
     if not report.sources:  # no source enabled: keep retrying cheaply so flipping one on takes effect
+        _finalize_failed_secret_source_fetch(home_key, attempt, routed=False)
         return
 
     # A real fetch attempt happened (success OR error): mark the home so the 3-5 import-time calls per
     # startup don't re-fetch / re-print (error retries are opt-in via reset_secret_source_cache()).
-    # Marking AFTER the attempt keeps the earlier failure paths retryable.
-    _APPLIED_HOMES.add(home_key)
+    # A partial/failed report still replaces the certificate, never shares an older one's authority.
+    from agent.secret_sources.registry import reconcile_application
 
-    if report.applied_any:
-        _sanitize_loaded_credentials()  # vault values carry the same copy-paste corruption risk as .env
-        for name, applied in report.provenance.items():
-            _SECRET_SOURCES[name] = applied.source
+    # Dotenv and source publication share the commit boundary. Replay only the fetched
+    # results, not the fetch itself, against the current environment and validate the
+    # entire write set before the first assignment.
+    with _DOTENV_LOCK, _SECRET_SOURCE_CACHE_LOCK:
+        if not _fetch_can_publish(home_key, attempt):
+            return
+        environ_before = dict(os.environ)
+        current = environ_before.copy()
+        written: list[str] = []
+        try:
+            report = reconcile_application(report, current)
+            pending = {name: current[name] for name in report.provenance}
+            for name, value in pending.items():
+                if "\x00" in name or "\x00" in value:
+                    raise ValueError("NUL in secret source environment assignment")
+                os.fsencode(name)
+                os.fsencode(value)
+            for name, value in pending.items():
+                os.environ[name] = value
+                written.append(name)
+        except Exception:  # noqa: BLE001 — secret-source failures never block startup
+            for name in reversed(written):
+                prior = environ_before.get(name)
+                if prior is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = prior
+            _finalize_failed_secret_source_fetch(home_key, attempt, routed=False)
+            logger.warning("Secret source environment commit failed", exc_info=True)
+            return
+        if report.applied_any:
+            _sanitize_loaded_credentials()  # vault values carry the same copy-paste corruption risk as .env
+            for name, applied in report.provenance.items():
+                _SECRET_SOURCES[name] = applied.source
 
-    # Snapshot EVERY name a source supplied, not just the newly applied ones. A name the source supplied
-    # but the pre-existing process value won (``skipped_existing``) is still this home's effective value
-    # for it — and on the unscoped path os.environ IS this home's environment. Skipping those names
-    # latched an EMPTY snapshot whenever the key was already in the env: after the first cron/plugin
-    # re-pull (the previous apply's own write-back shadows every key) or from boot under systemd
-    # ``EnvironmentFile=``. Under multiplex the scope is the only credential source, so an empty
-    # snapshot failed every default-profile turn for the process lifetime (#102041).
-    values: dict[str, str] = {}
-    supplied = _record_supplied_names(report)
-    for name in supplied:
-        if name in os.environ:
-            values[name] = os.environ[name]
-    _record_secret_source_writes(home_key, report, supplied, environ_before)
-    if values:
-        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
-    _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
-        n: values[n] for n, a in report.provenance.items() if a.authoritative and n in values}
+        # Snapshot every supplied name, including a source value skipped for a pre-existing one:
+        # under multiplex this snapshot, not os.environ, supplies the launch profile's scope.
+        supplied = _record_supplied_names(report)
+        values = {name: os.environ[name] for name in supplied if name in os.environ}
+        _record_secret_source_writes(home_key, report, supplied, environ_before)
+        restore = {name: values[name] for name, applied in report.provenance.items()
+                   if applied.authoritative and name in values}
+        _publish_secret_source_snapshot(
+            home_key, attempt, cfg, report, values, restore, mark_applied=True,
+        )
 
     for src in report.sources:
         if src.applied:
@@ -736,7 +917,10 @@ def _record_secret_source_writes(home_key: str, report, supplied: set[str], envi
     previous = _SECRET_SOURCE_WRITES_BY_HOME.get(home_key, {})
     _revoke_secret_source_writes(
         Path(home_key),
-        keep=lambda name, source: name in report.provenance or name in supplied or source in failed)
+        keep=lambda name, source: (
+            name in report.provenance or source in failed or
+            (name in supplied and name in previous and os.environ.get(name) == previous[name][1])
+        ))
     writes = {name: rec for name, rec in _SECRET_SOURCE_WRITES_BY_HOME.get(home_key, {}).items()
               if name not in report.provenance and os.environ.get(name) == rec[1]}
     for name, applied in report.provenance.items():

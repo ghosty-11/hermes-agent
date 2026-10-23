@@ -16,11 +16,15 @@ import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional, cast
 
 from agent.i18n import t
+from gateway.delivery_handoff import (
+    StreamDeliveryHandoff, delivery_handoff_from_receipt, reconcile_stream_delivery_handoff,
+    normalize_delivery_result,
+)
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
+from gateway.platforms.base import BasePlatformAdapter, SendResult, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
@@ -348,7 +352,7 @@ class GatewayNotificationsMixin:
 
     async def _deliver_media_from_response(
         self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
+    ) -> bool:
         """Deliver explicit MEDIA: tags from an already-streamed response (text already delivered).
         EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
         path in a streamed reply is shown text or stale inspected content, and promoting it sent
@@ -359,6 +363,8 @@ class GatewayNotificationsMixin:
         #20834.
         """
         from urllib.parse import quote as _quote
+        from gateway.relay.egress import declined_send
+        declined = False
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
@@ -387,25 +393,42 @@ class GatewayNotificationsMixin:
 
             image_paths = [p for p, v in media_files if _is_photo(p, v)]
             non_image_media = [(p, v) for p, v in media_files if not _is_photo(p, v)]
+            results = []
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    results.append(await adapter.send_multiple_images(
+                        chat_id=chat_id, images=images, metadata=_thread_meta))
+                    declined = declined_send(results[-1])
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
-            for media_path, is_voice in non_image_media:
-                try:
-                    ext = Path(media_path).suffix.lower()
-                    if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
-                            chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
-                        )
-                    elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
-                    else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
-                except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    results.append(SendResult(success=False, error=str(e) or type(e).__name__))
+            if not declined:
+                for media_path, is_voice in non_image_media:
+                    try:
+                        ext = Path(media_path).suffix.lower()
+                        if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
+                            receipt = await adapter.send_voice(
+                                chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice)
+                        elif ext in _VIDEO_EXTS:
+                            receipt = await adapter.send_video(
+                                chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        else:
+                            receipt = await adapter.send_document(
+                                chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        results.append(receipt)
+                        if declined_send(receipt):
+                            declined = True
+                            break
+                    except Exception as e:
+                        logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                        results.append(SendResult(success=False, error=str(e) or type(e).__name__))
+            address = getattr(event, "turn_delivery_address", None)
+            if results and isinstance(address, dict):
+                outcome = BasePlatformAdapter._turn_delivery_outcome(
+                    results, hint=None, streamed_text=None)
+                await self.record_turn_delivery(address, {**outcome, "lane": "media"})
+        return declined
 
 
     async def _deliver_queued_first_response(
@@ -413,6 +436,9 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        record_delivery: Optional[Callable[[SendResult], None]] = None,
+        receipt_owner: Optional[StreamDeliveryHandoff] = None,
+        turn_delivery_address: Optional[dict] = None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -421,87 +447,150 @@ class GatewayNotificationsMixin:
         ``event_message_id`` reply anchor); see ``_send_queued_final_text``. Without a key the send
         stays unledgered.
 
-        Returns whether the caller may treat this turn's final as delivered. True: the stream had
-        already delivered it, the reconcile edit landed, the send succeeded, or there was nothing
-        textual to send. False: the send was REFUSED (flood control, dead transport) — the caller
-        must leave the normal completion send as the fallback, or the user gets nothing. A connector
-        DECLINE returns True: that destination is not approved and must not be re-sent."""
+        True means delivery completed (or a connector explicitly declined). False
+        leaves a refused known remainder to the normal final bracket; an ambiguous
+        receipt also returns False, but that bracket records failure without sending
+        the uncertain payload again."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        from gateway.relay.egress import declined_send
+        handoff = (reconcile_stream_delivery_handoff(
+                       receipt_owner, BasePlatformAdapter.strip_media_directives_for_display(response))
+                   if isinstance(receipt_owner, StreamDeliveryHandoff)
+                   else stream_consumer.delivery_handoff_for_final(
+                       BasePlatformAdapter.strip_media_directives_for_display(response))
+                   if stream_consumer is not None and callable(
+                       getattr(stream_consumer, "delivery_handoff_for_final", None)) else None)
+        if not isinstance(handoff, StreamDeliveryHandoff):
+            handoff = None
+        text_content = _strip_response_attachments_for_direct_send(response, adapter)
+        if handoff is None and text_already_delivered and text_content:
+            # A legacy confirmation flag has no carriage receipt. Preserve the
+            # obligation as uncertain rather than manufacturing an ACK.
+            handoff = delivery_handoff_from_receipt(
+                text_content, SendResult(success=False, error="stream final missing carriage receipt",
+                                         raw_response={"delivery_ambiguous": True,
+                                                       "remaining_content": text_content,
+                                                       "model_remaining_content": text_content,
+                                                       "attachment_remaining_content": ""}))
+        if handoff and declined_send(handoff.result):
+            if record_delivery:
+                record_delivery(handoff.result)
+            if session_key and isinstance(adapter, BasePlatformAdapter):
+                await self._send_queued_final_text(
+                    adapter, source, text_content, metadata, event_message_id, session_key,
+                    inbound_message_id, handoff=handoff, turn_delivery_address=turn_delivery_address)
+            return True
+        text_already_delivered = bool(handoff and handoff.complete)
+        if handoff and handoff.complete:
+            _sent = await self._send_queued_final_text(
+                adapter, source, text_content, metadata, event_message_id, session_key,
+                inbound_message_id, handoff=handoff, turn_delivery_address=turn_delivery_address)
+            if record_delivery:
+                record_delivery(_sent)
+            text_already_delivered = True
         if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response, adapter)
-            if text_content:
-                # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
-                # a plain send here would duplicate it.
+            if text_content or handoff:
+                # A known remainder belongs to the final bracket. The acknowledged head
+                # must not be edited or re-sent, even when it has an editable message id.
                 _reconciled = False
+                declined_edit = False
                 _sc_msg_id = getattr(stream_consumer, "message_id", None)
+                prior = getattr(stream_consumer, "_delivery_handoff", None)
                 if (
-                    _sc_msg_id
+                    (handoff is None or (isinstance(prior, StreamDeliveryHandoff) and prior.complete))
+                    and _sc_msg_id
                     and _sc_msg_id != "__no_edit__"
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
+                        edit_receipt = await adapter.edit_message(
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
-                        if getattr(_edit_res, "success", False):
-                            _reconciled = True
+                        edit_receipt = normalize_delivery_result(edit_receipt) if edit_receipt is not None else None
+                        if edit_receipt is None:
+                            edit_receipt = SendResult(success=False, error="edit returned no receipt",
+                                                      raw_response={"delivery_ambiguous": True,
+                                                                    "remaining_content": text_content,
+                                                                    "model_remaining_content": text_content,
+                                                                    "attachment_remaining_content": ""})
+                        handoff = delivery_handoff_from_receipt(
+                            text_content, edit_receipt,
+                            previous=prior if isinstance(prior, StreamDeliveryHandoff) else None,
+                            edited_message_id=str(_sc_msg_id), attempted_content=text_content)
+                        _reconciled = handoff.complete
+                        if _reconciled:
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
                             )
-                        else:
-                            # P5(b): a DECLINE is not "editing unavailable". The
-                            # send below re-delivers the whole response to the
-                            # chat the connector just refused.
-                            from gateway.relay.egress import declined_send
-
-                            if declined_send(_edit_res):
-                                logger.warning(
-                                    "Queued-lane reconcile edit DECLINED by the "
-                                    "connector's egress guard; not falling back "
-                                    "to a send (the destination is not approved)."
-                                )
-                                return True
-                    except Exception as _qe:
-                        logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
-                if not _reconciled:
+                        declined_edit = declined_send(edit_receipt)
+                    except Exception as exc:
+                        handoff = delivery_handoff_from_receipt(
+                            text_content, SendResult(success=False, error=str(exc), raw_response={
+                                "delivery_ambiguous": True, "remaining_content": text_content,
+                                "model_remaining_content": text_content,
+                                "attachment_remaining_content": ""}),
+                            previous=prior if isinstance(prior, StreamDeliveryHandoff) else None)
+                        logger.warning("Queued-lane reconcile edit uncertain (%s); retaining receipt.", exc)
+                    if declined_edit:
+                        logger.warning(
+                            "Queued-lane reconcile edit DECLINED by the connector's egress guard; "
+                            "not re-addressing the destination.")
+                        if record_delivery:
+                            record_delivery(edit_receipt)
+                        # Bracket the projected owner without another transport call.
+                        if session_key and isinstance(adapter, BasePlatformAdapter):
+                            await self._send_queued_final_text(
+                                adapter, source, text_content, metadata, event_message_id,
+                                session_key, inbound_message_id, handoff=handoff,
+                                turn_delivery_address=turn_delivery_address)
+                        return True
+                if not _reconciled or handoff is not None:
                     _sent = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
-                        inbound_message_id)
+                        inbound_message_id, handoff=handoff, turn_delivery_address=turn_delivery_address)
+                    if record_delivery:
+                        record_delivery(_sent)
                     if not getattr(_sent, "success", False):
-                        # The text never landed. Report it undelivered and skip the attachments too:
-                        # the caller's normal completion send replays the whole response (text and
-                        # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
         # Failed turns deliver their (normalized failure) text but must not upload attachments as if
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
             return True
+        media_event = MessageEvent(text="", source=source, message_id=event_message_id)
+        if turn_delivery_address is not None:
+            media_event.turn_delivery_address = turn_delivery_address
         await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
-            thread_metadata=metadata,
-        )
+            response, media_event, adapter, thread_metadata=metadata)
         return True
 
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[Dict[str, Any]],
         event_message_id: Optional[str], session_key: Optional[str],
-        inbound_message_id: Optional[str] = None,
+        inbound_message_id: Optional[str] = None, *,
+        handoff: Optional[StreamDeliveryHandoff] = None,
+        turn_delivery_address: Optional[dict] = None,
     ):
-        """Send a queued-lane final through the same ledger bracket as the normal final
-        (``send_final_ledgered``). This lane used to call ``adapter.send`` bare and discard the
-        result, so a final refused here (flood control, a transport that had just died) left no
-        ledger row and was gone for good. The ledger identity is the raw inbound message id;
-        ``event_message_id`` is only the reply anchor, which is None wherever replies are not used
-        (Telegram forum topics, Slack reaction handoffs) and so cannot identify the turn; with no
-        inbound id the ledger falls back to the event's own (empty) message id. Adapters without
-        the base contract and sends without a session key keep the plain send."""
+        """Bracket a queued final with its original inbound identity when available."""
         if session_key and isinstance(adapter, BasePlatformAdapter):
+            event = MessageEvent(text="", source=source, ledger_message_id=inbound_message_id)
+            if turn_delivery_address is not None:
+                event.turn_delivery_address = turn_delivery_address
+            if handoff is not None:
+                event._stream_delivery_handoff = handoff
             result, _ = await adapter.send_final_ledgered(
-                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
-                session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
+                event, session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
-            result = await adapter.send(source.chat_id, text_content, metadata=metadata)
+            from gateway.relay.egress import declined_send
+            if handoff is not None and (handoff.complete or handoff.ambiguous or declined_send(handoff.result)):
+                return handoff.result
+            owed = handoff.owed if handoff else text_content
+            result = await adapter.send(source.chat_id, owed, metadata=metadata)
+            result = normalize_delivery_result(result)
+        if (isinstance(result, SendResult) and result.success and result.delivered_text is None
+                and not (isinstance(result.raw_response, dict)
+                         and result.raw_response.get("stream_handoff"))):
+            result = dataclasses.replace(result, delivered_text=handoff.owed if handoff else text_content)
         if not getattr(result, "success", False):
             logger.warning(
                 "Queued-lane final send to %s failed: %s", getattr(source, "chat_id", "?"),

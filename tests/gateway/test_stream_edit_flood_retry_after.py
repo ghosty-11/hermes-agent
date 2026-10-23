@@ -13,10 +13,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.platforms.base import SendResult
 
 
 def _flood(wait: float):
-    return SimpleNamespace(success=False, error=f"flood_control:{wait}", retry_after=wait)
+    return SendResult(success=False, error=f"flood_control:{wait}", retry_after=wait)
 
 
 async def _stream(adapter, edit_interval: float, deltas: int, gap: float):
@@ -55,7 +56,7 @@ async def test_flood_without_retry_after_keeps_doubling_backoff():
     adapter = MagicMock()
     adapter.MAX_MESSAGE_LENGTH = 4096
     adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
-    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=False, error="flood_control:9"))
+    adapter.edit_message = AsyncMock(return_value=SendResult(success=False, error="flood_control:9"))
 
     consumer = await _stream(adapter, edit_interval=0.02, deltas=6, gap=0.05)
 
@@ -63,3 +64,37 @@ async def test_flood_without_retry_after_keeps_doubling_backoff():
     assert len(interim_edits) >= 2  # 0.04s, 0.08s, 0.16s: the legacy doubling ladder keeps firing
     assert consumer._current_edit_interval <= 10.0
     assert consumer._flood_strikes >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+async def test_total_flood_failure_keeps_attached_payload_on_retry(retry_succeeds, monkeypatch):
+    from gateway.platforms.base import SendResult
+
+    original = "show the image"
+    owed = original + "\nhttps://example.com/attached.gif"
+    adapter = MagicMock()
+    delivered = []
+    first = True
+
+    async def transport(**kwargs):
+        nonlocal first
+        if first:
+            first = False
+            return SendResult(
+                success=False, error="flood_control:0.1", retry_after=0.1,
+                raw_response={"partial_overflow": False, "remaining_content": owed})
+        if retry_succeeds:
+            delivered.append(kwargs["content"])
+        return SendResult(success=retry_succeeds, error=None if retry_succeeds else "offline")
+
+    adapter.send = transport
+    consumer = GatewayStreamConsumer(adapter, "chat_1", StreamConsumerConfig())
+    monkeypatch.setattr("gateway.stream_consumer_fallback.asyncio.sleep", AsyncMock())
+    result = await consumer._send_with_flood_retry(
+        content=original, retry_log="fixture flood %.1fs")
+    if retry_succeeds:
+        assert delivered == [owed]
+    else:
+        assert not result.success
+        assert result.raw_response["remaining_content"] == owed

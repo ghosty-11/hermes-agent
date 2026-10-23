@@ -316,25 +316,54 @@ def test_live_old_update_blocks_launch_sync(tmp_path, monkeypatch):
     assert marker.is_file()
 
 
-def test_launch_under_the_owning_update_does_not_run_the_tail_again(tmp_path, monkeypatch, completion_tail):
-    """The tail imports the application, whose entry point runs prepare_launch: inside the
-    process tree of the update that owns the pending tail it must be a no-op, not recurse."""
-    import time
+@pytest.mark.platforms("posix")
+def test_launch_does_not_repay_tail_under_another_current_owner(tmp_path, monkeypatch, completion_tail):
+    """A different live installation owner excludes startup completion until it exits."""
     import pm
-    from hermes_cli.update_lock import update_marker_path
+    from hermes_cli._launchers import resolve_store_python
 
     root = _self_checkout(tmp_path, monkeypatch)
     pending = venv_sync.completion_pending_path(root)
     pending.parent.mkdir(parents=True)
     pending.write_text("owed\n")
+    before = pending.read_bytes()
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
-    marker = update_marker_path()
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"{os.getppid()}\n{int(time.time())}\n")  # an ancestor holds the update
+    store = tmp_path / "store"
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
+    subprocess.run([sys._base_executable, "-m", "venv", "--without-pip", str(store / "python")],
+                   check=True, capture_output=True)
+    python = store / "python/bin/python3"
+    assert python.is_file()
+    (store / "facts.json").write_text(
+        json.dumps({"packages": {"python": {"entry": "python"}}}), encoding="utf-8")
+    assert resolve_store_python(root) == python
 
-    assert venv_sync.prepare_launch(root, []) is None
-    assert completion_tail == []
-    assert pending.is_file(), "the owning update's obligation was discharged by its own tail"
+    owner_code = (
+        "import sys; from pathlib import Path; "
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r}); "
+        "from hermes_cli.update_lock import UpdateLock\n"
+        "with UpdateLock(install_root=Path(sys.argv[1])):\n"
+        " print('held', flush=True)\n"
+        " sys.stdin.readline()\n"
+    )
+    owner = subprocess.Popen([sys.executable, "-I", "-S", "-c", owner_code, str(root)],
+                             env=dict(os.environ), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        assert owner.stdout is not None
+        assert owner.stdout.readline().strip() == "held"
+        assert owner.poll() is None
+        with pytest.raises(RuntimeError):
+            venv_sync.prepare_launch(root, [])
+        assert completion_tail == []
+        assert pending.read_bytes() == before
+        assert not venv_sync._completion_attempts_path(root).exists()
+    finally:
+        _, error = owner.communicate("release\n", timeout=15)
+    assert owner.returncode == 0, error
+    assert venv_sync.prepare_launch(root, []) == python
+    assert len(completion_tail) == 1
+    assert not pending.exists()
 
 
 @pytest.mark.parametrize("marker,value,owed_by_cli", [

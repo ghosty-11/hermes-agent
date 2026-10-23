@@ -11,7 +11,8 @@ from hermes_cli.cli_output import (
     print_info as _print_info, print_success as _print_success, print_warning as _print_warning, prompt as _prompt,
 )
 from hermes_cli.colors import Colors, color
-from hermes_cli.config import cfg_get, get_env_value, load_config, save_config, save_env_value
+from hermes_cli.config import get_env_value, load_config, save_config, save_env_value
+from hermes_cli.config_primitives import cfg_get
 from hermes_cli.nous_account import format_nous_portal_entitlement_message
 from hermes_cli.nous_subscription import MANAGED_FEATURE_COVERAGE_CATEGORY, NousSubscriptionFeatures
 from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, fal_key_is_configured

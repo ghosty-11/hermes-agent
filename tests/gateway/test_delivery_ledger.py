@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+from contextlib import closing
 import os
 import sqlite3
 import threading
@@ -125,11 +126,115 @@ class TestSchemaMigration:
 
         assert "adapter_profile" in columns
 
+    def test_legacy_row_backfills_crash_identity_before_remaining_content_changes(self):
+        now = time.time()
+        with closing(sqlite3.connect(dl._db_path())) as conn, conn:
+            conn.execute(
+                """CREATE TABLE delivery_obligations (
+                    obligation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
+                    platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT,
+                    content TEXT NOT NULL, state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL, owner_pid INTEGER,
+                    owner_started_at INTEGER, last_error TEXT
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, content, state,
+                    created_at, updated_at, owner_pid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("legacy", "agent:main:slack:channel:C1", "slack", "C1",
+                 "visible prose\nunlanded link", "attempting", now - 10, now - 10, 999999999),
+            )
+
+        dl.mark_failed("legacy", "send_path_degraded", remaining_content="unlanded link")
+        dl.record_crash_left_reply(
+            obligation_id="crash:other-id", session_key="agent:main:slack:channel:C1",
+            platform="slack", chat_id="C1", thread_id=None,
+            content="visible prose\nunlanded link", since=now - 20,
+        )
+
+        with closing(dl._connect()) as conn:
+            rows = conn.execute(
+                "SELECT obligation_id, content FROM delivery_obligations"
+            ).fetchall()
+        assert rows == [("legacy", "unlanded link")]
+        assert [row["content"] for row in dl.sweep_recoverable()] == ["unlanded link"]
+
+    def test_fresh_nullable_row_captures_original_before_narrowing(self):
+        original = "visible prose\nunlanded link"
+        with closing(dl._connect()) as conn, conn:
+            conn.execute(
+                """INSERT INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, content, state,
+                    created_at, updated_at, owner_pid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("copied", "agent:main:slack:channel:C1", "slack", "C1",
+                 original, "attempting", time.time(), time.time(), 999999999),
+            )
+        with closing(dl._connect()) as conn:
+            assert conn.execute(
+                "SELECT original_content FROM delivery_obligations WHERE obligation_id='copied'"
+            ).fetchone() == (None,)
+
+        dl.mark_failed("copied", "send_path_degraded", remaining_content="unlanded link")
+        with closing(dl._connect()) as conn:
+            assert conn.execute(
+                "SELECT content, original_content FROM delivery_obligations WHERE obligation_id='copied'"
+            ).fetchone() == ("unlanded link", original)
+
+        dl.record_crash_left_reply(
+            obligation_id="other", session_key="agent:main:slack:channel:C1",
+            platform="slack", chat_id="C1", thread_id=None, content=original,
+            since=time.time() - 60,
+        )
+        with closing(dl._connect()) as conn:
+            assert conn.execute(
+                "SELECT obligation_id, content FROM delivery_obligations"
+            ).fetchall() == [("copied", "unlanded link")]
+
+
+
 
 class TestStateMachine:
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
+
+    def test_partial_failure_reopens_and_sweeps_only_remaining_content(self):
+        _record(platform="telegram", content="landed prose\nuncarried URL")
+        before = _row("ob-1")
+        dl.mark_failed("ob-1", "503 Service Unavailable", remaining_content="uncarried URL")
+
+        reopened = _row("ob-1")
+        assert reopened["state"] == "failed"
+        assert reopened["content"] == "uncarried URL"
+        assert reopened["owner_pid"] == before["owner_pid"]
+        assert reopened["attempts"] == before["attempts"]
+        assert reopened["last_error"] == "503 Service Unavailable"
+        claimed = dl.sweep_failed_for_runtime("telegram", now=time.time() + 31)
+        assert [row["content"] for row in claimed] == ["uncarried URL"]
+
+    def test_ordinary_failure_retains_full_content(self):
+        _record(platform="telegram", content="full response")
+        dl.mark_failed("ob-1", "503 Service Unavailable")
+        assert _row("ob-1")["content"] == "full response"
+        assert [row["content"] for row in dl.sweep_failed_for_runtime(
+            "telegram", now=time.time() + 31)] == ["full response"]
+
+    @pytest.mark.parametrize("remaining", ["", 42, [], False])
+    def test_invalid_remaining_does_not_mutate_row(self, remaining):
+        _record(content="full response")
+        with dl._connect() as conn:
+            before = conn.execute(
+                "SELECT * FROM delivery_obligations WHERE obligation_id='ob-1'").fetchone()
+        with pytest.raises(ValueError):
+            dl.mark_failed("ob-1", "error", remaining_content=remaining)
+        with dl._connect() as conn:
+            after = conn.execute(
+                "SELECT * FROM delivery_obligations WHERE obligation_id='ob-1'").fetchone()
+        assert after == before
 
 
 class TestObligationId:
@@ -380,6 +485,18 @@ class TestPrune:
         with dl._DB_LOCK, dl._transaction() as conn:
             dl._prune_unlocked(conn, time.time())
         assert _row("ob-1") is None
+
+    def test_overflow_prunes_terminal_history_before_live_obligations(self, monkeypatch):
+        """Over the row cap, delivered history goes first; a pending owed reply survives."""
+        monkeypatch.setattr(dl, "_MAX_ROWS", 2)
+        _record("live")
+        for oid in ("old-1", "old-2"):
+            _record(oid)
+            dl.mark_delivered(oid)
+        with dl._DB_LOCK, dl._transaction() as conn:
+            dl._prune_unlocked(conn, time.time())
+        assert _row("live")["state"] == "pending"
+        assert _row("old-1") is None
 
 
 

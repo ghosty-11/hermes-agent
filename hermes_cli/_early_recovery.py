@@ -67,17 +67,13 @@ _UPDATE_RETRY_RECOVERED = False
 
 
 def _should_skip_external_secret_sources() -> bool:
-    """True inside any ``hermes update`` process (and its import probes).
+    """Never run external secret commands during an update or failed startup."""
+    from hermes_cli._parser import command_argv
 
-    Every dotenv load in the process — ``hermes_cli.main``, ``run_agent``, ``cli`` — consults
-    this, so the updater never resolves external secret sources: on Windows they map
-    ``cryptography._rust.pyd`` into the process replacing that venv, and everywhere a slow
-    ``op``/``bws``/command helper (up to 120s per source) would run inside the updater's
-    120s critical-module import probe and be reported as an import-health timeout.
-    Profile flags are stripped before ``hermes_cli.main`` loads dotenv, so ``argv[1]`` is
-    the authoritative subcommand.
-    """
-    return _UPDATE_RETRY_RECOVERED or sys.argv[1:2] == ["update"]
+    return (_UPDATE_RETRY_RECOVERED or command_argv(sys.argv[1:])[:1] == ["update"]
+            or os.environ.get("HERMES_LOCAL_UPDATE_CONTEXT") == "1"
+            or Path(sys.argv[0]).name in {"local_update_entry.py", "update_completion.py"}
+            or local_transaction_marker(_project_root()).exists())
 
 
 def _project_root() -> Path:
@@ -242,6 +238,10 @@ def _git_dir(root: Path) -> Path:
 
 def interrupted_pull_marker(root: Path) -> Path:
     return _git_dir(root) / INTERRUPTED_PULL_MARKER
+
+def local_transaction_marker(root: Path) -> Path:
+    """Durable explicit-recovery obligation beside Git metadata, outside data images."""
+    return _git_dir(root) / "hermes-local-update-pending"
 
 
 def _trees_git_could_write(git, pre: str, target: str) -> tuple[list[str], set[str]]:
@@ -449,8 +449,18 @@ def restore_interrupted_pull(project_root: Path | None = None) -> bool:
     looks exactly like git's own half-written file and is restored too, as is a user edit to a
     conflicted path or, on git < 2.38, to a path both sides of a custom-branch merge changed.
     """
+    root = _project_root() if project_root is None else Path(project_root).resolve()
+    from hermes_cli._parser import command_argv
+    args = command_argv(sys.argv[1:])
+    if local_transaction_marker(root).exists() or (
+        args[:1] == ["update"] and any(
+            option == flag or option.startswith(flag + "=")
+            for option in args[1:]
+            for flag in ("--source-repo", "--target", "--rollback-local-update")
+        )
+    ):
+        return False  # explicit local recovery owns its torn checkout
     try:
-        root = _project_root() if project_root is None else project_root
         marker = interrupted_pull_marker(root)
         if not marker.is_file() or _pytest_owns_live_checkout(root):
             return False
@@ -609,14 +619,22 @@ def recover_if_needed(project_root: Path | None = None, argv: list[str] | None =
     global _UPDATE_RETRY_RECOVERED
 
     root = _project_root() if project_root is None else Path(project_root).resolve()
+    if local_transaction_marker(root).exists():
+        return False  # never repair local dependencies with a network-capable startup
     if not explicit and _pytest_owns_live_checkout(root):
         return False
     from hermes_cli._parser import command_argv
+    from pm.environments import install_state_dir
 
     args = command_argv(sys.argv[1:] if argv is None else argv)
+    if not explicit and args[:1] == ["update"] and any(
+        option == flag or option.startswith(flag + "=")
+        for option in args[1:]
+        for flag in ("--source-repo", "--target", "--rollback-local-update")
+    ):
+        return False
     if not explicit and args[:1] == ["pm"]:
         return False  # PM's command boundary owns the explicit repair.
-    from pm.environments import install_state_dir
 
     missing_marker = install_state_dir(root) / ".repair-incomplete"
     marker_paths = (root / ".update-incomplete", root / ".lazy-refresh-incomplete", missing_marker)

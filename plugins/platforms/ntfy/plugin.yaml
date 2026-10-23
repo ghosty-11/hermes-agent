@@ -1,6 +1,10 @@
 name: ntfy-platform
 label: ntfy
 kind: platform
+platform_dependencies:
+  ntfy:
+    extras: []
+    env: [NTFY_TOPIC, NTFY_TOKEN]
 version: 1.0.0
 description: >
   ntfy push-notification gateway adapter for Hermes Agent.

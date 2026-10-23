@@ -1016,7 +1016,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """``config.yaml`` value for ``section.key``, else the DEFAULT_CONFIG value.
         Raises if config is unreadable; callers wrap with their own hard fallback so
         registry code paths never crash on a broken config file."""
-        from hermes_cli.config import DEFAULT_CONFIG, cfg_get, read_raw_config
+        from hermes_cli.config import DEFAULT_CONFIG, read_raw_config
+        from hermes_cli.config_primitives import cfg_get
 
         val = cfg_get(read_raw_config(), section, key)
         return DEFAULT_CONFIG[section][key] if val is None else val

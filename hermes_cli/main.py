@@ -2409,12 +2409,44 @@ def _finalize_update_receipt(code: int, reason: str) -> None:
         pass
 
 
+def _validate_local_update_args(args) -> bool:
+    """Reject ambiguous local and rollback modes before channel metadata or checks."""
+    import re
+
+    source = getattr(args, "source_repo", None)
+    target = getattr(args, "target", None)
+    rollback = getattr(args, "rollback_local_update", None)
+    acknowledged = getattr(args, "acknowledge_data_rollback", False)
+    required = getattr(args, "required_extra", [])
+    local = source is not None or target is not None
+    if not local and not rollback and not acknowledged and not required:
+        return False
+    incompatible = ("check", "plan", "list_venv_holders", "install_id", "channel",
+                    "set_channel", "branch", "switch_branch", "keep_stash",
+                    "no_backup", "force", "force_venv")
+    if any(getattr(args, key, None) for key in incompatible):
+        raise ValueError("local update cannot combine with remote, bypass or read-only update flags")
+    if rollback:
+        if local or required or not acknowledged or getattr(args, "backup", False):
+            raise ValueError("rollback requires only --rollback-local-update and --acknowledge-data-rollback")
+    elif (acknowledged or not source or not target or not re.fullmatch(r"[0-9a-f]{40}", target)
+          or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", item) for item in required)):
+        raise ValueError("--source-repo and a full lowercase 40-hex --target are required together")
+    return True
+
+
 def _update_preflight_handled(args) -> bool:
     """Managed-install refusal, --plan, admission gate, --check. True = nothing more to do."""
     from hermes_cli.config import is_managed, managed_error
     from hermes_cli.update_channel import handle_metadata_args
+    try:
+        local = _validate_local_update_args(args)
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        raise SystemExit(2) from exc
 
-    if handle_metadata_args(args, PROJECT_ROOT):
+
+    if not local and handle_metadata_args(args, PROJECT_ROOT):
         sys.exit(0)
     if is_managed():
         managed_error("update Hermes Agent")
@@ -2467,7 +2499,7 @@ def _update_preflight_handled(args) -> bool:
         record_refusal_receipt(refusal)
         sys.exit(2)
 
-    if getattr(args, "check", False):
+    if getattr(args, "check", False) and not local:
         # --check honors --branch so its answer matches what update would pull.
         branch = _resolve_update_branch(args)
         from hermes_cli.update_cmd import _cmd_update_check
@@ -2499,24 +2531,28 @@ def cmd_update(args):
     gateway_mode = getattr(args, "gateway", False)
 
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
-    # Cross-process mutual exclusion: dashboard Update button, Tauri updater
-    # and this command all mutate one checkout; two at once strand it
-    # half-updated. Shares the marker the Tauri/Electron updaters already use.
+    # Every cooperating update of this checkout retains one kernel claim.
+    # The home marker remains status only; shared PM state has a second claim.
     from hermes_cli.update_lock import (
         UPDATE_EXIT_CONCURRENT,
         UpdateLock,
         describe_holder,
     )
+    from pm import InstallError
 
-    _update_lock = UpdateLock()
-    if not _update_lock.acquire():
-        print(describe_holder(_update_lock.holder))
+    try:
+        _update_lock = UpdateLock(install_root=PROJECT_ROOT) if os.name == "posix" else UpdateLock()
+        if not _update_lock.acquire():
+            print(describe_holder(_update_lock.holder))
+            _finalize_update_output(_update_io_state)
+            sys.exit(UPDATE_EXIT_CONCURRENT)
+    except (OSError, RuntimeError, InstallError) as exc:
+        print(f"✗ Update refused: {exc}")
         _finalize_update_output(_update_io_state)
-        sys.exit(UPDATE_EXIT_CONCURRENT)
+        raise SystemExit(UPDATE_EXIT_CONCURRENT) from exc
 
 
     from hermes_cli.update_cmd import _cmd_update_impl
-    from pm import InstallError
 
     try:
         _cmd_update_impl(args, gateway_mode=gateway_mode)

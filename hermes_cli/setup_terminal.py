@@ -171,7 +171,8 @@ def _setup_backend_modal(config: dict) -> None:
         tool_backend_helpers.managed_nous_tools_enabled()
         and nous_subscription.get_nous_subscription_features(config).nous_auth_present
         and is_managed_tool_gateway_ready("modal"))
-    modal_mode = normalize_modal_mode(_setup.cfg_get(config, "terminal", "modal_mode"))
+    from hermes_cli.config_primitives import cfg_get
+    modal_mode = normalize_modal_mode(cfg_get(config, "terminal", "modal_mode"))
     use_managed_modal = False
     if managed_modal_available:
         # Default to the configured mode; when unset, to "direct" only if Modal creds exist.
@@ -286,7 +287,8 @@ def setup_terminal_backend(config: dict):
     _setup._info("Choose where Hermes runs shell commands and code.",
                  "This affects tool execution, file access, and isolation.",
                  f"   Guide: {_setup._DOCS_BASE}/user-guide/configuration#terminal-backend-configuration", None)
-    current_backend = _setup.cfg_get(config, "terminal", "backend", default="local")
+    from hermes_cli.config_primitives import cfg_get
+    current_backend = cfg_get(config, "terminal", "backend", default="local")
     backends = list(_BUILTIN_TERMINAL_BACKENDS)
     if _platform.system() == "Linux":
         backends.append(("singularity", "Singularity/Apptainer - HPC-friendly container"))

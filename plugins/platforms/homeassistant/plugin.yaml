@@ -1,6 +1,10 @@
 name: homeassistant-platform
 label: Home Assistant
 kind: platform
+platform_dependencies:
+  homeassistant:
+    extras: []
+    env: [HASS_TOKEN, HASS_URL]
 version: 1.0.0
 description: >
   Home Assistant gateway adapter for Hermes Agent.

@@ -909,7 +909,8 @@ def check_requirements() -> bool:
 
 
 def validate_config(config) -> bool:
-    return all(_credentials(config))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("line", getattr(config, "extra", {}) or {}, _get_scoped_secret)
 
 
 def is_connected(config) -> bool:

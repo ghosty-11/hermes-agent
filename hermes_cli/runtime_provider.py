@@ -26,8 +26,9 @@ from hermes_cli.auth import (  # resolve_external_process_provider_credentials i
     resolve_nous_runtime_credentials, resolve_codex_runtime_credentials, resolve_xai_oauth_runtime_credentials,
     resolve_qwen_runtime_credentials, resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,  # noqa: F401
-    has_usable_secret, is_actual_local_base_url, looks_like_openrouter_key, normalize_actual_base_url,
+    is_actual_local_base_url, looks_like_openrouter_key, normalize_actual_base_url,
 )
+from hermes_cli.secret_validation import has_usable_secret
 from hermes_cli import config as _config_mod
 from hermes_cli import models as _models  # attribute access keeps ``hermes_cli.models.<name>`` patches effective
 from hermes_constants import OPENROUTER_BASE_URL

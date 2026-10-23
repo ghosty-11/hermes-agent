@@ -1,6 +1,10 @@
 name: email-platform
 label: Email
 kind: platform
+platform_dependencies:
+  email:
+    extras: []
+    env: [EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST]
 version: 1.0.0
 description: >
   Email gateway adapter for Hermes Agent. Polls an IMAP mailbox for inbound

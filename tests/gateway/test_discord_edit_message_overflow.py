@@ -312,3 +312,291 @@ class TestPartialMessageContinuationReferences:
             assert call["reference"] is not None, (
                 "continuation lost its reply reference — the ids-built "
                 "fallback for PartialMessage regressed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_timeout", (False, True))
+async def test_timeout_during_real_overflow_edit_retains_uncertain_tail_in_final_bracket(
+    tmp_path, monkeypatch, retry_timeout,
+):
+    import asyncio
+
+    from gateway import delivery_ledger as dl
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.session import SessionSource
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "ledger.db")
+    adapter = _make_adapter()
+    edited = []
+    message = SimpleNamespace(
+        id=42, edit=AsyncMock(side_effect=lambda *, content: edited.append(content)),
+        to_reference=lambda **_kwargs: object(),
+    )
+
+    def continuation(attempt, content, reference):
+        if not retry_timeout and attempt == 2:
+            raise asyncio.TimeoutError("continuation ack unknown")
+        if retry_timeout and attempt == 2:
+            raise RuntimeError("reply anchor unavailable")
+        if retry_timeout and attempt == 3:
+            raise asyncio.TimeoutError("retry ack unknown")
+        return None
+
+    channel, sends = _wire_channel(adapter, original_msg=message, send_side_effect=continuation)
+    final = "x" * 6100
+    chunks = adapter._cap_split_chunks(adapter.truncate_message(adapter.format_message(final), MAX))
+    assert len(chunks) >= 4  # one accepted continuation, one uncertain, one never attempted
+    # The first continuation lands, and the later one is unknown; in the retry case
+    # the same continuation is attempted once with and once without its reply anchor.
+    receipt = await adapter.edit_message("555", "42", final, finalize=True)
+    assert edited == [chunks[0]]
+    assert [s["content"] for s in sends] == (
+        [chunks[1], chunks[2], chunks[2]] if retry_timeout else [chunks[1], chunks[2]])
+    assert not receipt.success
+    assert receipt.delivered_text == "\n".join(chunks[:2])
+    assert set(receipt.raw_response["message_ids"]) == {"42", "9001"}
+    assert "9002" not in receipt.raw_response["message_ids"]
+    assert receipt.raw_response["delivery_ambiguous"] is True
+    owed = "\n".join(chunks[2:])
+    assert receipt.raw_response["remaining_content"] == owed
+
+    from gateway.delivery_handoff import delivery_handoff_from_receipt
+
+    handoff = delivery_handoff_from_receipt(final, receipt)
+    db = SessionDB(db_path=tmp_path / "session.db")
+    try:
+        sid = db.create_session("overflow", "test")
+        db.append_message(sid, "user", "question")
+        db.append_message(sid, "assistant", final)
+        row_id = db.get_messages_as_conversation(sid, include_row_ids=True)[-1]["_row_id"]
+        runner = GatewayTurnMixin()
+        runner._session_db = db
+        adapter.gateway_runner = runner
+        source = SessionSource(platform=Platform.DISCORD, chat_id="555", chat_type="channel")
+        event = MessageEvent(text="question", source=source, message_id="inbound")
+        event._stream_delivery_handoff = handoff
+        event.turn_delivery_address = {
+            "session_id": sid, "row_id": row_id, "turn_id": "overflow",
+            "disposition_hint": "text"}
+        key = "agent:main:discord:channel:555"
+        result, _ = await adapter.send_final_ledgered(event, key, final, {}, reply_to=None)
+        await adapter._finalize_turn_delivery_record(event, [result])
+        delivery = db.get_messages_as_conversation(sid)[-1]["display_metadata"]["delivery"]
+        with dl._connect() as conn:
+            obligation = conn.execute(
+                "SELECT obligation_id,content,original_content,state FROM delivery_obligations"
+            ).fetchone()
+        assert len(sends) == (3 if retry_timeout else 2)
+        assert tuple(obligation) == (
+            dl.compute_obligation_id(key, "inbound", final), owed, final, "failed")
+        assert delivery["text"] == "\n".join(chunks[:2])
+        assert delivery["message_ids"] == ["42", "9001"]
+        assert delivery["partial"] is True
+        assert delivery["error"]
+    finally:
+        db.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model,preview,final,attempt,finalize,tail", (
+    ("Hello", "Hello▉", "Hello plus", "Hello plus▉", False, " plus"),
+    ("Hello", "Hello▉", "Hello", "Hello", True, ""),
+    ("Hello▉", "Hello▉▉", "Hello▉ plus", "Hello▉ plus▉", False, " plus"),
+    ("Hello▉", "Hello▉", "Hello▉ plus", "Hello▉ plus▉", False, " plus"),
+))
+async def test_refused_edit_after_cursor_preview_owes_only_model_tail(
+    tmp_path, monkeypatch, model, preview, final, attempt, finalize, tail,
+):
+    from gateway import delivery_ledger as dl
+    from gateway.delivery_handoff import StreamDeliveryHandoff
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "ledger.db")
+    adapter = _make_adapter()
+    edits = []
+
+    async def refuse(*, content):
+        edits.append(content)
+        raise RuntimeError("edit refused")
+
+    message = SimpleNamespace(id=9001, content=preview, edit=refuse)
+    _, sends = _wire_channel(adapter, original_msg=message)
+    adapter._reply_to_mode = "off"
+    consumer = GatewayStreamConsumer(adapter, "555", StreamConsumerConfig(cursor="▉"))
+    consumer._stream_ledger = model
+    assert await consumer._first_send(preview, finalize=False)
+    consumer._stream_ledger = final
+    assert not await consumer._edit_existing(
+        attempt, finalize=finalize, is_turn_final=finalize)
+    handoff = consumer.delivery_handoff_for_final(final)
+    assert handoff.owed == tail
+    assert handoff.result.delivered_text == preview
+    restored = StreamDeliveryHandoff.from_record(handoff.to_record())
+    assert restored.owed == tail and restored.result.delivered_text == preview
+
+    event = MessageEvent(
+        text="question", source=SessionSource(
+            platform=Platform.DISCORD, chat_id="555", chat_type="channel"),
+        message_id="inbound")
+    event._stream_delivery_handoff = handoff
+    result, _ = await adapter.send_final_ledgered(
+        event, "agent:main:discord:channel:555", final, {}, reply_to=None)
+    assert edits[0] == attempt and all(edit == model for edit in edits[1:])
+    assert [item["content"] for item in sends] == (
+        [preview, tail] if tail else [preview])
+    assert message.content == preview
+    assert event._stream_delivery_handoff.result.delivered_text == (
+        preview + "\n" + tail if tail else preview)
+    assert result.success
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT content,original_content,state FROM delivery_obligations").fetchone()
+    assert tuple(row) == (tail, final, "delivered")
+
+@pytest.mark.asyncio
+async def test_refused_edit_after_sealed_head_cursor_tail_owes_only_model_suffix(
+    tmp_path, monkeypatch,
+):
+    from gateway import delivery_ledger as dl
+    from gateway.config import Platform
+    from gateway.delivery_handoff import StreamDeliveryHandoff
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig, _Tick
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "ledger.db")
+    adapter = _make_adapter()
+    head_text = "H" * 500
+    edits = []
+
+    async def edit_head(*, content):
+        edits.append(("9001", content))
+        head.content = content
+
+    async def refuse_tail(*, content):
+        edits.append(("9002", content))
+        raise RuntimeError("edit refused")
+
+    head = SimpleNamespace(id=9001, content=head_text + "▉", edit=edit_head)
+    tail = SimpleNamespace(id=9002, content="Tail▉", edit=refuse_tail)
+    channel, sends = _wire_channel(adapter, original_msg=head)
+    channel.get_partial_message = lambda mid: {9001: head, 9002: tail}[mid]
+    adapter._reply_to_mode = "off"
+    consumer = GatewayStreamConsumer(adapter, "555", StreamConsumerConfig(cursor="▉"))
+    consumer._len_fn = len
+    consumer._safe_limit = len(head_text)
+    consumer._append_accumulated(head_text)
+    assert await consumer._first_send(head_text + "▉", finalize=False)
+
+    consumer._append_accumulated("Tail")
+    await consumer._seal_overflow_heads()
+    assert consumer._turn_split_delivery and consumer._accumulated == "Tail"
+    tick = _Tick()
+    await consumer._push_update(tick)
+    assert tick.update_visible
+    assert sends[:2] == [
+        {"content": head_text + "▉", "reference": None},
+        {"content": "Tail▉", "reference": None},
+    ]
+    assert consumer._delivery_handoff.to_record()["cursor_carriage"] == {
+        "message_id": "9002", "text": "Tail▉"}
+
+    consumer._append_accumulated(" plus")
+    final = head_text + "Tail plus"
+    assert not await consumer._edit_existing(
+        "Tail plus▉", finalize=False, is_turn_final=False)
+    handoff = consumer.delivery_handoff_for_final(final)
+    assert handoff.owed == " plus"
+    assert handoff.to_record()["acknowledged_carriages"] == [
+        {"message_id": "9001", "text": head_text},
+        {"message_id": "9002", "text": "Tail▉"},
+    ]
+    restored = StreamDeliveryHandoff.from_record(handoff.to_record())
+    assert restored.owed == " plus"
+    assert restored.result.delivered_text == head_text + "\nTail▉"
+
+    event = MessageEvent(
+        text="question", source=SessionSource(
+            platform=Platform.DISCORD, chat_id="555", chat_type="channel"),
+        message_id="inbound")
+    event._stream_delivery_handoff = handoff
+    result, _ = await adapter.send_final_ledgered(
+        event, "agent:main:discord:channel:555", final, {}, reply_to=None)
+    assert edits[0] == ("9001", head_text)
+    assert edits[1] == ("9002", "Tail plus▉")
+    assert all(edit == ("9002", "Tail") for edit in edits[2:])
+    assert [item["content"] for item in sends] == [
+        head_text + "▉", "Tail▉", " plus"]
+    assert head.content == head_text and tail.content == "Tail▉"
+    assert event._stream_delivery_handoff.result.delivered_text == (
+        head_text + "\nTail▉\n plus")
+    assert result.success
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT content,original_content,state FROM delivery_obligations").fetchone()
+    assert tuple(row) == (" plus", final, "delivered")
+
+@pytest.mark.asyncio
+async def test_definitely_refused_edit_sends_only_tail_beside_visible_preview(
+    tmp_path, monkeypatch,
+):
+    from gateway import delivery_ledger as dl
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.session import SessionSource
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "ledger.db")
+    adapter = _make_adapter()
+    edits = []
+
+    async def refuse(*, content):
+        edits.append(content)
+        raise RuntimeError("edit refused")
+
+    message = SimpleNamespace(id=9001, edit=refuse)
+    _, sends = _wire_channel(adapter, original_msg=message)
+    adapter._reply_to_mode = "off"
+    consumer = GatewayStreamConsumer(adapter, "555", StreamConsumerConfig(cursor=""))
+    assert await consumer._first_send("Hello", finalize=False)
+    consumer._stream_ledger = "Hello plus"
+    assert not await consumer._edit_existing("Hello plus", finalize=True, is_turn_final=True)
+    handoff = consumer.delivery_handoff_for_final("Hello plus")
+    db = SessionDB(db_path=tmp_path / "session.db")
+    try:
+        sid = db.create_session("refused-edit", "test")
+        db.append_message(sid, "user", "question")
+        db.append_message(sid, "assistant", "Hello plus")
+        row_id = db.get_messages_as_conversation(sid, include_row_ids=True)[-1]["_row_id"]
+        runner = GatewayTurnMixin()
+        runner._session_db = db
+        adapter.gateway_runner = runner
+        event = MessageEvent(
+            text="question", source=SessionSource(
+                platform=Platform.DISCORD, chat_id="555", chat_type="channel"),
+            message_id="inbound")
+        event._stream_delivery_handoff = handoff
+        event.turn_delivery_address = {
+            "session_id": sid, "row_id": row_id, "turn_id": "refused-edit",
+            "disposition_hint": "text"}
+        result, _ = await adapter.send_final_ledgered(
+            event, "agent:main:discord:channel:555", "Hello plus", {}, reply_to=None)
+        await adapter._finalize_turn_delivery_record(event, [result])
+        delivery = db.get_messages_as_conversation(sid)[-1]["display_metadata"]["delivery"]
+        with dl._connect() as conn:
+            row = conn.execute(
+                "SELECT content,original_content,state FROM delivery_obligations").fetchone()
+        assert edits == ["Hello plus"]
+        assert [s["content"] for s in sends] == ["Hello", " plus"]
+        assert delivery["text"] == "Hello\n plus"
+        assert delivery["message_ids"] == ["9001", "9002"]
+        assert tuple(row) == (" plus", "Hello plus", "delivered")
+    finally:
+        db.close()

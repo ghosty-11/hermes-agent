@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Fail when tracked production code imports the tools.lazy_deps stub.
 
-``tools/lazy_deps.py`` survives only as an old-updater stub that raises or
-stops for relaunch; pm.extras (available / ensure_import / ensure_and_bind)
-is the only lazy-install surface. A production import of the stub never
-gets its dependencies, so this guard blocks the migration from silently
-re-opening.
+``tools/lazy_deps.py`` stops an old updater for relaunch; it never provides
+dependencies. Passive checks use ``pm.extras``. Bundled installers call
+``pm.platform_requirements.ensure_platform_dependencies`` with an explicit
+``plugin.yaml`` path, then rebind their optional dependency symbols.
 
 - **Tracked inventory.** The file list comes from ``git ls-files``, so
   ignored worktree/build debris is never walked. The check never passes
@@ -168,8 +167,9 @@ def main(argv: list[str]) -> int:
             print(site)
         print(
             f"{len(offenders)} import(s) of '{_STUB_MODULE}' (old-updater stub — "
-            "it never provides dependencies). Migrate to pm.extras "
-            "(available / ensure_import / ensure_and_bind).",
+            "it never provides dependencies). Use passive pm.extras checks and "
+            "pm.platform_requirements.ensure_platform_dependencies with an explicit "
+            "plugin.yaml path for installation.",
             file=sys.stderr,
         )
         return 1

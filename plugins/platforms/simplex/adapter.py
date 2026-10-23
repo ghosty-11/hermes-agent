@@ -616,8 +616,8 @@ def check_requirements() -> bool:
 
 
 def validate_config(config) -> bool:
-    extra = getattr(config, "extra", {}) or {}
-    return bool(_get_scoped_secret("SIMPLEX_WS_URL") or extra.get("ws_url", ""))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("simplex", getattr(config, "extra", {}) or {}, _get_scoped_secret)
 
 
 def is_connected(config) -> bool:

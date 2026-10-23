@@ -26,8 +26,10 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.relay.egress import declined_send
+from gateway.turn_refusals import refused
 from gateway.turn_context import TurnContext
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -114,6 +116,15 @@ class TurnRunner:
         ctx = self._ctx
         if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
             ctx._cleanup_msg_ids.append(str(result.message_id))
+
+    def _progress_declined(self, result=None) -> bool:
+        if result is not None and declined_send(result):
+            self._ctx._progress_decline_receipt = result
+        source = getattr(self._ctx, "source", None)
+        shared = refused(getattr(source, "platform", None), getattr(source, "chat_id", None))
+        if shared is not None and getattr(self._ctx, "_progress_decline_receipt", None) is None:
+            self._ctx._progress_decline_receipt = shared
+        return getattr(self._ctx, "_progress_decline_receipt", None) is not None
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -385,7 +396,6 @@ class TurnRunner:
     async def _task_card_send_or_edit_fallback(self, st) -> None:
         ctx = self._ctx
         text = st.fallback_text()
-        from gateway.relay.egress import declined_send
 
         if st.publication_suppressed:
             return
@@ -399,7 +409,7 @@ class TurnRunner:
             # editable-text fallback: a declined edit fell through to
             # _send_progress_text and re-sent the same task text to the refused
             # chat. The decline must set the terminal state here too.
-            if declined_send(result):
+            if self._progress_declined(result):
                 logger.warning(
                     "Task-card fallback edit DECLINED by the connector's egress "
                     "guard; suppressing progress delivery for the rest of this "
@@ -410,6 +420,8 @@ class TurnRunner:
         result = await self._send_progress_text(st, text)
         if getattr(result, "success", False) and getattr(result, "message_id", None):
             st.fallback_msg_id = str(result.message_id)
+        if self._progress_declined(result):
+            st.publication_suppressed = True
 
     async def _task_card_publish(self, st) -> None:
         ctx = self._ctx
@@ -441,9 +453,7 @@ class TurnRunner:
             # fallback below sends the same task text to the same chat, which
             # turns a refused card into delivered plain text. Stop the lane
             # without re-delivering; the refusal is already logged.
-            from gateway.relay.egress import declined_send
-
-            if declined_send(result):
+            if self._progress_declined(result):
                 # TERMINAL, and stored SEPARATELY from native_failed. Reusing
                 # native_failed suppressed exactly ONE update: the next progress
                 # event skipped this branch (the lane is already "failed") and
@@ -510,6 +520,9 @@ class TurnRunner:
         st = self._TaskCardState(adapter)
         try:
             while ctx._run_still_current():
+                if self._progress_declined():
+                    self._drain_progress_queue()
+                    return
                 try:
                     raw = ctx.progress_queue.get_nowait()
                 except queue.Empty:
@@ -521,13 +534,13 @@ class TurnRunner:
             if self._task_card_drain(st) and ctx._run_still_current() and not self._agent_interrupted():
                 await self._task_card_publish(st)
         finally:
-            if hasattr(adapter, "stop_native_task_card_progress"):
-                # Best-effort on the turn-cleanup path: an escaping transport exception would skip
-                # final-delivery logic (cleanup awaits catch only CancelledError).
+            if hasattr(adapter, "stop_native_task_card_progress") and not self._progress_declined():
+                # Stop is an addressed frame. Its receipt can be the first refusal in this turn.
                 try:
-                    await adapter.stop_native_task_card_progress(
+                    stop_result = await adapter.stop_native_task_card_progress(
                         ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
                     )
+                    self._progress_declined(stop_result)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -597,9 +610,12 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        if self._progress_declined():
+            return ctx._progress_decline_receipt
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
+        self._progress_declined(result)
         self._track_progress_result(result)
         return result
 
@@ -609,7 +625,7 @@ class TurnRunner:
         Returns True when it delivered/split the buffer or a transient edit failure left it
         intact for retry — either way the caller skips the normal send/edit path this tick.
         """
-        if not st.progress_lines or not st.can_edit:
+        if self._progress_declined() or not st.progress_lines or not st.can_edit:
             return False
         groups = self._split_progress_groups(st, st.progress_lines)
         if len(groups) <= 1:
@@ -617,6 +633,8 @@ class TurnRunner:
         if st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
             if not result.success:
+                if self._progress_declined(result):
+                    return True
                 if getattr(result, "retryable", False):
                     logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
                     return True
@@ -626,6 +644,8 @@ class TurnRunner:
             groups = groups[1:]
         for group in groups:
             result = await self._send_progress_text(st, self._progress_text(group))
+            if self._progress_declined():
+                return True
             if result.success and result.message_id:
                 st.progress_msg_id = result.message_id
         # The newest continuation is the only mutable bubble: keep just its lines so later
@@ -655,11 +675,14 @@ class TurnRunner:
         return raw
 
     async def _flush_progress_edit(self, st) -> None:
-        if st.can_edit and st.progress_lines and st.progress_msg_id:
+        if st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_declined():
             with suppress(Exception):
-                await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                self._progress_declined(result)
 
     async def _drain_progress_on_cancel(self, st) -> None:
+        if self._progress_declined():
+            return
         ctx = self._ctx
         with suppress(Exception):
             while not ctx.progress_queue.empty():
@@ -676,12 +699,14 @@ class TurnRunner:
         # Final edit with all remaining tools (only if editing works)
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             await self._roll_progress_overflow_if_needed(st)
+        if self._progress_declined():
+            return
         await self._flush_progress_edit(st)
 
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
         await asyncio.sleep(0.3)
-        if ctx._run_still_current():
+        if ctx._run_still_current() and not self._progress_declined():
             await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
     async def _progress_send_or_edit(self, st, msg) -> bool:
@@ -690,9 +715,13 @@ class TurnRunner:
         Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
         failures (not found, permissions) set can_edit=False. Flood control backs off but keeps editing.
         """
+        if self._progress_declined():
+            return True
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
             if result.success:
+                return True
+            if self._progress_declined(result):
                 return True
             if getattr(result, "retryable", False):
                 logger.debug("[%s] Transient edit failure — keeping can_edit=True", st.adapter.name)
@@ -729,6 +758,9 @@ class TurnRunner:
         EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
         while True:
             try:
+                if self._progress_declined():
+                    self._drain_progress_queue()
+                    return
                 if not ctx._run_still_current():
                     self._drain_progress_queue()
                     return

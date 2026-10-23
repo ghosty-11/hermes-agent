@@ -142,8 +142,11 @@ def _run_streaming(command: list[str], *, cwd: Path, env: dict[str, str],
                    timeout: int, output: TextSink) -> subprocess.CompletedProcess:
     """Keep CI progress live, a bounded diagnostic tail, and a wall-clock timeout."""
     deadline = time.monotonic() + timeout
-    proc = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0)
+    from pm.writer_claim import child_spawn
+    with child_spawn(env) as spawn:
+        proc = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                bufsize=0, **spawn)
     pipe = proc.stdout
     assert isinstance(pipe, io.TextIOWrapper)  # Popen was given stdout=PIPE and text=True.
     tail = ""
@@ -217,7 +220,8 @@ def managed_environment(destination: Path, *, python: Path | None = None,
     from pm._uv import _toolchain
     from pm.packages import uv_cache_dir
 
-    tools = _toolchain(explicit=explicit, realize=realize)
+    tools = _toolchain(explicit=explicit, realize=realize, offline=offline) if offline else (
+        _toolchain(explicit=explicit, realize=realize))
     if tools is None:
         raise InstallError("venv", "PM's pinned toolchain is unavailable")
     uv, pinned_python = tools
@@ -314,8 +318,11 @@ class PythonEnvironment:
                         raise
                     tail.close(result.returncode == 0)
                     return result
-                return subprocess.run(command, cwd=str(cwd), env=env, capture_output=True,
-                                      text=True, encoding="utf-8", errors="replace", timeout=timeout)
+                from pm.writer_claim import child_spawn
+                with child_spawn(env) as spawn:
+                    return subprocess.run(command, cwd=str(cwd), env=env, capture_output=True,
+                                          text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                                          **spawn)
             except subprocess.TimeoutExpired as exc:
                 from pm.index_config import TIMEOUT_HINT
 

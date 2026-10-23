@@ -334,15 +334,10 @@ def _resolve_cli_path(configured: str = "") -> str:
 
 
 def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
-    configured = _configured_credentials_file(extra)
-    if configured:
-        return [Path(configured).expanduser()]
-    if _is_multiplex_active():
-        return []
-    try:
-        return sorted(_DEFAULT_CREDENTIALS_DIR.glob("*credentials*.json"))
-    except OSError:
-        return []
+    from gateway.platform_configuration import buzz_credentials_candidates
+    return list(buzz_credentials_candidates(extra or {}, _get_scoped_secret,
+                                            multiplex_active=_is_multiplex_active(),
+                                            default_dir=_DEFAULT_CREDENTIALS_DIR))
 
 
 _KEY_FIELDS = ("nsec", "private_key_hex", "private_key")

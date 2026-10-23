@@ -21,11 +21,8 @@ def test_chat_provider_argparse_acceptance(monkeypatch):
 
     assert recorded["provider"] == "my-custom-key"
 
-def test_resolve_named_custom_runtime_honors_explicit_base_url(monkeypatch):
+def test_resolve_named_custom_runtime_honors_explicit_base_url():
     """_resolve_named_custom_runtime honors (provider='custom', explicit_base_url=...)."""
-    # Mock has_usable_secret to recognize our test key
-    monkeypatch.setattr("hermes_cli.runtime_provider.has_usable_secret", lambda x: x == "test-api-key")
-    
     result = _resolve_named_custom_runtime(
         requested_provider="custom",
         explicit_api_key="test-api-key",

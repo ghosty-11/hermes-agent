@@ -1,7 +1,7 @@
 """Custom-provider resolution: ``providers:`` / ``custom_providers:`` lookup, identity recovery,
 custom credential pools, and the named-custom runtime builder. Extracted from
 :mod:`hermes_cli.runtime_provider`; origin-internal collaborators
-(``load_config``, ``_get_model_config``, ``load_pool``, ``has_usable_secret``, …) are looked up on
+(``load_config``, ``_get_model_config``, ``load_pool``, …) are looked up on
 the origin module AT CALL TIME via :func:`_rp` so ``monkeypatch.setattr(runtime_provider, name, …)``
 keeps working for moved bodies."""
 
@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
 from agent.secret_scope import get_secret_str
+from hermes_cli.secret_validation import has_usable_secret
 from utils import base_url_hostname
 
 logger = logging.getLogger("hermes_cli.runtime_provider")
@@ -384,7 +385,7 @@ def _try_resolve_from_custom_pool(
             pool_api_key = rp._pool_entry_api_key(entry) if entry is not None else ""
             if not pool_api_key:
                 continue
-            if not rp.has_usable_secret(pool_api_key) and rp._loopback_hostname(base_url_hostname(base_url)):
+            if not has_usable_secret(pool_api_key) and rp._loopback_hostname(base_url_hostname(base_url)):
                 # Legacy configs used short placeholder keys ('123', 'm') for local no-auth
                 # services; has_usable_secret's 4-char floor rejects them. Every other path
                 # substitutes "no-key-required" for a loopback endpoint — this was the one gap.
@@ -497,7 +498,7 @@ def _resolve_direct_alias_runtime(requested_provider: str, explicit_api_key: Opt
     # ``model.key_env`` only when this alias endpoint IS the configured model.base_url (#67453).
     candidates = [(explicit_api_key or "").strip(), _model_cfg_key_env_for(rp._get_model_config(), base_url),
                   *rp._host_gated_env_key_candidates(base_url, ollama=True)]
-    api_key = next((c for c in candidates if rp.has_usable_secret(c)), "")
+    api_key = next((c for c in candidates if has_usable_secret(c)), "")
     return _custom_runtime(rp, base_url, api_key, None, source="direct-alias", requested_provider=requested_provider)
 
 
@@ -563,12 +564,12 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
         _key_env_secret(custom_provider, f"custom provider '{custom_provider.get('name', requested_provider)}'"),
         *rp._host_gated_env_key_candidates(base_url, ollama=False),
     ]
-    api_key: Any = next((c for c in candidates if rp.has_usable_secret(c)), "")
+    api_key: Any = next((c for c in candidates if has_usable_secret(c)), "")
     # ``key_cmd`` credentials are minted per request (short-lived bearers would go stale
     # mid-session); both wire clients accept a callable api_key (the Entra ID contract). An
     # explicit --api-key still wins as the one-off recovery escape hatch.
     key_cmd = _clean(custom_provider.get("key_cmd", ""))
-    if key_cmd and not rp.has_usable_secret(explicit_key):
+    if key_cmd and not has_usable_secret(explicit_key):
         from agent.command_token_source import build_command_token_provider
         token_provider = build_command_token_provider(key_cmd, str(custom_provider.get("name", requested_provider) or "custom"))
         if token_provider is not None:

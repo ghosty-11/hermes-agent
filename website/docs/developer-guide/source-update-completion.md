@@ -32,6 +32,16 @@ results). Selected-Python completion owns launcher publication, builders, cache
 invalidation, all-profile configuration/state/skills maintenance, process scans,
 fleet restart, Windows resume, dashboard deduplication and verification.
 
+Local-source completion carries `offline: true` in the correlated request through
+both interpreters. PM installs required pinned tools from verified archive cache
+entries only; missing entries refuse before a mirror request. Python resolution
+uses uv's offline mode. Node workspaces must match a prepared dependency receipt;
+the update never runs `npm ci` offline. Configured extras and local memory
+providers are required. Config migration and cron/model recovery
+checks must complete across all profile homes, or offline completion refuses.
+The offline tail records release-history fetch, Honcho peer creation and
+optional new default-tool acquisition as not attempted.
+
 The existing per-kind restart and abort-recovery algorithms remain; transient
 supervisor/process failures are real even without mixed-generation imports. Only
 the purge/reload workaround and independent retry/ZIP tail compositions disappear.

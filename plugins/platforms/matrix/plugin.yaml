@@ -1,6 +1,10 @@
 name: matrix-platform
 label: Matrix
 kind: platform
+platform_dependencies:
+  matrix:
+    extras: [matrix]
+    env: [MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN, MATRIX_PASSWORD, MATRIX_RECOVERY_KEY]
 version: 1.0.0
 description: >
   Matrix gateway adapter for Hermes Agent.

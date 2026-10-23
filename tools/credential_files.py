@@ -14,7 +14,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from hermes_cli.config import cfg_get
+from hermes_cli.config_primitives import cfg_get
 from hermes_constants import get_hermes_dir, get_hermes_home
 
 from agent.skill_utils import EXCLUDED_SKILL_DIRS

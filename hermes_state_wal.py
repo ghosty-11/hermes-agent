@@ -628,7 +628,8 @@ def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.d
     between bundled/distro/Homebrew builds). Best-effort: failures are ignored so DB init never breaks on a
     malformed section. Applied to ALL connection types: writer, read_only, WAL readers."""
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly  # local: avoids a circular import
+        from hermes_cli.config import load_config_readonly  # local: avoids a circular import
+        from hermes_cli.config_primitives import cfg_get
         cfg = load_config_readonly()
     except Exception:
         return

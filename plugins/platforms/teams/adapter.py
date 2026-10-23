@@ -20,6 +20,7 @@ import logging
 import re
 import sys
 from collections import deque
+from pathlib import Path
 from contextlib import contextmanager, suppress
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import urlparse
@@ -164,7 +165,8 @@ def _credentials(config) -> tuple[str, str, str]:
 
 
 def validate_config(config) -> bool:
-    return bool(all(_credentials(config)))
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("teams", getattr(config, "extra", {}) or {}, _get_scoped_secret)
 
 
 def is_connected(config) -> bool:
@@ -285,12 +287,7 @@ def _suppress_third_party_dotenv() -> Iterator[None]:
 
 
 def check_teams_requirements() -> bool:
-    """Ensure the Teams SDK is importable, lazy-installing it on first use.
-
-    Lazy-installs ``microsoft-teams-apps`` via
-    ``pm.ensure_import("teams")`` if not present, then rebinds
-    all module-level SDK globals on success. Returns True once the SDK (and
-    aiohttp) are importable, False if they couldn't be installed/imported.
+    """Install Teams' declared dependencies and rebind the SDK globals.
 
     ``App is not None`` means symbols are already bound — ``TEAMS_SDK_AVAILABLE``
     alone can be True from ``find_spec`` without an import having run yet.
@@ -312,9 +309,20 @@ def check_teams_requirements() -> bool:
         bindings["TEAMS_SDK_AVAILABLE"] = True
         return bindings
 
-    from pm.extras import ensure_and_bind
+    from pm.platform_requirements import ensure_platform_dependencies
 
-    return ensure_and_bind("teams", _import, globals())
+    try:
+        ensure_platform_dependencies("teams", Path(__file__).with_name("plugin.yaml"))
+    except Exception as exc:
+        logger.warning("Teams dependencies unavailable: %s", exc)
+        return False
+    try:
+        bindings = _import()
+    except ImportError as exc:
+        logger.warning("Teams import after installing dependencies failed: %s", exc)
+        return False
+    globals().update(bindings)
+    return True
 
 
 _CHAT_TYPES = {"personal": "dm", "groupChat": "group", "channel": "channel"}

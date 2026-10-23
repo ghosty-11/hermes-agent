@@ -917,10 +917,9 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
 
 def _is_connected(config) -> bool:
     """Connected when an address is configured (PlatformConfig.extra or EMAIL_ADDRESS)."""
-    if (getattr(config, "extra", {}) or {}).get("address"):
-        return True
     import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
+    from gateway.platform_configuration import plugin_configured
+    return plugin_configured("email", getattr(config, "extra", {}) or {}, gateway_mod.get_env_value)
 
 
 

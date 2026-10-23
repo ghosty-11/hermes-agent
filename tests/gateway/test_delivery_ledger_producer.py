@@ -9,6 +9,7 @@ block the send.
 
 import asyncio
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -125,6 +126,176 @@ class TestProducerHook:
         assert rows[0][1] == "failed"
 
     @pytest.mark.asyncio
+    async def test_partial_final_and_partial_replay_send_only_unlanded_content(self):
+        from gateway.run_startup import GatewayStartupMixin
+
+        adapter = _Adapter()
+        runner = MagicMock()
+        runner._delivery_adapter_for.return_value = adapter
+        runner._obligation_adapter = AsyncMock(return_value=adapter)
+        runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+        adapter.gateway_runner = runner
+        sent = []
+        outcomes = iter([
+            SendResult(success=False, error="partially sent", retryable=True,
+                       raw_response={"partial_overflow": True, "remaining_content": "link A\nlink B",
+                                     "delivery_error": "send_path_degraded"}),
+            SendResult(success=False, error="partially sent", retryable=True,
+                       raw_response={"partial_overflow": True, "remaining_content": "link B",
+                                     "delivery_error": "send_path_degraded"}),
+            SendResult(success=True, message_id="delivered"),
+        ])
+
+        async def transport(chat_id, content, reply_to=None, metadata=None):
+            sent.append(content)
+            return next(outcomes)
+
+        adapter.send = transport
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result, _ = await adapter.send_final_ledgered(
+                _event(), "agent:main:slack:channel:C1", "landed prose\nlink A\nlink B", {},
+                reply_to=None)
+        assert result.error == "partially sent"
+        oid, state, content, profile = _rows()[0]
+        assert (state, content, profile) == ("failed", "link A\nlink B", "default")
+        assert dl.pending_retries() == []
+
+        for expected in ("link A\nlink B", "link B"):
+            claimed = dl.sweep_failed_for_runtime("slack")
+            assert len(claimed) == 1
+            assert claimed[0]["obligation_id"] == oid
+            assert claimed[0]["content"] == expected
+            assert await GatewayStartupMixin._redeliver_claimed_obligations(runner, claimed) == (
+                0 if expected == "link A\nlink B" else 1)
+            if expected == "link A\nlink B":
+                assert _rows() == [(oid, "failed", "link B", "default")]
+                assert dl.pending_retries() == []
+
+        assert len(sent) == 3
+        assert sent[0] == "landed prose\nlink A\nlink B"
+        assert sent[1].endswith("link A\nlink B") and "landed prose" not in sent[1]
+        assert sent[2].endswith("link B") and "link A" not in sent[2]
+        assert _rows() == [(oid, "delivered", "link B", "default")]
+
+    @pytest.mark.asyncio
+    async def test_failed_turn_marker_cleanup_does_not_restore_narrowed_reply_on_startup(self, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionStore
+        from hermes_state import SessionDB
+
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        if store._db is not None:
+            store._db.close()
+        store._db = SessionDB(db_path=dl._db_path())
+        runner = object.__new__(GatewayRunner)
+        runner.session_store = store
+        adapter = _Adapter()
+        adapter.gateway_runner = runner
+        source_event = _event()
+        entry = store.get_or_create_session(source_event.source)
+        token = store.mark_turn_active(entry.session_key)
+        original = "already visible prose\nhttps://example.com/owed.gif"
+        remainder = "https://example.com/owed.gif"
+        store.append_to_transcript(entry.session_id, {"role": "user", "content": "show the GIF"})
+        store.append_to_transcript(entry.session_id, {"role": "assistant", "content": original})
+        source_event._turn_marker_handoff = True
+        source_event._gateway_active_turn_session_key = entry.session_key
+        source_event._gateway_active_turn_token = token
+        adapter.send = AsyncMock(return_value=SendResult(
+            success=False, error="partially sent", retry_after=120,
+            raw_response={"partial_overflow": True, "remaining_content": remainder,
+                          "delivery_error": "flood_control:120"}))
+        try:
+            with (
+                patch.object(runner.async_session_store, "clear_turn_active",
+                             new_callable=AsyncMock, side_effect=OSError("state store unavailable")) as clear,
+                patch.object(dl, "_owner_stamp", return_value=(999999999, 1)),
+            ):
+                result, _ = await adapter.send_final_ledgered(
+                    source_event, entry.session_key, original, {}, reply_to=None)
+            assert not result.success
+            assert clear.await_count == 3
+            assert store.get_or_create_session(source_event.source).active_turn_token == token
+            assert [(state, content) for _, state, content, _ in _rows()] == [
+                ("failed", remainder)]
+
+            assert await runner._recover_unclean_sessions() == (0, 1)
+            assert store.get_or_create_session(source_event.source).active_turn_token is None
+            assert [(state, content) for _, state, content, _ in _rows()] == [
+                ("failed", remainder)]
+            claimed = dl.sweep_recoverable(now=time.time() + 121,
+                                           deliverable_platforms={"slack"})
+            assert len(claimed) == 1
+            assert claimed[0]["content"] == remainder
+            assert claimed[0]["needs_marker"] is True
+        finally:
+            store._db.close()
+
+    @pytest.mark.asyncio
+    async def test_total_failure_with_attached_remainder_survives_exhaustion_and_startup(self):
+        from gateway.run_startup import GatewayStartupMixin
+
+        original = "visible only if delivered"
+        owed = original + "\nhttps://example.com/attached.gif"
+        adapter = _Adapter()
+        runner = MagicMock()
+        runner._obligation_adapter = AsyncMock(return_value=adapter)
+        runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+        adapter.gateway_runner = runner
+        sent = []
+        failed = SendResult(
+            success=False, error="transport failed", retryable=True,
+            raw_response={"partial_overflow": False, "remaining_content": owed,
+                          "delivery_error": "flood_control:2"})
+        outcomes = iter([failed, failed, failed, SendResult(success=True, message_id="landed")])
+
+        async def transport(chat_id, content, reply_to=None, metadata=None):
+            sent.append(content)
+            return next(outcomes)
+
+        adapter.send = transport
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result, _ = await adapter.send_final_ledgered(
+                _event(), "agent:main:slack:channel:C1", original, {}, reply_to=None)
+        assert not result.success
+        assert sent[:3] == [original, owed, owed]
+        oid, state, content, _ = _rows()[0]
+        assert (state, content) == ("failed", owed)
+
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1 "
+                "WHERE obligation_id=?", (oid,))
+        claimed = dl.sweep_recoverable(now=time.time() + 3)
+        assert len(claimed) == 1
+        assert claimed[0]["content"] == owed
+        assert await GatewayStartupMixin._redeliver_claimed_obligations(runner, claimed) == 1
+        assert sent[3] == dl.FLOOD_MARKER + owed
+        assert _rows() == [(oid, "delivered", owed, "default")]
+
+    @pytest.mark.asyncio
+    async def test_whole_flood_failure_keeps_full_content_and_wait(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(return_value=SendResult(
+            success=False, error="delivery failed", retry_after=120.0,
+            raw_response={"delivery_error": "flood_control:120"}))
+        result, _ = await adapter.send_final_ledgered(
+            _event(), "agent:main:slack:channel:C1", "full reply", {}, reply_to=None)
+
+        assert result.error == "delivery failed"
+        oid, state, content, _ = _rows()[0]
+        assert state == "failed" and content == "full reply"
+        with dl._connect() as conn:
+            error, failed_at = conn.execute(
+                "SELECT last_error, updated_at FROM delivery_obligations WHERE obligation_id=?",
+                (oid,)).fetchone()
+        assert error == "flood_control:120"
+        assert dl.sweep_failed_for_runtime("slack", now=failed_at + 119) == []
+        assert [r["content"] for r in dl.sweep_failed_for_runtime(
+            "slack", now=failed_at + 123)] == ["full reply"]
+
+    @pytest.mark.asyncio
     async def test_late_transient_failure_signals_reconnected_runner(self):
         """A replacement installed mid-send must trigger another ledger sweep."""
         adapter = _Adapter()
@@ -174,7 +345,7 @@ class TestProducerHook:
         with patch("gateway.delivery_ledger.record_obligation"), patch(
             "gateway.delivery_ledger.mark_attempting"
         ), patch(
-            "gateway.delivery_ledger.mark_delivered",
+            "gateway.delivery_ledger.finalize_delivery",
             side_effect=slow_delivered,
         ):
             await asyncio.gather(_run(adapter, _event()), event_loop_witness())

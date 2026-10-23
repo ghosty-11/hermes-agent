@@ -23,7 +23,10 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.delivery_handoff import (
+    StreamDeliveryHandoff, delivery_handoff_from_receipt, reconcile_stream_delivery_handoff,
+)
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
@@ -35,6 +38,7 @@ from gateway.session import (
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
+from gateway.turn_refusals import refused
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -1960,18 +1964,18 @@ class GatewayTurnMixin:
             "disposition_hint": disposition_hint, "streamed_text": streamed_text,
         }
 
-    def record_turn_delivery(self, address: Dict[str, Any], outcome: Dict[str, Any]) -> bool:
-        """Write one actual-delivery record through ``SessionDB.record_message_delivery``
-        (row-addressed merge into ``display_metadata``; reactions preserved). Best-effort:
-        a missing DB or a refused write never breaks the turn — the absence stays an
-        unknown delivery on replay."""
+    async def record_turn_delivery(self, address: Dict[str, Any], outcome: Dict[str, Any]) -> bool:
+        """Await the row-addressed delivery write before its owner can advance."""
         db = getattr(self, "_session_db", None)
         record = getattr(db, "record_message_delivery", None)
         if not callable(record):
             return False
         try:
-            return bool(record(
-                address.get("session_id"), address.get("row_id"), address.get("turn_id"), outcome))
+            written = record(
+                address.get("session_id"), address.get("row_id"), address.get("turn_id"), outcome)
+            if inspect.isawaitable(written):
+                written = await written
+            return bool(written)
         except Exception:
             logger.debug("record_message_delivery failed for row %s", address.get("row_id"), exc_info=True)
             return False
@@ -1981,10 +1985,25 @@ class GatewayTurnMixin:
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
     ):
-        """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
-        Returns the text for the adapter to send, or ``None`` when already delivered."""
+        """Apply silence, voice, media and footer policy while retaining the model text.
+        The adapter's final bracket derives the owed body from the turn receipt."""
+        if hasattr(event, "_stream_delivery_handoff"):
+            del event._stream_delivery_handoff  # this event may be reused for a queued turn
+        if hasattr(event, "_streamed_final_response"):
+            del event._streamed_final_response
+        if hasattr(event, "turn_delivery_address"):
+            del event.turn_delivery_address
         if diagnostic_wake_muted(event):
             return None
+        handoff = agent_result.get("_stream_delivery_handoff")
+        if not isinstance(handoff, StreamDeliveryHandoff) and agent_result.get("already_sent") and response:
+            text = BasePlatformAdapter.strip_media_directives_for_display(response)
+            handoff = delivery_handoff_from_receipt(
+                text, SendResult(success=False, error="stream final missing carriage receipt",
+                                 raw_response={"delivery_ambiguous": True,
+                                               "remaining_content": text,
+                                               "model_remaining_content": text,
+                                               "attachment_remaining_content": ""}))
         # Stamp the row-addressed delivery target BEFORE any send: the adapter's final
         # delivery lane aggregates the ACTUAL SendResults and records the real outcome on
         # the assistant row via GatewayRunner.record_turn_delivery (S02/V10). A missing
@@ -1992,7 +2011,7 @@ class GatewayTurnMixin:
         # never success.
         with suppress(Exception):
             _hint, _streamed = (
-                ("streamed", response) if agent_result.get("already_sent")
+                ("streamed", response) if isinstance(handoff, StreamDeliveryHandoff) and handoff.complete
                 else ("silence", None) if _intentional_silence
                 else ("text", None)
             )
@@ -2002,39 +2021,62 @@ class GatewayTurnMixin:
             )
             if _delivery_address is not None:
                 event.turn_delivery_address = _delivery_address
+                if isinstance(handoff, StreamDeliveryHandoff):
+                    handoff = handoff.with_address(_delivery_address)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
+        # The turn owner, not the preview flag, decides what reached the chat.
+        if isinstance(handoff, StreamDeliveryHandoff) and not _intentional_silence and not handoff.settled:
+            handoff = reconcile_stream_delivery_handoff(
+                handoff, BasePlatformAdapter.strip_media_directives_for_display(response or ""))
+            event._stream_delivery_handoff = handoff
         adapter = self._delivery_adapter_for(source)
+        if isinstance(handoff, StreamDeliveryHandoff) and handoff.settled:
+            if hasattr(event, "turn_delivery_address"):
+                del event.turn_delivery_address
+            return None  # this first turn was bracketed and row-recorded before recursion
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
-        if not _streaming_tts_done and self._should_send_voice_reply(
-            event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+        from gateway.relay.egress import declined_send
+        if not _streaming_tts_done and not (
+            isinstance(handoff, StreamDeliveryHandoff) and declined_send(handoff.result)
+        ) and self._should_send_voice_reply(
+            event, response, agent_messages, already_sent=bool(
+                isinstance(handoff, StreamDeliveryHandoff) and handoff.complete),
         ):
-            await self._send_voice_reply(event, response)
+            for receipt in (await self._send_voice_reply(event, response)) or ():
+                if declined_send(receipt):
+                    handoff = delivery_handoff_from_receipt(
+                        handoff.source_content if isinstance(handoff, StreamDeliveryHandoff)
+                        else BasePlatformAdapter.strip_media_directives_for_display(response or ""),
+                        receipt, previous=handoff if isinstance(handoff, StreamDeliveryHandoff) else None)
+                    event._stream_delivery_handoff = handoff
+                    return None
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
-        if agent_result.get("already_sent") and not agent_result.get("failed"):
+        if isinstance(handoff, StreamDeliveryHandoff) and handoff.complete and not agent_result.get("failed"):
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
+            media_declined = False
             if response and adapter and not agent_result.get("media_already_delivered"):
-                await self._deliver_media_from_response(response, event, adapter)
-            # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
-            if _footer_line and adapter:
+                media_declined = await self._deliver_media_from_response(response, event, adapter)
+            # The completed stream carried the body; its footer was held for a separate send.
+            if _footer_line and adapter and not media_declined:
                 try:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
-            # Return None so the body isn't sent twice; stash the delivered text on the event for the
-            # /loop and /goal hooks that read the return value.
+            # /loop and /goal read the delivered reply from the event. Keep the model text
+            # for the adapter's final bracket; the complete receipt owes no wire body.
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
-            return None
+            return response
 
         return response
 
@@ -2351,8 +2393,11 @@ class GatewayTurnMixin:
 
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
-            # Streaming already delivered the body: the footer goes out as a trailing send instead.
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            # A complete receipt carries the body; its footer goes out separately.
+            _stream_handoff = agent_result.get("_stream_delivery_handoff")
+            if (_footer_line and response and not _intentional_silence
+                    and not (isinstance(_stream_handoff, StreamDeliveryHandoff)
+                             and _stream_handoff.complete and not agent_result.get("failed"))):
                 response = f"{response}\n\n{_footer_line}"
             await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
 
@@ -3023,7 +3068,7 @@ class GatewayTurnMixin:
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
-        return {
+        result = {
             "final_response": full_response or t("gateway.proxy.no_response"),
             "messages": [
                 {"role": "user", "content": message},
@@ -3035,6 +3080,11 @@ class GatewayTurnMixin:
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
+        if _stream_consumer is not None:
+            handoff = _stream_consumer.delivery_handoff_for_final(result["final_response"])
+            if isinstance(handoff, StreamDeliveryHandoff):
+                result["_stream_delivery_handoff"] = handoff
+        return result
 
     async def _run_agent(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
@@ -3849,7 +3899,21 @@ class GatewayTurnMixin:
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
-        if first_response:
+        queued_receipts: list[SendResult] = []
+
+        def record_delivery(receipt):
+            if isinstance(receipt, SendResult):
+                queued_receipts.append(receipt)
+        address = self._hmwa_turn_delivery_address(
+            result, session_entry=turn_ctx, disposition_hint="text") if isinstance(result, dict) else None
+        if address is not None and _sc is not None and isinstance(
+                getattr(_sc, "_delivery_handoff", None), StreamDeliveryHandoff):
+            _sc._delivery_handoff = _sc._delivery_handoff.with_address(address)
+        owner = _delivery_result.get("_stream_delivery_handoff")
+        if address is not None and isinstance(owner, StreamDeliveryHandoff):
+            owner = owner.with_address(address)
+
+        if first_response or isinstance(_delivery_result.get("_stream_delivery_handoff"), StreamDeliveryHandoff):
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
                 if _already_streamed else
@@ -3865,21 +3929,41 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    record_delivery=record_delivery, receipt_owner=owner,
+                    turn_delivery_address=address,
                 )
             except Exception as e:
+                # Only failures outside the final bracket reach here. Never open a
+                # second obligation for a send whose first bracket already ran.
                 logger.warning("Failed to send first response before queued message: %s", e)
             else:
-                # One source of truth for "this turn's final already reached the chat": the normal
-                # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
-                # result the queued lane hands back. Every early `return result` after this point
-                # (follow-up text refused, stale goal continuation) otherwise re-sends the text the
-                # fallback just delivered — the #81052 duplicate. A REFUSED send reports False, and
-                # the completion send stays the fallback so the user is not left with nothing.
-                if _text_delivered and isinstance(result, dict):
+                if isinstance(result, dict) and (_text_delivered or queued_receipts):
+                    # Even a failed attempt has already passed the first turn's bracket.
+                    # The completion lane must not re-attempt that same obligation.
                     result["already_sent"] = True
-                    # The queued lane already uploaded this response's MEDIA: attachments; without
-                    # this the completion path's already_sent rescan uploads every file twice.
-                    result["media_already_delivered"] = _deliver_media
+                    result["media_already_delivered"] = _deliver_media and _text_delivered
+            if queued_receipts and isinstance(result, dict):
+                result["already_sent"] = True
+                receipt = queued_receipts[-1]
+                if _sc is not None:
+                    _sc.accept_final_delivery_result(first_response, receipt)
+                    handoff = _sc.delivery_handoff_for_final(first_response)
+                else:
+                    handoff = delivery_handoff_from_receipt(first_response, receipt)
+                result["_stream_delivery_handoff"] = dataclasses.replace(handoff, settled=True)
+                # The queued first reply has its own assistant row. Recursive follow-up
+                # results replace this result, so the terminal event cannot address it.
+                # The address was bound before the bracket, including on failed sends.
+                if address is not None:
+                    result["_stream_delivery_handoff"] = result["_stream_delivery_handoff"].with_address(address)
+                    delivery_adapter = self._delivery_adapter_for(turn_ctx.source) or adapter
+                    await self.record_turn_delivery(
+                        address, {**delivery_adapter._turn_delivery_outcome(
+                            queued_receipts, hint="text", streamed_text=None), "lane": "text"})
+            if not queued_receipts and _sc is not None and isinstance(result, dict):
+                handoff = _sc.delivery_handoff_for_final(first_response)
+                if isinstance(handoff, StreamDeliveryHandoff):
+                    result["_stream_delivery_handoff"] = handoff
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -3908,6 +3992,10 @@ class GatewayTurnMixin:
         if _active and session_key and session_key in _active:
             _active[session_key].clear()
 
+
+        # Interrupted: discard the response ("Operation interrupted." is noise).
+        if not result.get("interrupted"):
+            await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
         # Cap recursion depth (user keeps sending while the agent keeps failing).
         # (#816)
         if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
@@ -3921,10 +4009,6 @@ class GatewayTurnMixin:
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
-
-        # Interrupted: discard the response ("Operation interrupted." is noise).
-        if not result.get("interrupted"):
-            await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -4111,19 +4195,35 @@ class GatewayTurnMixin:
     async def _run_agent_edit_streamed_message(
         self, _sc, source, response, content, *, _sk, ok, fail_result: str, fail_exc: str,
     ) -> None:
-        """Edit the stream consumer's message in place with ``content``; on success mark
-        ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
-        ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
-        ``already_sent`` stays unset so the normal final send delivers the content."""
+        """Consume the edit receipt before the ordinary final bracket can send."""
+        message_id = _sc.message_id
         try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+            receipt = await _sc.adapter.edit_message(
+                chat_id=source.chat_id, message_id=message_id, content=content, finalize=True,
             )
-        except Exception as _edit_err:
-            logger.warning(fail_exc, _sk, _edit_err)
-            return
-        if not getattr(_res, "success", True):
-            logger.warning(fail_result, _sk, getattr(_res, "error", None))
+        except Exception as exc:
+            receipt = SendResult(success=False, error=str(exc), raw_response={
+                "delivery_ambiguous": True, "remaining_content": content,
+                "model_remaining_content": content, "attachment_remaining_content": ""})
+            logger.warning(fail_exc, _sk, exc)
+        if not isinstance(receipt, SendResult):
+            prior = getattr(_sc, "_delivery_handoff", None)
+            receipt = delivery_handoff_from_receipt(
+                content, receipt,
+                previous=prior if isinstance(prior, StreamDeliveryHandoff) else None,
+                edited_message_id=str(message_id)).result
+        if receipt.success and receipt.delivered_text is None:
+            receipt = dataclasses.replace(receipt, delivered_text=content)
+        accept = getattr(_sc, "accept_final_delivery_result", None)
+        if callable(accept):
+            accept(content, receipt, edited_message_id=str(message_id))
+            handoff = _sc.delivery_handoff_for_final(content)
+        else:
+            handoff = delivery_handoff_from_receipt(content, receipt)
+        response["_stream_delivery_handoff"] = handoff
+        if not getattr(receipt, "success", False):
+            logger.warning(fail_result, _sk, getattr(receipt, "error", None))
+            response.pop("already_sent", None)
             return
         response["already_sent"] = True
         logger.info(*ok)
@@ -4136,8 +4236,37 @@ class GatewayTurnMixin:
         payload: a mismatch (False, incl. payload-less split delivery) never suppresses; None (no
         record) keeps legacy trust."""
         _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
-        if not isinstance(response, dict) or response.get("failed"):
+        if not isinstance(response, dict):
             return
+        progress_decline = getattr(turn_ctx, "_progress_decline_receipt", None)
+        if progress_decline is not None:
+            final_text = BasePlatformAdapter.strip_media_directives_for_display(
+                response.get("final_response") or "")
+            previous = response.get("_stream_delivery_handoff")
+            response["_stream_delivery_handoff"] = dataclasses.replace(
+                delivery_handoff_from_receipt(
+                    final_text, progress_decline,
+                    previous=previous if isinstance(previous, StreamDeliveryHandoff) else None),
+                settled=False)
+            response.pop("already_sent", None)
+            return
+        settled = response.get("_stream_delivery_handoff")
+        if isinstance(settled, StreamDeliveryHandoff) and settled.settled:
+            return
+        if _sc is not None:
+            carrier = getattr(_sc, "delivery_handoff_for_final", None)
+            handoff = carrier(response.get("final_response") or "") if callable(carrier) else None
+            if isinstance(handoff, StreamDeliveryHandoff):
+                response["_stream_delivery_handoff"] = handoff
+                if handoff.complete and not response.get("failed"):
+                    response["already_sent"] = True
+                    return
+                response.pop("already_sent", None)
+                prior = getattr(_sc, "_delivery_handoff", None)
+                if not isinstance(prior, StreamDeliveryHandoff) or not prior.complete:
+                    return  # the final bracket owns an attempted remainder
+        if response.get("failed"):
+            return  # the error is new content; never suppress its normal final send
         _final = response.get("final_response") or ""
         _is_empty_sentinel = not _final or _final == "(empty)"
         # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
@@ -4297,6 +4426,8 @@ class GatewayTurnMixin:
         _heartbeat_msg_id: Optional[str] = None
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
+            if refused(source.platform, source.chat_id) is not None:
+                break
             if not self._should_emit_long_running_notification(
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
@@ -4331,6 +4462,8 @@ class GatewayTurnMixin:
                     except Exception as _ee:
                         logger.debug("Heartbeat edit failed: %s", _ee)
                         _notify_res = None
+                if refused(source.platform, source.chat_id) is not None:
+                    break
                 if not (_notify_res and getattr(_notify_res, "success", False)):
                     # The edit above awaited; a drain/restart notice may have gone out meanwhile, and
                     # a fresh "Working" bubble after it reads as a contradiction (#10990).
@@ -4346,6 +4479,8 @@ class GatewayTurnMixin:
                         _heartbeat_msg_id = str(_notify_res.message_id)
                         if turn_ctx._cleanup_progress:
                             turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                if refused(source.platform, source.chat_id) is not None:
+                    break
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
@@ -4443,6 +4578,13 @@ class GatewayTurnMixin:
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
+                # Settle progress before the queued lane brackets this turn's first reply.
+                if progress_task:
+                    progress_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await progress_task
+                if getattr(turn_ctx, "_progress_decline_receipt", None) is not None:
+                    await self._run_agent_mark_streamed_delivery(response, turn_ctx)
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )

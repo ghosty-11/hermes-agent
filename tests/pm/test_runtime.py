@@ -23,7 +23,7 @@ def test_pm_runtime_discovers_plugins_without_application_dependencies(tmp_path,
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(home / "tools"))
     (home / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
     repo = Path(__file__).resolve().parents[2]
-    python = prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime")
+    python = prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime", cache=tmp_path / "cache")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "UV_"))}
     env.update(HERMES_HOME=str(home), HERMES_RUNTIME_DIR=str(home / "tools"))
     # Import real PM, including its production plugin-discovery chain.
@@ -44,14 +44,87 @@ print(json.dumps({{"prefix": sys.prefix, "yaml": importlib.util.find_spec("ruame
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(result.stdout)
     assert Path(report["yaml"]).is_relative_to(Path(report["prefix"]))
-    assert prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime", offline=True) == python
+    assert prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime",
+                           offline=True, cache=tmp_path / "cache") == python
     # Repair PM itself from its own lock, without trusting an existing marker.
     (Path(report["yaml"]).parent / "main.py").unlink()
-    repaired = prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime", offline=True)
+    repaired = prepare_runtime(Path(uv), Path(sys.executable), tmp_path / "runtime",
+                               offline=True, cache=tmp_path / "cache")
     assert repaired != python
     checked = subprocess.run([str(repaired), "-I", "-B", "-c", code], env=env,
                              capture_output=True, text=True, timeout=30)
     assert checked.returncode == 0, checked.stdout + checked.stderr
+
+def test_claim_free_runtime_lookup_does_not_create_install_state(tmp_path, monkeypatch):
+    from pm import paths, runtime
+    from pm.environments import install_state_dir
+    from pm.package import InstallError
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    (project / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "store"))
+    monkeypatch.setattr(paths, "repo_root", lambda: project)
+    monkeypatch.setattr("pm._uv._toolchain", lambda **kwargs: (tmp_path / "uv", Path(sys.executable)))
+    with pytest.raises(InstallError, match="not installed or outdated"):
+        runtime.runtime_python(bootstrap=False)
+    assert not install_state_dir(project).exists()
+
+
+def test_runtime_publication_requires_writer_claim(tmp_path, monkeypatch):
+    """Publication never happens claimless: a direct publisher refuses, and a
+    claimless caller looks up claim-free, then publishes under its own claim."""
+    from pm import paths, runtime
+    from pm.writer_claim import has_writer_claim
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    (project / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "store"))
+    monkeypatch.setattr(paths, "repo_root", lambda: project)
+    monkeypatch.setattr("pm._uv._toolchain", lambda **kwargs: (tmp_path / "uv", Path(sys.executable)))
+    with pytest.raises(RuntimeError, match="writer claim"):
+        runtime.prepare_runtime(tmp_path / "uv", Path(sys.executable),
+                                tmp_path / "home" / "another-runtime", project=project)
+    assert not (tmp_path / "home").exists()
+
+    real_prepare = runtime.prepare_runtime
+    seen = []
+
+    def observe(*args, bootstrap=True, **kwargs):
+        seen.append((bootstrap, has_writer_claim()))
+        if not bootstrap:
+            return real_prepare(*args, bootstrap=False, **kwargs)
+        return Path(sys.executable)
+
+    monkeypatch.setattr(runtime, "prepare_runtime", observe)
+    assert runtime.runtime_python() == Path(sys.executable)
+    assert seen == [(False, False), (True, True)]
+    assert not has_writer_claim()
+
+
+
+@pytest.mark.parametrize("cache_kind", ["omitted", "shared"])
+def test_private_runtime_root_needs_private_cache_or_claim(tmp_path, monkeypatch, cache_kind):
+    from pm.runtime import prepare_runtime
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    (project / "uv.lock").write_text("version = 1\n")
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "store"))
+    root = tmp_path / "private-runtime"
+    cache = home / "cache" / "uv" if cache_kind == "shared" else None
+    with pytest.raises(RuntimeError, match="writer claim"):
+        prepare_runtime(tmp_path / "uv", Path(sys.executable), root, project=project, cache=cache)
+    assert not root.exists()
+    assert not (home / "cache" / "uv").exists()
 
 
 def test_cold_worker_bootstrap_reuses_the_requests_cache(tmp_path, monkeypatch):
@@ -171,8 +244,10 @@ def test_one_store_through_symlinked_homes_keeps_one_pm_runtime(tmp_path, monkey
 
     def stage(uv, python, environment, **_):
         staged.append(python)
-        environment.mkdir(parents=True)
-        return runtime._python(environment)
+        executable = runtime._python(environment)
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        return executable
 
     monkeypatch.setattr("pm.runtime_stage.stage_runtime", stage)
     monkeypatch.setattr(runtime, "_validate", lambda python, env: "")
@@ -181,14 +256,18 @@ def test_one_store_through_symlinked_homes_keeps_one_pm_runtime(tmp_path, monkey
     old = root / "generations" / "old"
     old.mkdir(parents=True)
     (old / "pm-runtime.json").write_text("{}")
+    old_executable = runtime._python(old)
+    old_executable.parent.mkdir(parents=True)
+    old_executable.touch()
     (root / "selected.json").write_text(json.dumps(
         {"inputs": pre_fix_identity(home / "tools" / "python" / "bin" / "python3"), "generation": "generations/old"}))
 
     def launch(tools: Path, bootstrap: bool = False) -> Path:
         return runtime.prepare_runtime(tools / "uv", tools / "python" / "bin" / "python3", root,
-                                       project=project, bootstrap=bootstrap)
+                                       project=project, bootstrap=bootstrap, cache=tmp_path / "cache")
 
     assert launch(home / "tools") == runtime._python(old)
+    assert not (root / ".prepare.lock").exists(), "ready lookup opened the publication lock"
     current = launch(task / "tools", bootstrap=True)  # a per-task home that was already churning re-stages once
     for tools in (home / "tools", task / "tools", real, home / "tools"):
         assert launch(tools) == current

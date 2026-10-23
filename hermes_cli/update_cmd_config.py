@@ -3,6 +3,8 @@ Names are re-imported by ``update_cmd`` (``hermes_cli.update_cmd.<name>`` resolv
 origin helpers are imported lazily."""
 
 import logging
+from contextlib import nullcontext
+import stat
 import sys
 from pathlib import Path
 
@@ -28,11 +30,11 @@ def _run_migrate_config_fresh(*, interactive: bool = False, quiet: bool = False)
     stop_for_relaunch(incomplete=True)
 
 
-def _migrate_sibling_profile_configs() -> list[tuple[str, int, int]]:
+def _migrate_sibling_profile_configs(*, offline: bool = False) -> list[tuple[str, int, int]]:
     """Migrate every SIBLING profile's config.yaml (the shared checkout serves all profiles). Per
     sibling (active skipped): scope via the context-local HERMES_HOME override (never ``os.environ``)
-    and run the NON-INTERACTIVE quiet migration — prompt-requiring settings wait for that profile's
-    own session. Returns ``[(name, from_version, to_version), ...]``; never raises.
+    and run the non-interactive quiet migration. Online failures remain best-effort;
+    offline completion requires every configured profile to reach the current version.
 
     91277 Phase 2 (fleet-wide config migration; #20438/#54926/#79048): the shared checkout serves every
     profile, but ``hermes update`` historically migrated only the active profile's config — siblings drifted
@@ -44,35 +46,45 @@ def _migrate_sibling_profile_configs() -> list[tuple[str, int, int]]:
     """
     from hermes_cli.config import check_config_version, migrate_config
     migrated: list[tuple[str, int, int]] = []
-    with _best_effort('Sibling profile enumeration failed: %s'):
+    with nullcontext() if offline else _best_effort('Sibling profile enumeration failed: %s'):
         from hermes_constants import (
             get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override)
         from hermes_cli.backup import _sibling_profile_homes
         active_home = Path(get_process_hermes_home())
-        for name, profile_home in _sibling_profile_homes(active_home):
-            if not (profile_home / "config.yaml").is_file():
-                continue  # profile never configured — nothing to migrate
+        for name, profile_home in _sibling_profile_homes(active_home, **({"strict": True} if offline else {})):
+            config_path = profile_home / "config.yaml"
+            if offline:
+                from hermes_cli.config_paths import strict_file_present
+                if not strict_file_present(config_path):
+                    continue
+            elif not config_path.is_file():
+                continue
             token = set_hermes_home_override(profile_home)
             try:
                 current_ver, latest_ver = check_config_version(raise_on_parse_error=True)
                 if current_ver >= latest_ver:
                     continue
-                migrate_config(interactive=False, quiet=True)
+                migrate_config(interactive=False, quiet=True, **({"strict": True} if offline else {}))
                 after_ver, _ = check_config_version(raise_on_parse_error=True)
+                if offline and after_ver < latest_ver:
+                    raise RuntimeError(f"profile {name} remains at config version {after_ver}, expected {latest_ver}")
                 if after_ver > current_ver:
                     migrated.append((name, current_ver, after_ver))
             except Exception as exc:
+                if offline:
+                    raise RuntimeError(f"Offline config migration failed for profile {name}: {exc}") from exc
                 logger.debug("Config migration for profile %s failed: %s", name, exc)
             finally:
                 reset_hermes_home_override(token)
     return migrated
 
 
-def _restore_snapshot_safety_nets(pre_update_snapshot_id) -> None:
-    """Post-migration safety nets (never break an otherwise-good update): restore cron jobs
-    emptied by migrations/the desktop scheduler and protected model settings (model.provider /
-    model.default / moa:) rewritten by Desktop repair cycles — for the active profile (from
-    *pre_update_snapshot_id*) and every sibling profile (against ITS OWN snapshot)."""
+def _restore_snapshot_safety_nets(pre_update_snapshot_id, *, offline: bool = False) -> None:
+    """Restore damaged cron/model settings for the active home and every profile.
+
+    Online updates retain best-effort recovery; offline completion refuses
+    when a local safety net cannot be checked.
+    """
     def _cron_line(r):
         return (
             f"cron/jobs.json lost jobs during this update — restored {r['job_count']} job(s) "
@@ -89,44 +101,44 @@ def _restore_snapshot_safety_nets(pre_update_snapshot_id) -> None:
             f"config.yaml user model settings were rewritten during this update — restored "
             f"{', '.join(r['keys'])} from pre-update snapshot {r['snapshot_id']}.")
 
-    with _best_effort("Cron jobs auto-restore check failed: %s"):
+    with nullcontext() if offline else _best_effort("Cron jobs auto-restore check failed: %s"):
         # Safety net: config-version migrations have been observed to leave cron/jobs.json valid-but-empty,
         # silently dropping every scheduled job (issue #34600). The desktop scheduler can also overwrite
         # with its own small set, causing partial loss (issue #52144). If the live file now has fewer jobs
         # than the pre-update snapshot, restore it and warn loudly.
         from hermes_cli.backup import restore_cron_jobs_if_emptied
-        cron_restore = restore_cron_jobs_if_emptied(pre_update_snapshot_id)
+        cron_restore = restore_cron_jobs_if_emptied(pre_update_snapshot_id, **({"strict": True} if offline else {}))
         if cron_restore:
             print()
             print(f"  ⚠️  {_cron_line(cron_restore)}")
-    with _best_effort("Cron prompt-field auto-restore check failed: %s"):
+    with nullcontext() if offline else _best_effort("Cron prompt-field auto-restore check failed: %s"):
         # Safety net: a writer in the update's mutation window replaced agent-job prompts
         # with the job NAME while the count stayed identical, so the count-based net above
         # passed it undetected (issue #82990). Restore only the degraded prompt fields.
         from hermes_cli.backup import restore_cron_prompt_fields_if_degraded
-        prompt_restore = restore_cron_prompt_fields_if_degraded(pre_update_snapshot_id)
+        prompt_restore = restore_cron_prompt_fields_if_degraded(pre_update_snapshot_id, **({"strict": True} if offline else {}))
         if prompt_restore:
             print()
             print(f"  ⚠️  {_prompt_line(prompt_restore)}")
-    with _best_effort("Config model-settings auto-restore check failed: %s"):
+    with nullcontext() if offline else _best_effort("Config model-settings auto-restore check failed: %s"):
         from hermes_cli.backup import restore_config_model_settings_if_rewritten
-        cfg_restore = restore_config_model_settings_if_rewritten(pre_update_snapshot_id)
+        cfg_restore = restore_config_model_settings_if_rewritten(pre_update_snapshot_id, **({"strict": True} if offline else {}))
         if cfg_restore:
             print()
             print(f"  ⚠️  {_cfg_line(cfg_restore)}")
-    with _best_effort('Sibling cron auto-restore check failed: %s'):
+    with nullcontext() if offline else _best_effort('Sibling cron auto-restore check failed: %s'):
         from hermes_cli.backup import restore_cron_jobs_all_profiles
-        for _restored in restore_cron_jobs_all_profiles(_LAST_SIBLING_SNAPSHOTS):
+        for _restored in restore_cron_jobs_all_profiles(_LAST_SIBLING_SNAPSHOTS, **({"strict": True} if offline else {})):
             print()
             print(f"  ⚠️  Profile '{_restored['profile']}': {_cron_line(_restored)}")
-    with _best_effort('Sibling cron prompt-field auto-restore check failed: %s'):
+    with nullcontext() if offline else _best_effort('Sibling cron prompt-field auto-restore check failed: %s'):
         from hermes_cli.backup import restore_cron_prompt_fields_all_profiles
-        for _prompt_restored in restore_cron_prompt_fields_all_profiles(_LAST_SIBLING_SNAPSHOTS):
+        for _prompt_restored in restore_cron_prompt_fields_all_profiles(_LAST_SIBLING_SNAPSHOTS, **({"strict": True} if offline else {})):
             print()
             print(f"  ⚠️  Profile '{_prompt_restored['profile']}': {_prompt_line(_prompt_restored)}")
-    with _best_effort('Sibling config auto-restore check failed: %s'):
+    with nullcontext() if offline else _best_effort('Sibling config auto-restore check failed: %s'):
         from hermes_cli.backup import restore_config_model_settings_all_profiles
-        for _cfg_restored in restore_config_model_settings_all_profiles(_LAST_SIBLING_SNAPSHOTS):
+        for _cfg_restored in restore_config_model_settings_all_profiles(_LAST_SIBLING_SNAPSHOTS, **({"strict": True} if offline else {})):
             print()
             print(f"  ⚠️  Profile '{_cfg_restored['profile']}': {_cfg_line(_cfg_restored)}")
 
@@ -156,7 +168,8 @@ def _ask_configure_new_options(*, assume_yes: bool, gateway_mode: bool) -> str:
 
 
 def _check_and_apply_config_migration(
-    *, assume_yes: bool = False, gateway_mode: bool = False, pre_update_snapshot_id: str | None = None
+    *, assume_yes: bool = False, gateway_mode: bool = False, pre_update_snapshot_id: str | None = None,
+    offline: bool = False,
 ) -> None:
     """Check/apply config migrations. Runs on EVERY completion path
     (post-pull, venv-repair, Node-deps repair on ``commit_count == 0``) so an interrupted update
@@ -177,6 +190,8 @@ def _check_and_apply_config_migration(
         missing_config = get_missing_config_fields()
         current_ver, latest_ver = check_config_version(raise_on_parse_error=True)
     except Exception as exc:
+        if offline:
+            raise RuntimeError(f"Offline completion cannot inspect config migration: {exc}") from exc
         logger.debug("Config check during update failed: %s", exc)
         print("  ⚠️  Could not check config version.")
         print("     Run 'hermes config migrate' to check manually.")
@@ -192,8 +207,9 @@ def _check_and_apply_config_migration(
         print()
         print(f"  ℹ Updating config format (v{current_ver} → v{latest_ver})…")
         try:
-            _mig_results = migrate_config(interactive=False, quiet=True)
-            print("  ✓ Config format updated (no new settings to configure)")
+            _mig_results = migrate_config(interactive=False, quiet=True, **({"strict": True} if offline else {}))
+            if not _mig_results.get("failed_steps"):
+                print("  ✓ Config format updated (no new settings to configure)")
             # quiet=True also mutes steps that RESET/REMOVE a setting; re-surface them so an
             # unattended update never silently changes config (config_added holds only mutations here).
             # In this branch missing_config is empty, so config_added can only contain migration-step
@@ -203,6 +219,8 @@ def _check_and_apply_config_migration(
             for _warn in _mig_results.get("warnings") or []:
                 print(f"  ⚠️  {_warn}")
         except Exception as _mig_err:
+            if offline:
+                raise RuntimeError(f"Offline config format migration failed: {_mig_err}") from _mig_err
             print(f"  ⚠️  Config format update failed: {_mig_err}")
             print("     Run 'hermes config migrate' to retry.")
     elif needs_migration:
@@ -216,14 +234,14 @@ def _check_and_apply_config_migration(
             _print_items(missing_config, "New options", "key")
 
         print()
-        response = _ask_configure_new_options(assume_yes=assume_yes, gateway_mode=gateway_mode)
+        response = "auto" if offline else _ask_configure_new_options(assume_yes=assume_yes, gateway_mode=gateway_mode)
         if response in {"", "y", "yes", "auto"}:
             print()
             # Gateway/--yes/non-interactive can't prompt for API keys; still run the
             # non-interactive pass so defaults and version bumps land before the gateway restarts.
-            unattended = gateway_mode or assume_yes or response == "auto"
-            results = migrate_config(interactive=not unattended, quiet=False)
-            if results["env_added"] or results["config_added"]:
+            unattended = offline or gateway_mode or assume_yes or response == "auto"
+            results = migrate_config(interactive=not unattended, quiet=False, **({"strict": True} if offline else {}))
+            if (results["env_added"] or results["config_added"]) and not results.get("failed_steps"):
                 print()
                 print("✓ Configuration updated!")
             if unattended and missing_env:
@@ -234,13 +252,17 @@ def _check_and_apply_config_migration(
     else:
         print("  ✓ Configuration is up to date")
 
+    if offline:
+        after_ver, _ = check_config_version(raise_on_parse_error=True)
+        if after_ver < latest_ver:
+            raise RuntimeError(f"Offline config migration remains at v{after_ver}, expected v{latest_ver}")
     # The migration above touched only the active profile; run the same NON-INTERACTIVE
     # migration per sibling home via the context-local HERMES_HOME override (never os.environ).
-    with _best_effort('Sibling config migration failed: %s'):
-        for _name, _from_ver, _to_ver in _migrate_sibling_profile_configs():
+    with nullcontext() if offline else _best_effort('Sibling config migration failed: %s'):
+        for _name, _from_ver, _to_ver in _migrate_sibling_profile_configs(**({"offline": True} if offline else {})):
             print(f"  ✓ Profile '{_name}': config format updated (v{_from_ver} → v{_to_ver})")
 
-    _restore_snapshot_safety_nets(pre_update_snapshot_id)
+    _restore_snapshot_safety_nets(pre_update_snapshot_id, offline=offline)
 
 
 # {profile: snapshot_id} from this run's pre-update backup, consumed by the per-profile

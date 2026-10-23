@@ -26,15 +26,14 @@ def source_product_current(project_root: Path, product: str, out: Path) -> bool:
         return False
 
 
-def source_build_env(base_env: dict | None = None, *, explicit: bool = False) -> dict[str, str]:
-    from pm import ensure
+def _normalized_source_build_env(base_env: dict | None = None, *, offline: bool = False) -> dict[str, str]:
+    """Apply receipt-significant source-build settings without selecting or acquiring tools."""
     from pm.environments import project_python, running_from_selected_environment
     from pm.paths import repo_root
     from hermes_constants import get_hermes_home
 
-    # The historical update runs on store Python with the selected environment
-    # activated in-process. Icon generation starts an isolated child, which needs
-    # the selected venv executable rather than the store interpreter.
+    # Icon generation starts an isolated child, which needs the selected venv
+    # executable when the update runs on store Python.
     root = repo_root()
     python = str(project_python(root)) if running_from_selected_environment(root) else sys.executable
     env = {**os.environ, **(base_env or {}), "CI": "1", "HERMES_PYTHON": python,
@@ -43,7 +42,19 @@ def source_build_env(base_env: dict | None = None, *, explicit: bool = False) ->
     npmrc = get_hermes_home() / "npmrc"
     if npmrc.is_file():
         env.setdefault("NPM_CONFIG_USERCONFIG", str(npmrc))
-    return ensure("npm", base_env=env, explicit=explicit).env
+    if offline:
+        from pm.offline import offline_environment
+        env = offline_environment(env)
+    return env
+
+
+def source_build_env(base_env: dict | None = None, *, explicit: bool = False,
+                     offline: bool = False) -> dict[str, str]:
+    from pm import ensure
+
+    env = _normalized_source_build_env(base_env, offline=offline)
+    return ensure("npm", base_env=env, explicit=explicit,
+                  **({"offline": True} if offline else {})).env
 
 
 def run_source_script(project_root: Path, script: str, *args: str, env: dict, label: str) -> None:
@@ -59,12 +70,12 @@ def run_source_script(project_root: Path, script: str, *args: str, env: dict, la
 
 
 def prepare_source_dependencies(project_root: Path, workspaces: tuple[str, ...], *, env: dict,
-                                explicit: bool = False) -> None:
+                                explicit: bool = False, offline: bool = False) -> None:
     from pm import lazy_installs_allowed
 
     run_source_script(
         project_root, "scripts/build/node-deps.mjs", "--source", str(project_root), "--reuse",
-        *(() if explicit or lazy_installs_allowed() else ("--no-install",)),
+        *(() if not offline and (explicit or lazy_installs_allowed()) else ("--no-install",)),
         *(arg for workspace in workspaces for arg in ("--workspace", workspace)), env=env,
         label="Preparing Node dependencies",
     )
@@ -99,21 +110,76 @@ def source_frontends(project_root: Path) -> tuple[str, ...]:
     return tuple(name for name in ("ui-tui", "web") if (project_root / name / "package.json").is_file())
 
 
-def build_update_products(project_root: Path, *, desktop: bool) -> None:
+def validate_offline_products(source_root: Path, installed_root: Path, *,
+                              env: dict[str, str] | None = None) -> dict:
+    """Read-only admission against the installed preparation, not the new checkout's outputs.
+
+    The caller stages selected tools privately when needed. This function never
+    ensures tools or publishes a dependency/application selection.
+    """
+    # Node admission covers the source TUI and web workspaces only.
+
+    source_root, installed_root = Path(source_root).resolve(), Path(installed_root).resolve()
+    frontends = source_frontends(source_root)
+    workspaces = frontends
+    if source_root == installed_root:
+        raise ValueError("Offline admission needs distinct source and installed trees")
+    if not workspaces:
+        return {"source_root": str(source_root), "installed_root": str(installed_root),
+                "workspaces": (), "products": (), "mutation_roots": []}
+    if env is None:
+        from pm import env_for, installed_package
+        selected = installed_package("node")
+        npm_selected = installed_package("npm")
+        if selected is None or selected.binary is None or npm_selected is None or npm_selected.binary is None:
+            raise RuntimeError("Offline products require selected Node and npm or a privately staged tool environment")
+        env = env_for("npm", base_env=dict(os.environ))
+        node = str(selected.binary)
+    else:
+        node = shutil.which("node", path=env.get("PATH", env.get("Path", "")))
+    tool_path = env.get("PATH", env.get("Path", ""))
+    if not node or not shutil.which("npm", path=tool_path):
+        raise RuntimeError("Offline products require prepared Node and npm tools")
+    child_env = _normalized_source_build_env(env, offline=True)
+    result = {
+        "source_root": str(source_root), "installed_root": str(installed_root),
+        "workspaces": workspaces, "products": tuple(frontends),
+        "mutation_roots": [str(installed_root / "node_modules"),
+                           *(str(installed_root / item) for item in (
+                               ("ui-tui/dist",) if "ui-tui" in frontends else ()) + (
+                               ("hermes_cli/web_dist",) if "web" in frontends else ()))],
+    }
+    if workspaces:
+        prepared = subprocess.run(
+            [node, str(source_root / "scripts/build/node-deps.mjs"),
+             "--source", str(source_root), "--prepared-source", str(installed_root),
+             "--check-prepared", *(arg for workspace in workspaces for arg in ("--workspace", workspace))],
+            cwd=source_root, env=child_env, capture_output=True, text=True, check=True,
+        )
+        import json
+        result["node"] = json.loads(prepared.stdout.splitlines()[-1])
+    return result
+
+
+def build_update_products(project_root: Path, *, desktop: bool, offline: bool = False) -> None:
     """Prepare the selected union once; a failed product aborts the update."""
     # Both current updates and historical takeover reach this in a fresh target
     # interpreter, never in the updater's pre-sync import graph.
     from hermes_cli.main_install_repair import _install_configured_features_missing_deps
     from hermes_cli.update_stage import publish_stage
 
-    _install_configured_features_missing_deps(project_root)
+    _install_configured_features_missing_deps(project_root, **({"offline": True} if offline else {}))
     frontends = source_frontends(project_root)
     if not frontends:
+        if offline:
+            from hermes_cli.memory_provider_migration import migrate_all_homes
+            migrate_all_homes(offline=True)
         return
-    env = source_build_env(explicit=True)
+    env = source_build_env(explicit=True, **({"offline": True} if offline else {}))
     workspaces = frontends + (("apps/desktop",) if desktop else ())
     publish_stage("Updating Node dependencies")
-    prepare_source_dependencies(project_root, workspaces, env=env, explicit=True)
+    prepare_source_dependencies(project_root, workspaces, env=env, explicit=True,
+                                **({"offline": True} if offline else {}))
     if "ui-tui" in frontends:
         publish_stage("Building the TUI")
         build_source_tui(project_root, env=env)
@@ -143,15 +209,16 @@ def build_update_products(project_root: Path, *, desktop: bool) -> None:
         # A current release/ can still sit beside a stale installed copy (an earlier
         # update rebuilt but never installed); healing must not wait for the next build.
         _refresh_installed_desktop_apps(project_root / "apps/desktop")
-    # A configured memory provider that no longer ships in core is installed from the
-    # catalog for every profile home sharing this venv (config, data and tool names
-    # unchanged). The update must finish even if the migration blows up.
-    try:
-        from hermes_cli.memory_provider_migration import migrate_all_homes
+    # A configured memory provider must remain available after the core cutover.
+    from hermes_cli.memory_provider_migration import migrate_all_homes
 
-        migrate_all_homes()
-    except Exception as exc:
-        print(f"  ⚠ Memory provider migration skipped: {exc}")
+    if offline:
+        migrate_all_homes(offline=True)
+    else:
+        try:
+            migrate_all_homes()
+        except Exception as exc:
+            print(f"  ⚠ Memory provider migration skipped: {exc}")
 
 
 if __name__ == "__main__":

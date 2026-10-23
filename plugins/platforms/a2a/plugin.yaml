@@ -1,6 +1,10 @@
 name: a2a-platform
 label: A2A
 kind: platform
+platform_dependencies:
+  a2a:
+    extras: []
+    env: [A2A_PORT, A2A_PEER_TOKENS, A2A_BEARER_TOKEN, A2A_PUSH_SECRET]
 version: 1.0.0
 description: >
   A2A (Agent-to-Agent) protocol v1.0 support for Hermes Agent — both directions

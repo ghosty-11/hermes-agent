@@ -679,7 +679,7 @@ class TestRootLevelProviderOverride:
 
     def test_normalize_root_model_keys_moves_to_model(self):
         """_normalize_root_model_keys migrates root keys into model section."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         config = {
             "provider": "opencode-go",
@@ -698,7 +698,7 @@ class TestRootLevelProviderOverride:
 
     def test_normalize_root_model_keys_does_not_override_existing(self):
         """Existing model.provider is never overridden by root-level key."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         config = {
             "provider": "stale-provider",
@@ -724,7 +724,7 @@ class TestRootLevelProviderOverride:
 
     def test_normalize_model_alias_to_default(self):
         """model.model becomes model.default."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         result = _normalize_root_model_keys({"model": {"model": "via-model-key"}})
         assert result["model"]["default"] == "via-model-key"
@@ -734,7 +734,7 @@ class TestRootLevelProviderOverride:
 
     def test_normalize_model_wins_over_name(self):
         """Precedence: model > name when both are aliases and default is empty."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         result = _normalize_root_model_keys({"model": {"model": "m-key", "name": "n-key"}})
         assert result["model"]["default"] == "m-key"
@@ -750,7 +750,7 @@ class TestRootLevelProviderOverride:
 
     def test_nested_dict_default_flattens_model_and_provider(self):
         """dict model.default -> string default + provider, no outer provider set."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         result = _normalize_root_model_keys({
             "model": {
@@ -762,7 +762,7 @@ class TestRootLevelProviderOverride:
 
     def test_nested_dict_default_provider_wins_over_auto(self):
         """Nested provider replaces the merged default "auto"."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         result = _normalize_root_model_keys({
             "model": {
@@ -775,7 +775,7 @@ class TestRootLevelProviderOverride:
 
     def test_nested_dict_default_never_overrides_explicit_provider(self):
         """An explicitly configured model.provider beats the nested provider."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         result = _normalize_root_model_keys({
             "model": {
@@ -788,7 +788,7 @@ class TestRootLevelProviderOverride:
 
     def test_nested_dict_model_alias_flattens_to_default(self):
         """dict model.model alias also flattens (default > model > name)."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         result = _normalize_root_model_keys({
             "model": {
@@ -801,7 +801,7 @@ class TestRootLevelProviderOverride:
 
     def test_flat_string_default_untouched(self):
         """Plain string defaults keep existing behavior exactly."""
-        from hermes_cli.config import _normalize_root_model_keys
+        from hermes_cli.config_primitives import _normalize_root_model_keys
 
         result = _normalize_root_model_keys({
             "model": {"default": "flat-default-model", "provider": "auto"},

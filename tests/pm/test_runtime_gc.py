@@ -54,6 +54,47 @@ def test_collector_yields_to_an_in_flight_stage(tmp_path):
     assert collect_runtime_generations(root) == [aborted]
 
 
+def test_ready_lookup_pins_selection_before_collector_can_remove_it(tmp_path, monkeypatch):
+    from hermes_cli.runtime_state import leases_held
+    from pm import runtime
+    from pm.environments import venv_python
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    (project / "uv.lock").write_text("version = 1\n")
+    root = tmp_path / "pm-runtime"
+    first = _generation(root, "first")
+    second = _generation(root, "second")
+    executable = venv_python(first)
+    executable.parent.mkdir()
+    executable.touch()
+    (root / ".prepare.lock").touch()
+    identity = runtime._inputs(project, Path(sys.executable))
+    selected = root / "selected.json"
+    selected.write_text(json.dumps({"inputs": identity, "generation": "generations/first"}))
+    collected = []
+
+    def selection_changes(_python, _env):
+        selected.write_text(json.dumps({"inputs": identity, "generation": "generations/second"}))
+        collected.extend(collect_runtime_generations(root))
+        return ""
+
+    monkeypatch.setattr(runtime, "_validate", selection_changes)
+    try:
+        assert runtime.prepare_runtime(tmp_path / "uv", Path(sys.executable), root,
+                                       project=project, bootstrap=False) == executable
+        assert collected == []
+        assert executable.is_file() and leases_held(first)
+        assert collect_runtime_generations(root) == []
+    finally:
+        release = runtime._HELD.pop(first, None)
+        if release is not None:
+            release()
+    assert collect_runtime_generations(root) == [first]
+    assert second.is_dir()
+
+
 def test_next_reader_removes_lease_left_by_hard_exit(tmp_path):
     from hermes_cli.runtime_state import lease_directory
 

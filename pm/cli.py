@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pm import termux_libs
 from pm.install import _facts, _lockfile, _store, ensure, stage_only
-from pm.operations import lock_project
+from pm.operations import lock_project, pm_mutation
 from pm.package import InstallError
 from pm.paths import repo_root
 from pm.registry import get_package, source_install_packages, tool_roots
@@ -507,6 +507,7 @@ def _gc_store(store, facts) -> tuple[int, int]:
     return (removed, len(keep))
 
 
+@pm_mutation
 def cmd_gc(args) -> int:
     from pm.paths import writable_store_root
     from pm.lock import Facts

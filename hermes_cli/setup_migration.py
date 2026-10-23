@@ -73,7 +73,7 @@ def _model_summary(config: dict) -> Optional[str]:
 
 
 def _cfg_summary(config: dict, section: str, key: str, default, prefix: str) -> str:
-    from hermes_cli.setup import cfg_get
+    from hermes_cli.config_primitives import cfg_get
     return f"{prefix}{cfg_get(config, section, key, default=default)}"
 
 

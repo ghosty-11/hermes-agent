@@ -10,21 +10,43 @@ import venv
 
 import pytest
 
+from pm.writer_claim import child_spawn, writer_claim
 from hermes_cli import update_completion
 
 
 @pytest.fixture
-def transition(tmp_path):
+def transition(tmp_path, monkeypatch):
     root = tmp_path / "checkout"
     root.mkdir()
     home = tmp_path / "home"
     home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     package = root / "hermes_cli"
     package.mkdir()
     (package / "__init__.py").write_text("")
     pm_package = root / "pm"
     pm_package.mkdir()
     (pm_package / "__init__.py").write_text("OLD_API = True\n")
+    # The old transport and the fresh checkout must both see the same real
+    # claim and owned-process implementations across the Git transition.
+    from pm import paths, process_scope, writer_claim as claim_module
+    from hermes_cli import _early_recovery
+
+    for module in (paths, process_scope, claim_module):
+        shutil.copy2(module.__file__, pm_package / Path(module.__file__).name)
+    shutil.copy2(_early_recovery.__file__, package / "_early_recovery.py")
+    (pm_package / "environments.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "dependency_home_root = lambda: Path(os.environ['HERMES_HOME'])\n"
+        "store_root = lambda root: dependency_home_root() / 'tools'\n"
+    )
+    # The parent claims with the same dependency-home derivation the synthetic
+    # child imports, so inherited claims name identical domains.
+    from pm import environments
+
+    monkeypatch.setattr(environments, "dependency_home_root", lambda: Path(os.environ["HERMES_HOME"]))
+    monkeypatch.setattr(environments, "store_root", lambda _root: Path(os.environ["HERMES_HOME"]) / "tools")
 
     def git(*args):
         return subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
@@ -38,7 +60,7 @@ def transition(tmp_path):
     # Deliberately incompatible: a cached OLD_API-only PM cannot prepare this tree.
     (root / "pm/__init__.py").write_text(
         "from hermes_cli.probe import event\n"
-        "def sync_venv(*, explicit, project_root, evict_incompatible_plugins):\n"
+        "def sync_venv(*, extras, explicit, project_root, evict_incompatible_plugins):\n"
         "    assert explicit and evict_incompatible_plugins\n"
         "    event('prepare')\n"
     )
@@ -65,6 +87,8 @@ def transition(tmp_path):
     (pm_package / "environments.py").write_text(
         "import os, sys\n"
         "from pathlib import Path\n"
+        "dependency_home_root = lambda: Path(os.environ['HERMES_HOME'])\n"
+        "store_root = lambda root: dependency_home_root() / 'tools'\n"
         "selected_venv = lambda root: Path(sys.executable).parent.parent\n"
         f"project_python = lambda root: Path({str(selected_python)!r})\n"
         "activation_environment = lambda root: {**os.environ, 'PYTHONPATH': str(root)}\n"
@@ -160,6 +184,12 @@ def transition(tmp_path):
         "receipt": {"update_id": "b" * 32, "outcome": "running", "steps": []},
         "windows_resume": {"resume_needed": True, "profiles": {"work": [123]}},
     }
+    from hermes_cli import main, update_owning_install
+
+    # cmd_update claims the install it runs from; point it at the synthetic checkout.
+    # Interpreter redirection to the owning install is outside these tests' contract.
+    monkeypatch.setattr(main, "PROJECT_ROOT", root)
+    monkeypatch.setattr(update_owning_install, "retarget_to_owning_install", lambda _root: None)
     return root, git, old, new, request
 
 
@@ -184,16 +214,21 @@ def test_old_process_new_git_tree_completes_in_fresh_python(transition, tmp_path
         f"if {bom_boundary == 'request'!r}:\n"
         "    transport._write_json = lambda path, data: path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8-sig')\n"
         "import pm\nassert pm.OLD_API\n"
-        "subprocess.run(['git', 'checkout', sys.argv[2]], check=True)\n"
-        "result = transport.run_completion(json.loads(sys.argv[3]))\n"
+        "from pm.writer_claim import writer_claim\n"
+        "from pathlib import Path\n"
+        "with writer_claim(install=Path.cwd(), inherited_only=True):\n"
+        "    subprocess.run(['git', 'checkout', sys.argv[2]], check=True)\n"
+        "    result = transport.run_completion(json.loads(sys.argv[3]))\n"
         "assert pm.OLD_API, 'transport mutated old module graph'\n"
         "print('RESULT=' + json.dumps(result))\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", driver, update_completion.__file__, new, json.dumps(request)],
-        cwd=root, env={**os.environ, "PYTHONPATH": str(root), "HERMES_HOME": request["home"]},
-        capture_output=True, text=True, timeout=30,
-    )
+    # Copy the environment only once the claim is held: it carries the claim description.
+    with writer_claim(install=root), child_spawn(
+            environment := {**os.environ, "PYTHONPATH": str(root), "HERMES_HOME": request["home"]}) as spawn:
+        result = subprocess.run(
+            [sys.executable, "-c", driver, update_completion.__file__, new, json.dumps(request)],
+            cwd=root, env=environment, capture_output=True, text=True, timeout=30, **spawn,
+        )
     assert result.returncode == 0, result.stdout + result.stderr
     response = json.loads(result.stdout.split("RESULT=")[1])
     assert response["exit_code"] == 0
@@ -248,8 +283,11 @@ def test_missing_child_result_fails_boundary_receipt_and_releases_lock(transitio
 @pytest.mark.parametrize("cleanup_failure", [None, "kill", "wait"])
 def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transition, monkeypatch, cleanup_failure):
     import io
+    import signal
     from types import SimpleNamespace
     from hermes_cli import main, update_cmd, update_lock, update_receipt
+    from pm import process_scope
+    from pm.process_scope import ProcessStillRunning
 
     root, git, old, new, request = transition
     marker = Path(request["home"]) / ".update_exit_code"
@@ -264,11 +302,12 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
     monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(main, "_finalize_update_output", lambda state: None)
     interrupted = False
-    cleanup_error = (OSError("retained-handle kill failed") if cleanup_failure == "kill"
+    cleanup_error = (OSError("owned group signal failed") if cleanup_failure == "kill"
                      else subprocess.TimeoutExpired("completion", 5))
     waits = []
     children = []
     popen = subprocess.Popen
+    real_killpg = process_scope.os.killpg
 
     def capture_child(*args, **kwargs):
         proc = popen(*args, **kwargs)
@@ -277,12 +316,17 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
         if not children and str(root / "hermes_cli/update_completion.py") in args[0]:
             children.append(proc)
             wait = proc.wait
-            kill = proc.kill
 
-            def cleanup_kill():
-                kill()
-                if cleanup_failure == "kill":
-                    raise cleanup_error
+            if cleanup_failure == "kill":
+                def cleanup_group_signal(pid, sig):
+                    if pid == proc.pid and sig == signal.SIGKILL:
+                        real_killpg(pid, sig)
+                        # Reap through the existing wait hook before making cleanup inconclusive.
+                        proc.wait(timeout=5)
+                        raise cleanup_error
+                    return real_killpg(pid, sig)
+
+                monkeypatch.setattr(process_scope.os, "killpg", cleanup_group_signal)
 
             def cleanup_wait(timeout=None):
                 waits.append(timeout)
@@ -292,7 +336,6 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
                     raise cleanup_error
                 return result
 
-            monkeypatch.setattr(proc, "kill", cleanup_kill)
             monkeypatch.setattr(proc, "wait", cleanup_wait)
         return proc
 
@@ -321,7 +364,8 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
     assert children[0].stdout.closed
     assert waits and all(timeout is not None and timeout > 0 for timeout in waits)
     if cleanup_failure:
-        assert error.value.__cause__ is cleanup_error
+        assert isinstance(error.value.__cause__, ProcessStillRunning)
+        assert error.value.__cause__.__cause__ is cleanup_error
     receipt = update_receipt.read_latest_receipt()
     assert receipt["update_id"] == request["receipt"]["update_id"]
     assert receipt["outcome"] == "failed"
@@ -343,7 +387,8 @@ def test_killed_selected_python_returns_signal_exit_status(transition):
         "import os, signal\n"
         "def build_update_products(*a, **kw): os.kill(os.getpid(), signal.SIGKILL)\n"
     )
-    result = update_completion.run_completion(request)
+    with writer_claim(install=root):
+        result = update_completion.run_completion(request)
     assert result["exit_code"] == 137
     assert result["pm_receipt"]["update_id"] == request["receipt"]["update_id"]
 
@@ -357,7 +402,8 @@ def test_failed_build_preserves_exit_status_without_maintenance(transition):
         "import subprocess\n"
         "def build_update_products(*a, **kw): raise subprocess.CalledProcessError(23, ['builder'])\n"
     )
-    result = update_completion.run_completion(request)
+    with writer_claim(install=root):
+        result = update_completion.run_completion(request)
     assert result["exit_code"] == 23
     assert result["receipt"]["outcome"] == "failed"
     assert (Path(request["home"]) / "completion-pending").read_text() == "owed"
@@ -410,7 +456,8 @@ def test_bootstrap_does_not_initialize_old_site_packages(transition, tmp_path, m
     trap = tmp_path / "old-site-loaded"
     (site / "application.pth").write_text(f"import pathlib; pathlib.Path({str(trap)!r}).touch()\n")
     monkeypatch.setattr(sys, "executable", str(obsolete / ("Scripts/python.exe" if os.name == "nt" else "bin/python")))
-    result = update_completion.run_completion(request)
+    with writer_claim(install=root):
+        result = update_completion.run_completion(request)
     assert result["exit_code"] == 0
     assert not trap.exists(), "preparation initialized the old application's .pth graph"
 
@@ -453,7 +500,8 @@ def test_progress_is_forwarded_before_held_stage_is_released(transition, monkeyp
 
     def run():
         try:
-            responses.append(update_completion.run_completion(request))
+            with writer_claim(install=root):
+                responses.append(update_completion.run_completion(request))
         except BaseException as exc:
             errors.append(exc)
 
@@ -490,26 +538,35 @@ def test_interactive_configuration_keeps_terminal_input(transition):
         "    return True\n"
     )
     master, slave = pty.openpty()
-    driver = "import json,runpy,sys; m=runpy.run_path(sys.argv[1]); raise SystemExit(m['run_completion'](json.loads(sys.argv[2]))['exit_code'])"
-    proc = subprocess.Popen([sys.executable, "-c", driver, update_completion.__file__, json.dumps(request)],
-                            cwd=root, stdin=slave, stdout=slave, stderr=slave)
-    os.close(slave)
-    output = b""
-    try:
-        deadline = time.monotonic() + 20
-        while b"CONFIG?" not in output:
-            assert time.monotonic() < deadline, output.decode(errors="replace")
-            if select.select([master], [], [], 0.1)[0]:
-                output += os.read(master, 8192)
-        os.write(master, b"yes\n")
-        assert proc.wait(timeout=20) == 0
-        events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
-        assert next(e for e in events if e["name"] == "answer")["value"] == "yes"
-    finally:
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGINT)
-            proc.wait(timeout=5)
-        os.close(master)
+    driver = (
+        "import json,runpy,sys\n"
+        "from pathlib import Path\n"
+        "from pm.writer_claim import writer_claim\n"
+        "with writer_claim(install=Path.cwd(), inherited_only=True):\n"
+        "    m=runpy.run_path(sys.argv[1])\n"
+        "    raise SystemExit(m['run_completion'](json.loads(sys.argv[2]))['exit_code'])\n"
+    )
+    # Copy the environment only once the claim is held: it carries the claim description.
+    with writer_claim(install=root), child_spawn(environment := dict(os.environ)) as spawn:
+        proc = subprocess.Popen([sys.executable, "-c", driver, update_completion.__file__, json.dumps(request)],
+                                cwd=root, env=environment, stdin=slave, stdout=slave, stderr=slave, **spawn)
+        os.close(slave)
+        output = b""
+        try:
+            deadline = time.monotonic() + 20
+            while b"CONFIG?" not in output:
+                assert time.monotonic() < deadline, output.decode(errors="replace")
+                if select.select([master], [], [], 0.1)[0]:
+                    output += os.read(master, 8192)
+            os.write(master, b"yes\n")
+            assert proc.wait(timeout=20) == 0
+            events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+            assert next(e for e in events if e["name"] == "answer")["value"] == "yes"
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=5)
+            os.close(master)
 
 
 @pytest.mark.platforms("posix")
@@ -538,7 +595,7 @@ def test_interrupt_reaps_completion_descendants_before_return(transition, monkey
 
     monkeypatch.setattr(sys, "stdout", Interrupt())
     try:
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt), writer_claim(install=root):
             update_completion.run_completion(request)
         assert pids
         deadline = time.monotonic() + 3
@@ -641,6 +698,7 @@ def test_only_correlated_terminal_receipt_can_acknowledge_success(transition, en
         f"    windows_resume={{}}, receipt={receipt!r}), ensure_ascii=False), encoding={encoding!r})\n",
         encoding="utf-8",
     )
-    response = run_completion(request)
+    with writer_claim(install=root):
+        response = run_completion(request)
     assert response["exit_code"] == (0 if correlated else 1)
     assert response["receipt"] == (receipt if correlated else None)

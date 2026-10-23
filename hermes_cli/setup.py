@@ -21,9 +21,10 @@ from hermes_cli.curses_ui import MenuNavigationEvent, MenuNavigationStart
 # Config helpers are re-exported (tests patch them on this module). display_hermes_home is
 # imported lazily at call sites (stale-module safety during hermes update).
 from hermes_cli.config import (
-    cfg_get, DEFAULT_CONFIG, get_hermes_home, get_config_path, get_env_path, load_config, save_config,
+    DEFAULT_CONFIG, get_hermes_home, get_config_path, get_env_path, load_config, save_config,
     save_env_value, remove_env_value, get_env_value, ensure_hermes_home,
 )
+from hermes_cli import config_primitives
 from hermes_cli.colors import Colors, color
 from hermes_cli.cli_output import print_error, print_info, print_success, print_warning
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -453,7 +454,7 @@ def setup_agent_settings(config: dict):
     # ── Max Iterations ── (config.yaml is authoritative; never surface a stale legacy .env value)
     # If a legacy .env entry is still around (from pre-PR#18413 setups), prefer the config value so we don't
     # surface a stale number to the user.
-    current_max = str(cfg_get(config, "agent", "max_turns", default=90))
+    current_max = str(config_primitives.cfg_get(config, "agent", "max_turns", default=90))
     _info("Maximum tool-calling iterations per conversation.",
           "Higher = more complex tasks, but costs more tokens.",
           f"Press Enter to keep {current_max}. Use 90 for most tasks or 150+ for open exploration.")
@@ -471,7 +472,7 @@ def setup_agent_settings(config: dict):
     _info("", *_TOOL_PROGRESS_HELP)
     # Unset = each platform keeps its own default (CLI all, Telegram/Slack off). Enter on an unset key must keep
     # that: a global display.tool_progress beats every platform tier (#121230).
-    current_mode = cfg_get(config, "display", "tool_progress")
+    current_mode = config_primitives.cfg_get(config, "display", "tool_progress")
     mode = prompt("Tool progress mode" if current_mode else "Tool progress mode (Enter keeps per-platform defaults)",
                   current_mode)
     if not mode and not current_mode:
@@ -488,7 +489,7 @@ def setup_agent_settings(config: dict):
     _info("Automatically summarizes old messages when context gets too long.",
           "Higher threshold = compress later (use more context). Lower = compress sooner.")
     config.setdefault("compression", {})["enabled"] = True
-    current_threshold = cfg_get(config, "compression", "threshold", default=0.50)
+    current_threshold = config_primitives.cfg_get(config, "compression", "threshold", default=0.50)
     threshold = _prompt_number("Compression threshold (0.5-0.95)", current_threshold, float)
     if threshold is not None and 0.5 <= threshold <= 0.95:
         config["compression"]["threshold"] = threshold

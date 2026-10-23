@@ -47,6 +47,7 @@ from hermes_constants import (  # noqa: F401
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F401
 from utils import atomic_replace, fast_safe_load, file_signature
+from hermes_cli import config_primitives
 from hermes_cli.config_read_errors import (
     _CONFIG_PARSE_FAILURES, _FIX_PERMS, _FIX_YAML, FailedConfigRead, _backups_dir_display,
     _refuse_failed_read, _refuse_overwrite, _warn_config_parse_failure, _yaml_error_details,
@@ -928,7 +929,7 @@ def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
         return []
 
     config = load_config()
-    values = ((var, cfg_get(config, *f"{SKILL_CONFIG_PREFIX}.{var['key']}".split("."))) for var in all_vars)
+    values = ((var, config_primitives.cfg_get(config, *f"{SKILL_CONFIG_PREFIX}.{var['key']}".split("."))) for var in all_vars)
     return [var for var, v in values if v is None or (isinstance(v, str) and not v.strip())]
 
 
@@ -951,7 +952,14 @@ def _read_config_version_stamp(*, raise_on_parse_error: bool = False) -> Tuple[O
     ``latest`` exactly as ``check_config_version()`` always reported it."""
     latest = _coerce_config_version(DEFAULT_CONFIG.get("_config_version", 1)) or 1
     config_path = get_config_path()
-    if not config_path.exists():
+    if raise_on_parse_error:
+        try:
+            mode = config_path.stat().st_mode
+        except FileNotFoundError:
+            return latest, latest
+        if not stat.S_ISREG(mode):
+            raise InvalidUserConfigError(f"Cannot inspect {config_path}: config.yaml is not a file")
+    elif not config_path.exists():
         return latest, latest
 
     try:
@@ -1210,7 +1218,7 @@ def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue
         # ``parse_config_string_list`` readers accept the quoted form; nothing is ignored there.
         if key in _SCALAR_AS_ONE_ITEM_LIST_KEYS:
             continue
-        value = cfg_get(config, *key.split("."))
+        value = config_primitives.cfg_get(config, *key.split("."))
         if not isinstance(value, str) or not _looks_structured_value(value):
             continue
         try:
@@ -1342,7 +1350,7 @@ def _ask_yes_no(prompt: str) -> bool:
     return answer in {"y", "yes"}
 
 
-def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
+def migrate_config(interactive: bool = True, quiet: bool = False, *, strict: bool = False) -> Dict[str, Any]:
     """Migrate config to latest version, prompting for new required fields."""
     results = {"env_added": [], "config_added": [], "warnings": []}
 
@@ -1356,7 +1364,9 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         if fixes and not quiet:
             print(f"  ✓ Normalized .env line formatting ({fixes} line(s) changed)")
     except Exception:
-        pass  # best-effort; never block migration on sanitize failure
+        if strict:
+            raise
+        pass  # online migration keeps its existing best-effort sanitation
 
     # Auto-migration support floor (v12): an EXPLICIT on-disk ``_config_version`` below the
     # floor is NOT migrated and NOT rewritten — surface a message and leave the file untouched
@@ -1378,12 +1388,12 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         if not quiet:
             print(f"  ⚠ {msg}")
     else:
-        run_migrations(current_ver, results, quiet, unversioned=not has_explicit_version)
+        run_migrations(current_ver, results, quiet, unversioned=not has_explicit_version, strict=strict)
 
     _disable_suspicious_mcp_servers(results, quiet)
     _warn_invalid_platform_toolsets(results, quiet)
 
-    if current_ver < latest_ver and not quiet and not floor_refused:
+    if current_ver < latest_ver and not quiet and not floor_refused and not results.get("failed_steps"):
         print(f"Config version: {current_ver} → {latest_ver}")
 
     missing_env = get_missing_env_vars(required_only=True)
@@ -1407,7 +1417,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     # read time); this list only feeds the "N new config option(s)" display.
     results["config_added"].extend(field["key"] for field in get_missing_config_fields())
 
-    if current_ver < latest_ver and not floor_refused:
+    if current_ver < latest_ver and not floor_refused and not results.get("failed_steps"):
         config = read_raw_config()
         config["_config_version"] = latest_ver
         _persist_migration(config)
@@ -1536,26 +1546,10 @@ def _merge_partial_save(raw: dict, override: dict) -> dict:
         if key not in result:
             result[key] = copy.deepcopy(value)
         elif isinstance(result.get(key), dict) and isinstance(value, dict):
-            result[key] = _deep_merge(value, result[key])
+            result[key] = config_primitives._deep_merge(value, result[key])
     return result
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge *override* into *base*: dict-over-dict recurses (so overriding one leaf
-    keeps sibling defaults), and ``None`` over a dict section is ignored.
-
-    An empty section key in config.yaml (``terminal:`` with no value) parses as YAML ``None``; treating that
-    as an override would replace the entire default dict with ``None`` and crash every downstream consumer
-    that expects a mapping (#58277).
-    """
-    result = base.copy()
-    for key, value in override.items():
-        over_dict = isinstance(result.get(key), dict)
-        if over_dict and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
-        elif not (over_dict and value is None):
-            result[key] = value
-    return result
 
 
 def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
@@ -1565,86 +1559,13 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     stripped: set = set()
     for dotted in dotted_keys:
         *parents, leaf = dotted.split(".")
-        node = cfg_get(cfg, *parents)
+        node = config_primitives.cfg_get(cfg, *parents)
         if isinstance(node, dict) and leaf in node:
             del node[leaf]
             stripped.add(dotted)
     return cfg, stripped
 
 
-_ENV_REF_RE = re.compile(r"\${([^}]+)}")
-
-
-def _env_ref_lookup(name: str) -> Optional[str]:
-    """Resolve the env var behind a ``${VAR}`` / ``${env:VAR}`` ref — plain ``os.environ`` outside
-    a profile secret scope (legacy behavior for the default profile).
-
-    Inside a scope (a multiplexed gateway turn, a secondary profile's config load, a cron job) the read goes
-    through ``agent.secret_scope.get_secret`` so the ref resolves against *that* profile's ``.env``: under
-    multiplexing a miss is a miss, never another profile's ``os.environ`` value (#84079 — every profile
-    "had" the default profile's ``${MATRIX_ACCESS_TOKEN}`` and fanned out). Same policy as
-    ``gateway.config._getenv`` and ``get_env_value``.
-    """
-    try:
-        from agent.secret_scope import current_secret_scope, get_secret as _get_secret
-    except Exception:
-        return os.environ.get(name)
-    if current_secret_scope() is None:
-        return os.environ.get(name)
-    return _get_secret(name)
-
-
-def _env_expand_match(m: re.Match) -> str:
-    """Expand one ``${VAR}`` (legacy bare name) or ``${env:VAR}`` (Cursor-style SecretRef).
-    Other SecretRef sources (``file:``, ``bitwarden:``, ``vault:``...) are NOT resolved here:
-    external backends inject their values into the environment at startup (the ``secrets:``
-    block), so a config ref only ever needs the env shape. Unresolved refs stay verbatim so
-    callers can detect them."""
-    raw = m.group(0)
-    inner = m.group(1).strip()
-    name = _env_ref_var_name(inner)
-    if name is None:
-        if not inner.startswith("env:") and _is_non_env_secret_ref(inner):
-            logger.warning(
-                "Config ref %r uses source %r which is not resolvable in "
-                "config.yaml — external secret sources inject env vars at "
-                "startup, so reference the variable as ${env:NAME} instead",
-                raw, inner.split(":", 1)[0])
-        return raw  # non-env source, or empty ``${env:}``
-    val = _env_ref_lookup(name)
-    if val is not None:
-        return val
-    if inner.startswith("env:"):
-        logger.warning(
-            "Config ref %r: %s is not set (check ~/.hermes/.env); "
-            "keeping the literal placeholder", raw, name)
-    return raw
-
-
-def _is_non_env_secret_ref(ref: str) -> bool:
-    """True for a SecretRef body with a non-``env`` source (``bitwarden:FOO``, ``vault:...``)."""
-    return ":" in ref and re.match(r"^[a-z][a-z0-9_-]*:", ref) is not None
-
-
-def _env_ref_var_name(ref: str) -> Optional[str]:
-    """Env-var name a ``${...}`` body reads, or None for a non-env source / empty ``env:``."""
-    ref = ref.strip()
-    if ref.startswith("env:"):
-        return ref[len("env:"):].strip() or None
-    if _is_non_env_secret_ref(ref):
-        return None
-    return ref
-
-
-def _expand_env_vars(obj):
-    """Recursively expand ``${VAR}`` / ``${env:VAR}`` in string values (keys/non-strings untouched)."""
-    if isinstance(obj, str):
-        return _ENV_REF_RE.sub(_env_expand_match, obj)
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
-    return obj
 
 
 def _env_ref_snapshot(obj, snapshot=None):
@@ -1658,10 +1579,10 @@ def _env_ref_snapshot(obj, snapshot=None):
     if snapshot is None:
         snapshot = {}
     if isinstance(obj, str):
-        for raw in _ENV_REF_RE.findall(obj):
-            name = _env_ref_var_name(raw)
+        for raw in config_primitives._ENV_REF_RE.findall(obj):
+            name = config_primitives._env_ref_var_name(raw)
             if name is not None:
-                snapshot[name] = _env_ref_lookup(name)
+                snapshot[name] = config_primitives._env_ref_lookup(name)
     elif isinstance(obj, dict):
         for value in obj.values():
             _env_ref_snapshot(value, snapshot)
@@ -1689,8 +1610,8 @@ def _items_by_unique_name(items):
 def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
     """Restore raw ``${VAR}`` templates where the value is otherwise unchanged, so persisting a
     loaded (expanded) config never writes the plaintext secret back to ``config.yaml``."""
-    if isinstance(current, str) and isinstance(raw, str) and _ENV_REF_RE.search(raw):
-        if current in (raw, loaded_expanded) or _expand_env_vars(raw) == current:
+    if isinstance(current, str) and isinstance(raw, str) and config_primitives._ENV_REF_RE.search(raw):
+        if current in (raw, loaded_expanded) or config_primitives._expand_env_vars(raw) == current:
             return raw
         return current
 
@@ -1775,89 +1696,6 @@ def split_model_config_default(raw_default: Any) -> tuple[str, str]:
     return (str(raw_default or "").strip(), "")
 
 
-def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Canonicalize the ``model`` section at the single load/save chokepoint.
-    Root-level ``provider``/``base_url``/``context_length`` (older layouts) are moved under
-    ``model`` only when the corresponding ``model.*`` key is empty — never overriding. ``api_base``
-    (the OpenAI-SDK/LiteLLM name users reach for) is an alias for ``base_url``; the runtime reads
-    only ``model.base_url``. A dict-valued ``default``/``model``/``name`` is flattened so no reader
-    sees a nested dict, and the id is canonicalized to ``default``.
-
-    Also aliases ``api_base`` → ``base_url`` (issue #8919). ``api_base`` is the intuitive name OpenAI-SDK /
-    LiteLLM users reach for, and ``hermes config set`` blindly accepts any dotted key — so
-    ``model.api_base`` got written, confirmed, and then silently ignored by the runtime resolver (which
-    reads only ``model.base_url``), causing requests to fall back to OpenRouter. We migrate the alias to the
-    canonical key (fallback-only — never override an explicit ``base_url``) and drop the alias so it can't
-    confuse later loads.
-    Finally, canonicalizes the model-id key to ``model.default`` (issue #34500). The runtime resolver and
-    ~14 other readers select the chat model via ``model.default``; ``model.model`` was already aliased
-    inline at some sites but ``model.name`` was not, so a custom-provider config like ``model: {name: <id>,
-    provider: <custom>}`` resolved to an empty model and the API request went out with ``model=`` (HTTP 400
-    from OpenAI-compatible backends) — while display paths (``hermes status``/``dump``) read ``name`` and
-    *showed* the model, making the failure silent. Normalizing here (the single load/save chokepoint) means
-    every reader, present and future, sees a populated ``default`` and the stale alias is migrated out of
-    config.yaml on the next save. Precedence: ``default`` > ``model`` > ``name`` (never overrides an
-    explicit ``default``, so existing configs are unaffected).
-    """
-    model_in = config.get("model")
-    model_provider = model_in.get("provider") if isinstance(model_in, dict) else None
-    needs_model_work = (model_provider is not None and not isinstance(model_provider, str)) or (
-        isinstance(model_in, dict) and (
-            model_in.get("api_base")
-            or model_in.get("model") or model_in.get("name")
-            or any(isinstance(model_in.get(k), dict) for k in ("default", "model", "name"))))
-    has_root = any(config.get(k) for k in ("provider", "base_url", "context_length", "api_base"))
-    if not has_root and not needs_model_work:
-        return config
-
-    config = dict(config)
-    model = config.get("model")
-    model = dict(model) if isinstance(model, dict) else {"default": model} if model else {}
-    config["model"] = model
-
-    # Flatten ``{provider: <p>, model: <m>}``. The nested provider wins over the merged default
-    # ``"auto"`` (which runtime resolution treats as authoritative) but never over a configured one.
-    for _key in ("default", "model", "name"):
-        _val = model.get(_key)
-        if isinstance(_val, dict):
-            _nested_model = _val.get("model") or _val.get("default")
-            _nested_provider = str(_val.get("provider") or "").strip()
-            model[_key] = str(_nested_model or "").strip()
-            if _nested_provider:
-                _outer_provider = str(model.get("provider") or "").strip()
-                if not _outer_provider or _outer_provider == "auto":
-                    model["provider"] = _nested_provider
-
-    for key in ("provider", "base_url", "context_length"):
-        root_val = config.get(key)
-        if root_val and not model.get(key):
-            model[key] = root_val
-        config.pop(key, None)
-
-    # Provider identity is a string (#117345): an unquoted YAML scalar (``provider: 2``)
-    # loads as int, and downstream readers call ``(provider or "").strip()`` — a gateway
-    # turn dies before the agent runs. Normalize at the load/save chokepoint so every
-    # reader (and the next save, which rewrites config.yaml) heals the persisted value.
-    # Guard on presence: coerce_provider_id(None) is "" — injecting an empty key into
-    # provider-less configs would add churn to config.yaml on the next save.
-    if model.get("provider") is not None:
-        model["provider"] = coerce_provider_id(model.get("provider"))
-
-    for alias_val in (config.get("api_base"), model.get("api_base")):
-        if alias_val and not model.get("base_url"):
-            model["base_url"] = alias_val
-    config.pop("api_base", None)
-    model.pop("api_base", None)
-
-    # ``model``/``name`` are last-resort aliases (in that order), then dropped.
-    alias = model.get("model") or model.get("name")
-    if not model.get("default") and alias:
-        model["default"] = alias
-    if model.get("default"):
-        model.pop("model", None)
-        model.pop("name", None)
-
-    return config
 
 
 def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -1875,7 +1713,7 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def _canonicalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """The load/save normalization pipeline: max_turns relocation, then model-section canon."""
-    return _normalize_root_model_keys(_normalize_max_turns_config(config))
+    return config_primitives._normalize_root_model_keys(_normalize_max_turns_config(config))
 
 
 # Sentinel for an unlimited turn budget. ``sys.maxsize`` survives the str->int round-trip through
@@ -1916,18 +1754,6 @@ def resolve_turn_limit(raw: Any, default: int = TURN_LIMIT_UNLIMITED) -> int:
     return TURN_LIMIT_UNLIMITED if n <= 0 else n
 
 
-def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
-    """Traverse nested dict keys safely, returning ``default`` on any miss.
-    Explicit ``None`` values are returned as-is (``dict.get`` semantics: ``default`` only when the
-    key is absent). Named ``cfg_get`` to avoid shadowing the ubiquitous ``cfg_path`` local."""
-    if not isinstance(cfg, dict):
-        return default
-    node: Any = cfg
-    for key in keys:
-        if not isinstance(node, dict) or key not in node:
-            return default
-        node = node[key]
-    return node
 
 
 def _raw_config_cache_hit(path_key: str, cache_key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
@@ -2292,8 +2118,8 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         from hermes_cli.config_backups import load_newest_good_backup
         raw_good = load_newest_good_backup(config_path)
         if raw_good is not None:
-            normalized = _canonicalize_config(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good))
-            expanded_good: Dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
+            normalized = _canonicalize_config(config_primitives._deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good))
+            expanded_good: Dict[str, Any] = config_primitives._expand_env_vars(normalized)  # type: ignore[assignment]
             lkg, _ = _merge_managed_overlay(expanded_good)
             fallback = "last-known-good-backup"
     _warn_config_parse_failure(
@@ -2302,7 +2128,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         return None
     # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
     # expanded one. Expand defensively — idempotent when already expanded.
-    lkg_copy = FailedConfigRead(_expand_env_vars(copy.deepcopy(lkg)), error=exc)
+    lkg_copy = FailedConfigRead(config_primitives._expand_env_vars(copy.deepcopy(lkg)), error=exc)
     if cache_sig is not None:
         # Cache under the failed file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse the fallback; fixing the file changes the signature and reloads
@@ -2322,11 +2148,11 @@ def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], An
         return expanded, managed_config
     # Same canonicalization as the user config BEFORE merging (parity with
     # managed_scope.apply_managed_overlay) so the merged result never exposes a nested dict.
-    managed_normalized = _normalize_root_model_keys(managed_config)
+    managed_normalized = config_primitives._normalize_root_model_keys(managed_config)
     if isinstance(managed_normalized.get("model"), str):
         managed_normalized = dict(managed_normalized)
         managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
+    return config_primitives._deep_merge(expanded, config_primitives._expand_env_vars(managed_normalized)), managed_config
 
 
 def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, Any]]:
@@ -2349,7 +2175,7 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, 
         except OSError:
             return hit
     env_snapshot = cached[9] if len(cached) > 9 else {}
-    if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
+    if all(config_primitives._env_ref_lookup(k) == v for k, v in env_snapshot.items()):
         return hit
     return None
 
@@ -2398,7 +2224,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
-                config = _deep_merge(config, user_config)
+                config = config_primitives._deep_merge(config, user_config)
                 # A copy of the file that just parsed is what a FRESH process falls back to when the
                 # next edit breaks the YAML (see _last_known_good_fallback). backup_config() skips
                 # byte-identical repeats and keeps a bounded count, so steady-state loads cost one stat.
@@ -2411,13 +2237,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # Defaults stand in for the unreadable file: never the next last-known-good,
                 # never saveable, and cached like the LKG path.
                 fallback = FailedConfigRead(
-                    _merge_managed_overlay(_expand_env_vars(_canonicalize_config(config)))[0], error=e)
+                    _merge_managed_overlay(config_primitives._expand_env_vars(_canonicalize_config(config)))[0], error=e)
                 if cache_sig is not None:
                     _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, fallback, {})
                 return copy.deepcopy(fallback) if want_deepcopy else fallback
 
         normalized = _canonicalize_config(config)
-        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
+        expanded, managed_config = _merge_managed_overlay(config_primitives._expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while
@@ -3190,7 +3016,7 @@ def edit_config():
 
 def _default_value_for_key(dotted_key: str):
     """Return the leaf value declared for *dotted_key* in ``DEFAULT_CONFIG`` (None for dicts/misses)."""
-    node = cfg_get(DEFAULT_CONFIG, *_split_key_path(dotted_key))
+    node = config_primitives.cfg_get(DEFAULT_CONFIG, *_split_key_path(dotted_key))
     return None if isinstance(node, dict) else node
 
 
@@ -3432,7 +3258,7 @@ def _expected_container_type(key: str, user_config: Dict[str, Any]) -> Optional[
     A single-segment key that is a mapping *section* in the schema skips the lookup: replacing a
     whole section is ``_guard_section_overwrite``'s call (``--force``, the bare ``model`` shorthand)."""
     parts = _split_key_path(key)
-    schema_node = cfg_get(DEFAULT_CONFIG, *parts)
+    schema_node = config_primitives.cfg_get(DEFAULT_CONFIG, *parts)
     if len(parts) == 1 and isinstance(schema_node, dict):
         schema_node = None
     existing = _get_nested(user_config, key)
@@ -3713,7 +3539,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         # Normalize the api_base → base_url alias at set-time too (issue #8919), so a fresh `hermes config
         # set model.api_base ...` lands on the canonical key the runtime resolver actually reads, instead of
         # being silently ignored.
-        user_config = _normalize_root_model_keys(user_config)
+        user_config = config_primitives._normalize_root_model_keys(user_config)
         key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
     _write_user_config(config_path, user_config)

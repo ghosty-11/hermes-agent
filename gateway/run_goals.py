@@ -340,8 +340,8 @@ class GatewayGoalsMixin:
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
-        """Text for /goal and /loop after a gateway turn. Streamed turns return None from
-        _handle_message_with_agent (already_sent); the delivered reply is stashed on the event."""
+        """Text for /goal and /loop after a gateway turn. A previously bracketed
+        queued reply may return None; its delivered text is stashed on the event."""
         text = ""
         if isinstance(agent_result, dict):
             text = str(agent_result.get("final_response") or "")

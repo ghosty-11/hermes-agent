@@ -245,6 +245,33 @@ def test_frozen_export_keeps_markers_and_excludes_build_metadata(locked_source, 
     assert not (source / ".venv").exists()
 
 
+def test_runtime_export_claim_follows_real_output_destination(tmp_path, monkeypatch):
+    """In-runtime direct dispatch holds the writer claim exactly when the real
+    write-set classifier says the export writes shared state."""
+    from pm import build_operations, client
+    from pm.writer_claim import has_writer_claim
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "store"))
+    monkeypatch.setattr(client, "is_runtime", lambda: True)
+    claims = []
+    # The implementation needs a locked toolchain; the contract under test is
+    # the claim held at the dispatch boundary, so record it there.
+    monkeypatch.setattr(build_operations, "export_requirements",
+                        lambda **_kwargs: claims.append(has_writer_claim()))
+    cache = tmp_path / "private-cache"
+    monkeypatch.chdir(tmp_path)
+    for destination, expected in ((tmp_path / "private" / "requirements.txt", False),
+                                  (home / "requirements.txt", True),
+                                  (Path("relative-export.txt"), True)):
+        client.export_requirements(tmp_path / "source", destination,
+                                   python=Path(sys.executable), cache=cache, explicit=True)
+        assert claims[-1] is expected
+        assert not has_writer_claim()
+
+
 def test_frozen_export_preserves_git_commit_pin(locked_source, tmp_path, build_tools):
     from packaging.requirements import Requirement
     from pm import export_requirements, lock_project
@@ -419,8 +446,8 @@ def test_prune_cache_does_not_acquire_a_missing_toolchain(tmp_path, monkeypatch)
 
     monkeypatch.setattr("pm.client.is_runtime", lambda: True)
     store = tmp_path / "empty-store"
-    monkeypatch.setattr(pm.paths, "store_root", lambda: store)
-    monkeypatch.setattr(pm.paths, "writable_store_root", lambda: store)
+    monkeypatch.setattr(pm.paths, "store_root", lambda project_root=None: store)
+    monkeypatch.setattr(pm.paths, "writable_store_root", lambda project_root=None: store)
     monkeypatch.setattr(pm.paths, "facts_path", lambda: store / "facts.json")
     monkeypatch.setattr(importlib.import_module("pm.install"), "ensure",
                         lambda *args, **kwargs: pytest.fail("cache pruning must not acquire tools"))

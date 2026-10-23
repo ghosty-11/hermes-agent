@@ -332,7 +332,7 @@ def test_a_routed_profile_script_never_receives_a_launch_only_name(hermes_env, m
 
     from agent import secret_scope
     from agent.secret_sources import registry as reg_module
-    from agent.secret_sources.base import FetchResult
+    from agent.secret_sources.base import FetchResult, SecretSource
     from agent.secret_sources.registry import ApplyReport, SourceReport
     from cron.scheduler_script import _run_job_script
     from hermes_cli import env_loader
@@ -348,10 +348,27 @@ def test_a_routed_profile_script_never_receives_a_launch_only_name(hermes_env, m
     monkeypatch.setattr(env_loader, "_SECRET_SOURCES", {"LAUNCH_VAULT_ONLY": "vault", "ROUTED_VAULT_ONLY": "vault"})
     monkeypatch.setattr(env_loader, "_APPLIED_HOMES", set())
     monkeypatch.setattr(env_loader, "_SECRET_SOURCE_VALUES_BY_HOME", {})
-    monkeypatch.setattr(reg_module, "apply_all", lambda _cfg, home_path, **_kw: ApplyReport(
-        sources=[SourceReport(name="test-source", label="Test Source", result=FetchResult(),
-                              applied=[], skipped_existing=["LAUNCH_SKIPPED_SECRET"])],
-        provenance={}))
+
+    class _TestSource(SecretSource):
+        name = "test-source"
+        label = "Test Source"
+
+        def fetch(self, cfg, home_path):
+            return FetchResult(secrets={"LAUNCH_SKIPPED_SECRET": "vault-value"})
+
+    source = _TestSource()
+
+    def _fake_apply_all(cfg, home_path, *, environ=None):
+        result = source.fetch(cfg["test-source"], home_path)
+        return ApplyReport(
+            sources=[SourceReport(name="test-source", label="Test Source", result=result,
+                                  applied=[], skipped_existing=["LAUNCH_SKIPPED_SECRET"])],
+            provenance={},
+            activation_decisions={"test-source": True},
+            _fetches=[(source, cfg["test-source"], result)],
+        )
+
+    monkeypatch.setattr(reg_module, "apply_all", _fake_apply_all)
     env_loader._apply_external_secret_sources(launch)  # the real registry path; the source loses to the env
     environ_before = dict(os.environ)
 
