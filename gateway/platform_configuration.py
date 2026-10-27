@@ -156,7 +156,7 @@ def _buzz_key(extra: dict, lookup: Lookup, *, multiplex_active: bool) -> bool:
 
 def credential_seed(step, lookup: Lookup) -> dict:
     """Fields written by a credential step; runtime and inspection use the same projection."""
-    from gateway.config_env import _INT
+    from gateway.platform_env import INT
 
     extra = {}
     for key, env, *rest in step.fixed:
@@ -175,7 +175,7 @@ def credential_seed(step, lookup: Lookup) -> dict:
                 value = value.strip()
             if not value:
                 continue
-            if converter and converter[0] is _INT:
+            if converter and converter[0] is INT:
                 try:
                     extra[key] = int(value)
                 except ValueError:
@@ -236,6 +236,26 @@ def plugin_configured(name: str, extra: dict, lookup: Lookup, home: Path | None 
     if name == "dingtalk":
         return _pair(extra, lookup, ("client_id", "DINGTALK_CLIENT_ID"),
                      ("client_secret", "DINGTALK_CLIENT_SECRET"))
+    # Incoming vendor platforms: each predicate mirrors its adapter's own configured contract
+    # (register.py ``is_connected``/``config_connected_extra``) — extra key or its env name.
+    if name == "bluebubbles":
+        return _pair(extra, lookup, ("server_url", "BLUEBUBBLES_SERVER_URL"),
+                     ("password", "BLUEBUBBLES_PASSWORD"))
+    if name == "qqbot":
+        return _pair(extra, lookup, ("app_id", "QQ_APP_ID"), ("client_secret", "QQ_CLIENT_SECRET"))
+    if name == "signal":
+        return _pair(extra, lookup, ("http_url", "SIGNAL_HTTP_URL"), ("account", "SIGNAL_ACCOUNT"))
+    if name == "weixin":
+        # A token alone is not enough (adapter's config_connected): account id AND a token.
+        return bool(_pair(extra, lookup, ("account_id", "WEIXIN_ACCOUNT_ID"))
+                    and (token or extra.get("token") or lookup("WEIXIN_TOKEN")))
+    if name == "whatsapp_cloud":
+        return _pair(extra, lookup, ("phone_number_id", "WHATSAPP_CLOUD_PHONE_NUMBER_ID"),
+                     ("access_token", "WHATSAPP_CLOUD_ACCESS_TOKEN"))
+    if name == "yuanbao":
+        # YUANBAO_APP_KEY is the legacy alias the adapter still accepts for the app id.
+        return bool((extra.get("app_id") or lookup("YUANBAO_APP_ID") or lookup("YUANBAO_APP_KEY"))
+                    and (extra.get("app_secret") or lookup("YUANBAO_APP_SECRET")))
     if name == "ntfy":
         return bool(extra.get("topic") or lookup("NTFY_TOPIC"))
     if name == "simplex":

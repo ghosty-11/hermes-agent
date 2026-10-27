@@ -49,6 +49,8 @@ def stage_local_inputs(source_root: Path, installed_root: Path, staging: Path,
                        required_extras: list[str]) -> list[str]:
     """Prove the target graph with real offline builders before changing installed HEAD."""
     from hermes_cli.source_build import validate_offline_products
+    from hermes_cli.left_core_migration import validate_offline_home
+    from hermes_cli.memory_provider_migration import _pending_provider
     from pm.plugin_declarations import manifest_version_error, read_python_declaration
     from pm.install import _install
     from pm.environment import managed_environment
@@ -59,10 +61,14 @@ def stage_local_inputs(source_root: Path, installed_root: Path, staging: Path,
     from pm.store import Store, current_target
     from pm.build_operations import stage_tools, verified_tools
     from pm.workspace import enabled_plugin_dirs, lock_and_sync
+    from pm.plugins_state import dependency_homes
 
     source_root, installed_root = Path(source_root).resolve(), Path(installed_root).resolve()
     if source_root == installed_root:
         raise ValueError("local preflight requires a frozen source distinct from the installed tree")
+    for home in dependency_homes():
+        _pending_provider(home, say=print, offline=True)
+        validate_offline_home(home)
     extras, recorded = admitted_extras(source_root, installed_root, required_extras)
     tools = staging / "tools"
     original = writable_store_root(installed_root).resolve()
@@ -137,6 +143,6 @@ def stage_local_inputs(source_root: Path, installed_root: Path, staging: Path,
         lock_and_sync(members, extras, root=workspace, source=source_root,
                       seed_lock=Path(seed) if seed else None,
                       frozen=not members, environment=engine)
-        engine.check()
+        engine.check(workspace / "uv.lock")
         validate_offline_products(source_root, installed_root, env=environment)
     return extras

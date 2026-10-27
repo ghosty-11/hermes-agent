@@ -272,6 +272,32 @@ async def test_normal_streaming_turn_still_suppresses_exactly_once(
     assert len(full_sends) <= 1, f"duplicate final delivery: {full_sends!r}"
 
 
+@pytest.mark.asyncio
+async def test_recordless_flag_with_dead_transport_leaves_normal_send(
+    monkeypatch, tmp_path
+):
+    """#95382 incident shape: the reconciliation edit ALSO fails (dead
+    transport). The gateway must NOT claim already_sent — the normal final
+    send (and, on failure there, the delivery ledger) owns recovery."""
+
+    class _DeadEditRecordlessConsumer(_RecordlessFlagConsumer):
+        async def run(self):
+            await super().run()
+            # Transport dies after the stream drained: every further edit
+            # fails, like a dropped Discord WebSocket.
+            self.adapter.fail_edits = True
+
+    _adapter, result = await _run_turn(
+        monkeypatch,
+        tmp_path,
+        consumer_cls=_DeadEditRecordlessConsumer,
+        session_id="sess-95382-dead-transport",
+    )
+    assert result["final_response"] == FULL_RESPONSE
+    assert not result.get("already_sent"), (
+        "gateway claimed delivery although neither the stream nor the "
+        "reconciliation edit put the complete response on the wire"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +324,7 @@ class TestDiscordTransportClassification:
         assert not mod._is_discord_transport_error(
             RuntimeError("error code: 50013: Missing Permissions")
         )
-        assert not mod._is_discord_transport_error(asyncio.TimeoutError())
+        assert not mod._is_discord_transport_error(TimeoutError())
 
     @pytest.mark.asyncio
     async def test_send_without_client_reports_send_path_degraded(self):

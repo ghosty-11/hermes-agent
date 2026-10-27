@@ -6,7 +6,7 @@ import shutil
 from pm.writer_claim import writer_claim
 from hermes_cli import update_completion
 from hermes_cli.subcommands.update import build_update_parser
-from tests.hermes_cli.test_update_completion_process import transition  # noqa: F401
+from tests.hermes_cli.test_update_completion_process import transition
 
 
 def test_restart_deferral_crosses_real_completion_process(transition):

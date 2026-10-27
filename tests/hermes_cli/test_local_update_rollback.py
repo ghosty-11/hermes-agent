@@ -404,6 +404,164 @@ def test_preexisting_link_with_generated_name_is_restored_after_regular_update(
     assert git(install, "rev-parse", "HEAD") == before
 
 
+_UPDATE_ID = "0123456789abcdef0123456789abcdef"
+_FOREIGN_UPDATE_ID = "fedcba9876543210fedcba9876543210"
+
+
+def test_parked_receipt_and_recorded_latch_created_after_seal_are_removed(transaction):
+    """The updater's metric producers only write under ``telemetry/shared_metrics`` after
+    the capsule seals: the parked receipt (``pending_updates/<update_id>.json``) and the
+    recorded latch (``recorded_updates/<update_id>``). Both producer shapes restore away
+    with their freshly created directories, so a rolled-back run is never counted."""
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    shared = home / "telemetry" / "shared_metrics"
+    parked = shared / "pending_updates" / f"{_UPDATE_ID}.json"
+    parked.parent.mkdir(parents=True)
+    parked.write_bytes(json.dumps({"update_id": _UPDATE_ID}).encode())
+    recorded = shared / "recorded_updates"
+    recorded.mkdir()
+    (recorded / _UPDATE_ID).write_bytes(b"")
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert (home / "config.yaml").read_bytes() == b"old config\n"
+    assert not (home / "telemetry").exists()
+
+
+def test_captured_metric_receipts_restore_to_their_preimage_and_replants_are_removed(
+        transaction):
+    """Receipts and latches captured before the update are owned data: restore returns
+    their exact preimage bytes, mode and mtime, while producer-shaped records planted
+    after the seal are removed instead of refused."""
+    install, source, home, sibling, before, target = transaction
+    shared = home / "telemetry" / "shared_metrics"
+    receipt = shared / "pending_updates" / f"{_UPDATE_ID}.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_bytes(b'{"outcome": "success"}\n')
+    receipt.chmod(0o640)
+    receipt_mtime = receipt.stat().st_mtime_ns
+    latch = shared / "recorded_updates" / _UPDATE_ID
+    latch.parent.mkdir(parents=True)
+    latch.write_bytes(b"")
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    receipt.write_bytes(b'{"outcome": "refused"}\n')
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    receipt.write_bytes(b'{"outcome": "interrupted"}\n')
+    replant = shared / "pending_updates" / f"{_FOREIGN_UPDATE_ID}.json"
+    replant.write_bytes(b'{"outcome": "noop"}\n')
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert receipt.read_bytes() == b'{"outcome": "success"}\n'
+    assert receipt.stat().st_mode & 0o777 == 0o640
+    assert receipt.stat().st_mtime_ns == receipt_mtime
+    assert latch.read_bytes() == b""
+    assert not replant.exists()
+
+
+def test_wrongly_named_pending_file_refuses_rollback(transaction):
+    """Only ``<update_id>.json`` is the producer's shape; any other name parked in the
+    pending directory stays foreign postimage drift that refuses the restore."""
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    notes = home / "telemetry" / "shared_metrics" / "pending_updates" / "notes.json"
+    notes.parent.mkdir(parents=True)
+    notes.write_bytes(b'{"unknown": true}\n')
+    with pytest.raises(ValueError, match="postimage drift"):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert notes.read_bytes() == b'{"unknown": true}\n'
+
+
+def test_receipt_shape_outside_the_producer_directories_refuses_rollback(transaction):
+    """A producer-shaped name is only tolerated in its producer's directory: the same
+    name directly under ``shared_metrics`` stays drift, so shared-metrics records the
+    rollback never owned cannot be silently deleted."""
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    stray = home / "telemetry" / "shared_metrics" / f"{_UPDATE_ID}.json"
+    stray.parent.mkdir(parents=True)
+    stray.write_bytes(b"{}\n")
+    with pytest.raises(ValueError, match="postimage drift"):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert stray.is_file()
+
+
+def test_metric_receipt_name_as_link_refuses_rollback(transaction, tmp_path):
+    """Classification admits regular files only: a receipt name that is a link is
+    foreign drift, and the link's outside target is never touched."""
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    victim = tmp_path / "outside"
+    victim.write_bytes(b"outside\n")
+    link = home / "telemetry" / "shared_metrics" / "pending_updates" / f"{_UPDATE_ID}.json"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(victim)
+    with pytest.raises(ValueError, match="postimage drift"):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert link.is_symlink() and victim.read_bytes() == b"outside\n"
+
+
+def test_metric_receipt_name_as_directory_refuses_rollback(transaction):
+    """Classification admits regular files only: a directory occupying a receipt name is
+    foreign drift, and its contents survive the refusal."""
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    planted = home / "telemetry" / "shared_metrics" / "pending_updates" / f"{_UPDATE_ID}.json"
+    planted.parent.mkdir(parents=True)
+    planted.mkdir()
+    (planted / "inner").write_bytes(b"directory\n")
+    with pytest.raises(ValueError, match="postimage drift"):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert planted.is_dir()
+    assert (planted / "inner").read_bytes() == b"directory\n"
+
+
+def test_metrics_store_created_after_seal_refuses_rollback(transaction):
+    """The shared-metrics database is durable user data, not a per-run producer record:
+    rows an enabled profile records after the seal stay drift that refuses rollback
+    instead of a store restore would have to rebuild or destroy."""
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    store = home / "telemetry" / "shared_metrics" / "metrics.sqlite3"
+    store.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(store)) as connection, connection:
+        connection.execute("CREATE TABLE events (value TEXT)")
+    with pytest.raises(ValueError, match="postimage drift"):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert store.is_file()
+
+
 def test_bootstrap_tmp_link_refuses_but_rewritten_record_restores(transaction, tmp_path):
     install, source, home, sibling, before, target = transaction
     records = install_state_dir(install) / "bootstrap"
@@ -522,6 +680,8 @@ def test_protected_home_data_still_refuses_later_history(transaction, changed):
 @pytest.mark.parametrize("location", ["override", "xdg"])
 def test_capture_creates_host_obligation_owner_before_anchoring(
         transaction, tmp_path, monkeypatch, location):
+    from hermes_cli.update_host_obligation import host_obligation_path, write_host_obligation
+
     install, source, home, sibling, before, target = transaction
     account = tmp_path / "account"
     account.mkdir()
@@ -537,9 +697,19 @@ def test_capture_creates_host_obligation_owner_before_anchoring(
     manifest = capture_local_update_capsule(install, home, source, target)
     assert owner.is_dir()
     assert owner.stat().st_mode & 0o777 == 0o700
-    records = json.loads(manifest.read_text())["roots"]
-    assert any(row["kind"] == "selection" and row["path"] == str(owner)
-               and row["include"] == [str(owner / "host-update-restart.json")] for row in records)
+    obligation = host_obligation_path()
+    assert obligation.parent == owner
+    advance(install, source, target)
+    assert write_host_obligation(expected_sha=target)
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    foreign = owner / "unrelated-debt"
+    foreign.write_bytes(b"preserve\n")
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert not obligation.exists()
+    assert foreign.read_bytes() == b"preserve\n"
 
 
 def test_capture_refuses_symlink_in_host_obligation_owner(transaction, tmp_path, monkeypatch):
@@ -756,11 +926,13 @@ def test_generated_products_launchers_and_source_identity_restore(transaction):
         "node_modules/.hermes-node-deps": b"old dependency receipt\n",
         "ui-tui/dist/main.js": b"old terminal bundle\n",
         "hermes_cli/web_dist/index.html": b"old web bundle\n",
+        "apps/desktop/dist-webapp/index.html": b"old browser renderer\n",
     }
     for name, content in outputs.items():
         file = install / name
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_bytes(content)
+    (install / ".git/info/exclude").write_text("apps/desktop/dist-webapp/\n")
     receipt = install / ".hermes-bootstrap-complete"
     receipt.write_text(json.dumps({"schemaVersion": 1, "pinnedCommit": before,
                                    "pinnedBranch": git(install, "symbolic-ref", "--short", "HEAD")}))

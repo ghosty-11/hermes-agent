@@ -37,17 +37,69 @@ def complete_source_checkout(
     completion_message: str | None = None,
     announce: str | None = None,
     offline: bool = False,
+    followups: list[tuple[str, str]] | None = None,
+    before_build=None,
 ) -> bool:
     """Publish commands, build the products, then run post-build maintenance.
 
-    Returns the SQLite runtime verdict: a positive unsafe-runtime probe withholds
-    success here exactly as it does at the end of an update.
+    ``before_build`` (an update's paused-gateway restart) runs once the launchers are published:
+    dependencies are already synced, the long product builds have not started.
+
+    Every step runs even when an earlier one failed; each failure is printed as ``⚠``,
+    recorded on the open update receipt and appended to ``followups`` as ``(step, reason)``.
+    Returns True only when every step finished and the SQLite runtime is not unsafe.
     """
+    from hermes_cli.update_lock import UpdateLock, describe_holder
+
+    root = Path(root)
+    # This tail is the last mutating step of an install or update, and its product
+    # builds run for minutes. A gateway restarted while it runs (launchd KeepAlive,
+    # a service manager, a second `hermes` launch) reaches the same tail through
+    # venv_sync, and `hermes update` runs its own: two completions then build the
+    # same output directories concurrently and race on install-stamp.json (#123376).
+    # Claim the shared update lock so stacked completions serialize. A tail whose
+    # orchestrator already holds the lock (venv_sync's interrupted-update finish,
+    # the updater's completion child) runs under its parent's claim, exactly as
+    # `hermes update` does under the desktop handoff pid. The CHECKOUT lock is acquired, not
+    # sampled (R2): a completion from another home must not build a checkout an update owns;
+    # one inside the update's tree joins the lock it inherited.
+    lock = UpdateLock(install_root=root)
+    if not lock.acquire():
+        raise RuntimeError(
+            f"an update is still running ({describe_holder(lock.holder)}); "
+            "wait for it to exit, then relaunch Hermes"
+        )
+    try:
+        return _complete_locked(
+            root, desktop=desktop, assume_yes=assume_yes, gateway_mode=gateway_mode,
+            pre_update_snapshot_id=pre_update_snapshot_id,
+            pre_update_version=pre_update_version,
+            completion_message=completion_message, announce=announce, followups=followups,
+            before_build=before_build, offline=offline,
+        )
+    finally:
+        lock.release()
+
+
+def _complete_locked(
+    root: Path,
+    *,
+    desktop: bool,
+    assume_yes: bool,
+    gateway_mode: bool,
+    pre_update_snapshot_id: str | None,
+    pre_update_version: str | None,
+    completion_message: str | None,
+    announce: str | None,
+    followups: list[tuple[str, str]] | None = None,
+    before_build=None,
+    offline: bool = False,
+) -> bool:
+    """The completion body; callers hold the update lock already."""
     from hermes_cli.source_build import build_update_products
     from hermes_cli.update_cmd_maint import _run_post_update_maintenance
     from hermes_cli.venv_sync import publish_launchers
 
-    root = Path(root)
     try:
         from hermes_cli._subprocess_compat import expose_pm_git
 
@@ -58,20 +110,42 @@ def complete_source_checkout(
         if offline:
             raise RuntimeError(f"Offline completion requires pinned Git: {exc}") from exc
         print(f"⚠ Could not provide git for the source completion: {exc}", file=sys.stderr)
-    publish_launchers(root)
-    build_update_products(root, desktop=desktop, **({"offline": True} if offline else {}))
+    owed: list[tuple[str, str]] = []
+
+    def step(name: str, run) -> None:
+        # Each step is independent: a failed launcher publish or web build must not skip the
+        # config migration, the maintenance, or (in an update) the gateway restart after it.
+        try:
+            run()
+        except (Exception, SystemExit) as exc:  # health: allow BLE001 -- reported as an owed follow-up
+            if offline:
+                raise
+            from hermes_cli.update_receipt import record_followup
+
+            reason = str(exc) or type(exc).__name__
+            record_followup(name, reason)
+            owed.append((name, reason))
+
+    step("launchers", lambda: publish_launchers(root))
+    if before_build is not None:
+        before_build()  # never raises: a failed restart stays owed and is retried after the build
+    step("build", lambda: build_update_products(
+        root, desktop=desktop, **({"offline": True} if offline else {})))
     if announce:
         print(announce)
-    complete = _run_post_update_maintenance(
+    verdict: list[bool] = []
+    step("maintenance", lambda: verdict.append(_run_post_update_maintenance(
         assume_yes=assume_yes,
         gateway_mode=gateway_mode,
         pre_update_snapshot_id=pre_update_snapshot_id,
         had_desktop_app_before_update=desktop,
         pre_update_version=pre_update_version,
         completion_message=completion_message,
+        followups=owed,
         **({"offline": True} if offline else {}),
-    )
-    if complete:
+    )))
+    tail_done = not owed
+    if tail_done:
         from hermes_cli.source_stamp import write_source_stamp
 
         try:
@@ -83,7 +157,11 @@ def complete_source_checkout(
                 raise RuntimeError(f"Offline completion could not write the source stamp: {exc}") from exc
             print(f"⚠ Source update completed, but the install stamp could not be written: {exc}",
                   file=sys.stderr)
-    return complete
+    if followups is not None:
+        followups.extend(owed)
+    # The SQLite verdict is not tail work (re-running the tail cannot fix the interpreter); it
+    # is reported by the maintenance step itself and only withholds an install's success.
+    return tail_done and all(verdict)
 
 
 def _bootstrap_command(root: Path, argv: list[str]) -> list[str]:
@@ -124,10 +202,18 @@ def _main_owned(args, root: Path, prepared: bool) -> int:
 
         activate_dependencies(root)
         if args.finish_update:
-            ok = complete_source_checkout(
+            # A source update that never reached its own completion -- a
+            # pre-handoff release cannot flip during `hermes update`, so its
+            # update ends with the tree at HEAD and nothing built -- lands here
+            # on the next ordinary startup. Same tail as an install, so the two
+            # states cannot drift apart. Only owed TAIL work keeps it pending: an
+            # unsafe SQLite runtime is reported, but re-running the tail cannot fix it.
+            owed: list[tuple[str, str]] = []
+            complete_source_checkout(
                 root, desktop=args.desktop, assume_yes=True,
-                completion_message=None, announce="\n✓ Code updated!",
+                completion_message=None, announce="\n✓ Code updated!", followups=owed,
             )
+            ok = not owed
         else:
             ok = complete_source_checkout(
                 root, desktop=args.desktop, assume_yes=not args.interactive,
@@ -142,9 +228,16 @@ def _main_owned(args, root: Path, prepared: bool) -> int:
     passthrough = (["--desktop"] if args.desktop else []) + \
                   (["--finish-update"] if args.finish_update else [])
     command = _bootstrap_command(root, passthrough)
+    from hermes_cli.update_lock import checkout_lock_fds
+
+    # Called inside an update tree (venv_sync's interrupted-update finish), the prepared child
+    # keeps the checkout lock this bootstrap inherited, and the writer-claim descriptors the
+    # spawning update passed to this interpreter.
     environment = activation_environment(root)
     with child_spawn(environment) as spawn:
-        return subprocess.call(command, cwd=root, env=environment, **spawn)
+        fds = (*spawn.get("pass_fds", ()), *checkout_lock_fds(root))
+        return subprocess.call(command, cwd=root, env=environment,
+                               **({"pass_fds": tuple(dict.fromkeys(fds))} if fds else {}))
 
 
 if __name__ == "__main__":

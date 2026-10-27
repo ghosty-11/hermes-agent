@@ -1,6 +1,8 @@
 """Run native local update from the guard's frozen, verified commit snapshot.
 
-Usage: managed-python local_update_entry.py INSTALL_ROOT HERMES_HOME SOURCE_SNAPSHOT SHA [EXTRA...]
+Usage: managed-python local_update_entry.py INSTALL_ROOT HERMES_HOME SOURCE_SNAPSHOT SHA
+       [--rollback-local-update MANIFEST --acknowledge-data-rollback]
+       [--update-extension-context PATH] [EXTRA...]
 """
 from __future__ import annotations
 
@@ -20,6 +22,12 @@ def main() -> None:
         if len(extras) != 3 or extras[2] != "--acknowledge-data-rollback":
             raise SystemExit("recovery requires a manifest and explicit data-rollback acknowledgment")
         rollback, extras = extras[1], []
+    extension_context = None
+    if "--update-extension-context" in extras:
+        index = extras.index("--update-extension-context")
+        if len(extras) != index + 2:
+            raise SystemExit("--update-extension-context requires exactly one path argument")
+        extension_context, extras = extras[index + 1], extras[:index]
     if snapshot != Path(__file__).resolve().parents[1]:
         raise RuntimeError("entry is not running from the selected snapshot")
     # Set frozen imports and use the same protected Git policy as the apply path.
@@ -49,6 +57,7 @@ def main() -> None:
             native.cmd_update(argparse.Namespace(
                 source_repo=None if rollback else str(snapshot), target=None if rollback else target,
                 required_extra=extras, rollback_local_update=rollback,
+                update_extension_context=extension_context,
                 acknowledge_data_rollback=bool(rollback), yes=True, backup=not rollback,
                 no_gateway_restart=True, gateway=False, check=False, plan=False,
                 list_venv_holders=False, no_backup=False, keep_stash=False,

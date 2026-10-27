@@ -1940,10 +1940,11 @@ def test_runtime_credential_defaults_match_passive_seed(
 ):
     from agent.secret_scope import reset_secret_scope, set_secret_scope
     from gateway.config import GatewayConfig, Platform
-    from gateway.config_env import _Cred, _ENV_STEPS
     from gateway.platform_configuration import credential_seed
+    from gateway.platform_env import EnvCred, bundled_env_rows
 
-    step = next(s for s in _ENV_STEPS if isinstance(s, _Cred) and s.platform.value == platform)
+    rows = bundled_env_rows(platform)
+    step = next(s for s in (rows or ((), ()))[0] if isinstance(s, EnvCred))
     for name in (*required, optional):
         monkeypatch.delenv(name, raising=False)
     values = {name: "fixture-value" for name in required}

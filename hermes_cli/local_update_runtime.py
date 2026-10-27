@@ -14,7 +14,7 @@ from hermes_cli.local_update_coverage import dependency_coverage, retained_bookk
 PRODUCTS = (
     "node_modules", "ui-tui/node_modules", "web/node_modules",
     "ui-tui/dist", "ui-tui/packages/hermes-ink/dist",
-    "hermes_cli/web_dist", ".hermes/bin", "install-stamp.json",
+    "hermes_cli/web_dist", "apps/desktop/dist-webapp", ".hermes/bin", "install-stamp.json",
     ".hermes-bootstrap-complete",
 )
 

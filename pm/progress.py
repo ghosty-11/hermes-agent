@@ -90,6 +90,19 @@ class LiveTail:
     def flush(self) -> None:
         return None
 
+    def discard(self) -> None:
+        """Clear the status line without a success or failure verdict.
+
+        Used when a bytecode-compile failure will be retried. Closing as a
+        failure here would report a recovered install as failed.
+        """
+        if self._partial:
+            self._line(self._partial)
+            self._partial = ""
+        if self.live:
+            self._draw("")
+            self._emit("\r")
+
     def close(self, ok: bool) -> None:
         if self._partial:
             self._line(self._partial)
@@ -136,7 +149,13 @@ class LiveTail:
 def run_contained(command: Sequence[str], label: str, *, stream: Optional[IO[str]] = None,
                   hide: Optional[Callable[[str], bool]] = None, indent: str = "",
                   **kwargs) -> subprocess.CompletedProcess:
-    """``subprocess.run(check=True)`` under the output policy."""
+    """``subprocess.run(check=True)`` under the output policy.
+
+    POSIX: a checkout custody (:func:`hermes_cli.source_build.run_in_custody`)
+    and the writer claim each hand their own ``pass_fds`` — distinct
+    descriptors of one held update — so the two sets merge and deduplicate
+    into one spawn mapping instead of colliding as a duplicate keyword.
+    """
     if os.name != "posix":
         return _run_contained(command, label, stream=stream, hide=hide, indent=indent, **kwargs)
     from pm.writer_claim import child_spawn
@@ -144,6 +163,9 @@ def run_contained(command: Sequence[str], label: str, *, stream: Optional[IO[str
     environment = dict(kwargs.pop("env", os.environ))
     with child_spawn(environment) as spawn:
         runner = _run_contained_owned if spawn else _run_contained
+        claim_fds = spawn.pop("pass_fds", ())
+        if claim_fds:
+            kwargs["pass_fds"] = tuple(dict.fromkeys((*kwargs.get("pass_fds", ()), *claim_fds)))
         return runner(command, label, stream=stream, hide=hide, indent=indent,
                       env=environment, **kwargs, **spawn)
 

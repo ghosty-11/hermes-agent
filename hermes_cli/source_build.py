@@ -38,6 +38,12 @@ def _normalized_source_build_env(base_env: dict | None = None, *, offline: bool 
     python = str(project_python(root)) if running_from_selected_environment(root) else sys.executable
     env = {**os.environ, **(base_env or {}), "CI": "1", "HERMES_PYTHON": python,
            "PYTHON": python}
+    # Electron's installer unpacks its binary with a native module that imports
+    # VCRUNTIME140.dll, which a fresh Windows lacks. Our Python ships one, and
+    # scripts/build/electron-runtime.mjs copies it beside that module.
+    vc_runtime = Path(sys.base_prefix) / "vcruntime140.dll"
+    if vc_runtime.is_file():
+        env["HERMES_VC_RUNTIME"] = str(vc_runtime)
     env.pop("ESBUILD_BINARY_PATH", None)
     npmrc = get_hermes_home() / "npmrc"
     if npmrc.is_file():
@@ -49,33 +55,46 @@ def _normalized_source_build_env(base_env: dict | None = None, *, offline: bool 
 
 
 def source_build_env(base_env: dict | None = None, *, explicit: bool = False,
-                     offline: bool = False) -> dict[str, str]:
+                     verify: bool = True, offline: bool = False) -> dict[str, str]:
     from pm import ensure
 
     env = _normalized_source_build_env(base_env, offline=offline)
-    return ensure("npm", base_env=env, explicit=explicit,
+    return ensure("npm", base_env=env, explicit=explicit, verify=verify,
                   **({"offline": True} if offline else {})).env
 
 
-def run_source_script(project_root: Path, script: str, *args: str, env: dict, label: str) -> None:
+def run_in_custody(project_root: Path, command: list, label: str, **kwargs):
+    """``pm.progress.run_contained`` for a build command that writes the checkout (node, npm):
+    it and everything it starts stay in the update's custody (POSIX: the checkout lock fd, the
+    caller's process group, and every descendant killed when it exits; Windows: the owner's
+    kill-on-close job), so the checkout is never handed to a contender while one of them still
+    writes. Outside an update it is ``run_contained`` as is."""
     from pm.progress import run_contained
+    from hermes_cli.update_custody import contained_command
 
+    with contained_command(command, root=project_root) as (argv, custody):
+        return run_contained(argv, label, **kwargs, **custody)
+
+
+def run_source_script(project_root: Path, script: str, *args: str, env: dict, label: str) -> None:
+    command = [shutil.which("node", path=env["PATH"]), str(project_root / script), *args]
     # npm's deprecation warnings are the loudest lines and never actionable
     # here; they still land in the failure tail.
-    run_contained(
-        [shutil.which("node", path=env["PATH"]), str(project_root / script), *args],
-        label, hide=lambda line: line.lower().startswith("npm warn"), indent="  ",
-        cwd=project_root, env=env,
-    )
+    run_in_custody(project_root, command, label, hide=lambda line: line.lower().startswith("npm warn"),
+                   indent="  ", cwd=project_root, env=env)
+
+
+def _install_args(explicit: bool) -> tuple[str, ...]:
+    from pm import lazy_installs_allowed
+
+    return () if explicit or lazy_installs_allowed() else ("--no-install",)
 
 
 def prepare_source_dependencies(project_root: Path, workspaces: tuple[str, ...], *, env: dict,
                                 explicit: bool = False, offline: bool = False) -> None:
-    from pm import lazy_installs_allowed
-
     run_source_script(
         project_root, "scripts/build/node-deps.mjs", "--source", str(project_root), "--reuse",
-        *(() if not offline and (explicit or lazy_installs_allowed()) else ("--no-install",)),
+        *(("--no-install",) if offline else _install_args(explicit)),
         *(arg for workspace in workspaces for arg in ("--workspace", workspace)), env=env,
         label="Preparing Node dependencies",
     )
@@ -96,11 +115,22 @@ def build_source_tui(project_root: Path, *, env: dict) -> None:
 
 
 def build_source_web(project_root: Path, *, env: dict, icons: Path | None = None) -> None:
+    # Bounded build (#63338): the Vite/Rolldown dashboard build saturates small
+    # hosts; cap the V8 heap and the native bundler's rayon thread pool.
+    from hermes_cli.web_build_limits import apply_web_build_limits
+
+    apply_web_build_limits(env)
     # Default-brand icons are committed; installs never render them.
     icons = icons or project_root
     run_source_script(project_root, "scripts/build/web.mjs", "--source", str(project_root),
                       "--icons", str(icons), "--out", str(project_root / "hermes_cli/web_dist"), env=env,
                       label="Building the web UI")
+
+
+def build_source_webapp(project_root: Path, *, env: dict, explicit: bool = False) -> None:
+    """Browser renderer; its dependencies live in a private workspace, never the checkout's."""
+    run_source_script(project_root, "apps/desktop/scripts/build-webapp.mjs", *_install_args(explicit),
+                      env=env, label="Building the Webapp renderer")
 
 
 def source_frontends(project_root: Path) -> tuple[str, ...]:
@@ -110,6 +140,23 @@ def source_frontends(project_root: Path) -> tuple[str, ...]:
     return tuple(name for name in ("ui-tui", "web") if (project_root / name / "package.json").is_file())
 
 
+def _require_prepared_webapp(source_root: Path, installed_root: Path) -> bool:
+    """An enabled browser renderer must already match the target before offline mutation."""
+    from gateway.webapp_listener import webapp_settings
+    from hermes_cli.webapp import webapp_bundle_stale, webapp_dist_dir
+    from pm.plugins_state import dependency_homes
+
+    if not any(webapp_settings(home).enabled for home in dependency_homes()):
+        return False
+    output = webapp_dist_dir(installed_root)
+    if (not (output / "index.html").is_file() or webapp_bundle_stale(output)
+            or not source_product_current(source_root, "webapp", output)):
+        raise RuntimeError(
+            f"Offline update requires target-current prepared Webapp output at {output}; "
+            "the enabled renderer cannot be left stale")
+    return True
+
+
 def validate_offline_products(source_root: Path, installed_root: Path, *,
                               env: dict[str, str] | None = None) -> dict:
     """Read-only admission against the installed preparation, not the new checkout's outputs.
@@ -117,16 +164,17 @@ def validate_offline_products(source_root: Path, installed_root: Path, *,
     The caller stages selected tools privately when needed. This function never
     ensures tools or publishes a dependency/application selection.
     """
-    # Node admission covers the source TUI and web workspaces only.
 
     source_root, installed_root = Path(source_root).resolve(), Path(installed_root).resolve()
     frontends = source_frontends(source_root)
     workspaces = frontends
     if source_root == installed_root:
         raise ValueError("Offline admission needs distinct source and installed trees")
+    webapp = _require_prepared_webapp(source_root, installed_root)
     if not workspaces:
         return {"source_root": str(source_root), "installed_root": str(installed_root),
-                "workspaces": (), "products": (), "mutation_roots": []}
+                "workspaces": (), "products": ("webapp",) if webapp else (),
+                "mutation_roots": [str(installed_root / "apps/desktop/dist-webapp")] if webapp else []}
     if env is None:
         from pm import env_for, installed_package
         selected = installed_package("node")
@@ -143,11 +191,12 @@ def validate_offline_products(source_root: Path, installed_root: Path, *,
     child_env = _normalized_source_build_env(env, offline=True)
     result = {
         "source_root": str(source_root), "installed_root": str(installed_root),
-        "workspaces": workspaces, "products": tuple(frontends),
+        "workspaces": workspaces, "products": (*frontends, *(("webapp",) if webapp else ())),
         "mutation_roots": [str(installed_root / "node_modules"),
                            *(str(installed_root / item) for item in (
                                ("ui-tui/dist",) if "ui-tui" in frontends else ()) + (
-                               ("hermes_cli/web_dist",) if "web" in frontends else ()))],
+                               ("hermes_cli/web_dist",) if "web" in frontends else ()))] +
+                          ([str(installed_root / "apps/desktop/dist-webapp")] if webapp else []),
     }
     if workspaces:
         prepared = subprocess.run(
@@ -161,34 +210,167 @@ def validate_offline_products(source_root: Path, installed_root: Path, *,
     return result
 
 
+class ProductBuildError(RuntimeError):
+    """One or more products failed; every independent product was still attempted."""
+
+    def __init__(self, failures: list[tuple[str, BaseException]]):
+        self.failures = failures
+        super().__init__("; ".join(f"{name}: {_failure_text(exc)}" for name, exc in failures))
+
+
+def _failure_text(exc: BaseException) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        return f"{' '.join(map(str, exc.cmd)) if isinstance(exc.cmd, (list, tuple)) else exc.cmd} exited {exc.returncode}"
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+def _headless_linux() -> bool:
+    return sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def build_update_products(project_root: Path, *, desktop: bool, offline: bool = False) -> None:
-    """Prepare the selected union once; a failed product aborts the update."""
+    """Prepare the selected union once, attempting every independent product.
+
+    A failed product never skips the next one (a broken web build must not leave the TUI or the
+    desktop app stale); the failures are raised together at the end as ``ProductBuildError``.
+    Offline, every step runs against the prepared installation (``offline=True`` threads
+    through each tool acquisition) and a failed migration raises instead of deferring.
+    """
     # Both current updates and historical takeover reach this in a fresh target
     # interpreter, never in the updater's pre-sync import graph.
     from hermes_cli.main_install_repair import _install_configured_features_missing_deps
     from hermes_cli.update_stage import publish_stage
 
-    _install_configured_features_missing_deps(project_root, **({"offline": True} if offline else {}))
-    frontends = source_frontends(project_root)
-    if not frontends:
-        if offline:
-            from hermes_cli.memory_provider_migration import migrate_all_homes
-            migrate_all_homes(offline=True)
-        return
-    env = source_build_env(explicit=True, **({"offline": True} if offline else {}))
-    workspaces = frontends + (("apps/desktop",) if desktop else ())
-    publish_stage("Updating Node dependencies")
-    prepare_source_dependencies(project_root, workspaces, env=env, explicit=True,
-                                **({"offline": True} if offline else {}))
-    if "ui-tui" in frontends:
-        publish_stage("Building the TUI")
-        build_source_tui(project_root, env=env)
-    if "web" in frontends:
-        publish_stage("Building the web UI")
-        build_source_web(project_root, env=env)
-    if desktop:
-        from hermes_cli.main_desktop import _refresh_installed_desktop_apps, build_prepared_desktop
+    failures: list[tuple[str, BaseException]] = []
 
+    def attempt(name: str, step) -> bool:
+        try:
+            step()
+            return True
+        except Exception as exc:  # health: allow BLE001 -- collected and raised after the independent steps
+            print(f"  ⚠ {name} failed: {_failure_text(exc)}")
+            failures.append((name, exc))
+            return False
+
+    offline_deps = {"offline": True} if offline else {}
+    attempt("feature dependencies",
+            lambda: _install_configured_features_missing_deps(project_root, **offline_deps))
+    frontends = source_frontends(project_root)
+    if frontends:
+        desktop_built = False
+        env: dict = {}
+        workspaces = frontends + (("apps/desktop",) if desktop else ())
+        publish_stage("Updating Node dependencies")
+
+        def node_dependencies(selected: tuple[str, ...]) -> None:
+            # Acquiring npm is part of this step: its failure must be reported like the install's.
+            # A recorded install is trusted as at startup (re-hashing node+npm costs ~2 s per
+            # tail); a missing one is still installed explicitly.
+            env.update(source_build_env(explicit=True, verify=False, **offline_deps))
+            prepare_source_dependencies(project_root, selected, env=env, explicit=True, **offline_deps)
+
+        # Every product compiles from these node_modules: without them there is nothing to build.
+        prepared = attempt("Node dependencies", lambda: node_dependencies(workspaces))
+        desktop_skipped = False
+        if not prepared and desktop and env:
+            # Only apps/desktop brings native addons (node-pty, electron) into the union: a host
+            # whose compiler cannot build them must still get the TUI and web UI it runs.
+            print("  → Retrying Node dependencies without the desktop app")
+            failed = failures.pop()
+            prepared = desktop_skipped = attempt("Node dependencies", lambda: node_dependencies(frontends))
+            if desktop_skipped:
+                failures.append(("desktop dependencies", failed[1]))
+        desktop_reason = failures[-1][0] if failures else ""
+        if desktop and (desktop_skipped or _headless_linux()):
+            print("  ⓘ If this host never runs the desktop app, `hermes uninstall --gui` removes it "
+                  "and future updates stop building it.")
+        if prepared:
+            # An update that changed no TUI/web input reuses the receipted output, as the
+            # launch path already does; recompiling it produces the same bytes. Desktop
+            # additionally needs the packaged app to name HEAD (its baked stamp carries the
+            # commit), so it is reused only when HEAD did not move: "Already up to date",
+            # a retried tail, a takeover re-entry.
+            if "ui-tui" in frontends:
+                if source_product_current(project_root, "tui", project_root / "ui-tui/dist"):
+                    print("  ✓ TUI is up to date")
+                else:
+                    publish_stage("Building the TUI")
+                    attempt("TUI build", lambda: build_source_tui(project_root, env=env))
+            if "web" in frontends:
+                if source_product_current(project_root, "web", project_root / "hermes_cli/web_dist"):
+                    print("  ✓ Web UI is up to date")
+                else:
+                    publish_stage("Building the web UI")
+                    attempt("web UI build", lambda: build_source_web(project_root, env=env))
+            if desktop and not desktop_skipped:
+                desktop_built = attempt("desktop app build", lambda: _build_desktop_product(project_root, env, publish_stage))
+                desktop_reason = failures[-1][0] if not desktop_built else ""
+        if desktop and not desktop_built:
+            # One whole line the Desktop hand-off scripts match: the follow-up text is truncated
+            # and names whichever products failed first, so it cannot say if THIS app was rebuilt.
+            print(f"  Desktop app build owed: {desktop_reason} failed")
+    if offline:
+        _require_prepared_webapp(project_root, project_root)
+    elif (project_root / "apps/desktop/scripts/build-webapp.mjs").is_file():
+        # Its dependencies live in a private workspace, independent of the union above.
+        attempt("Webapp build", lambda: _rebuild_served_webapp(project_root, publish_stage))
+    # A configured memory provider that no longer ships in core is installed from the
+    # catalog for every profile home sharing this venv (config, data and tool names
+    # unchanged). The update must finish even if the migration blows up.
+    try:
+        from hermes_cli.memory_provider_migration import migrate_all_homes
+
+        migrate_all_homes(**offline_deps)
+    except Exception as exc:  # health: allow BLE001 -- post-commit boundary: printed as ⚠, never fails the committed update; every later update/tail re-runs it
+        if offline:
+            raise  # an offline completion must not silently skip a migration it cannot run
+        print(f"  ⚠ Memory provider migration skipped: {exc}")
+    # Same for a gateway platform / toolset that left core (Home Assistant): every home that used
+    # it gets its catalog plugin (hermes_cli/left_core_migration.py).
+    try:
+        from hermes_cli.left_core_migration import migrate_all_homes as migrate_left_core
+
+        migrate_left_core(**offline_deps)
+    except Exception as exc:  # health: allow BLE001 -- post-commit boundary: printed as ⚠, never fails the committed update; every later update/tail re-runs it
+        if offline:
+            raise
+        print(f"  ⚠ Plugin migration skipped: {exc}")
+    if failures:
+        raise ProductBuildError(failures)
+
+
+def _rebuild_served_webapp(project_root: Path, publish_stage) -> None:
+    """The Webapp bundle (``apps/desktop/dist-webapp``), when a home sharing this install serves it
+    (``webapp.enabled``): its gateway serves the bundle as built, so one older than the updated
+    backend would talk to it with an outdated contract. Built with the function ``hermes webapp``
+    uses, which reuses a current bundle. A failed build leaves the previous bundle on disk, marked
+    out of date: its gateways report the Webapp unavailable until ``hermes webapp`` rebuilds it."""
+    from gateway.webapp_listener import webapp_settings
+    from hermes_cli.webapp import mark_webapp_stale, prepare_webapp_renderer
+    from pm.plugins_state import dependency_homes
+
+    if not any(webapp_settings(home).enabled for home in dependency_homes()):
+        return
+    publish_stage("Building the Webapp")
+    try:
+        prepare_webapp_renderer(project_root, explicit=True)
+    except BaseException:
+        try:
+            if mark_webapp_stale(project_root):
+                print("  ⓘ The Webapp stays unavailable until `hermes webapp` rebuilds it.")
+        except OSError as exc:
+            print(f"  ⚠ Could not mark the Webapp out of date: {exc}")
+        raise
+
+
+def _build_desktop_product(project_root: Path, env: dict, publish_stage) -> None:
+    from hermes_cli.main_desktop import (
+        _packaged_desktop_current_for_head, _refresh_installed_desktop_apps, build_prepared_desktop)
+
+    desktop_dir = project_root / "apps/desktop"
+    if _packaged_desktop_current_for_head(desktop_dir, project_root):
+        print("  ✓ Desktop app is up to date")
+    else:
         publish_stage("Building the desktop app")
         # The desktop build mutates checkout-scoped node_modules and
         # apps/desktop/release; serialize it against a concurrent manual
@@ -201,24 +383,14 @@ def build_update_products(project_root: Path, *, desktop: bool, offline: bool = 
         build_lock.acquire(wait=True)
         try:
             build_prepared_desktop(
-                project_root / "apps/desktop", source_mode=False,
+                desktop_dir, source_mode=False,
                 npm=shutil.which("npm", path=env["PATH"]), env=env, icons=project_root,
             )
         finally:
             build_lock.release()
-        # A current release/ can still sit beside a stale installed copy (an earlier
-        # update rebuilt but never installed); healing must not wait for the next build.
-        _refresh_installed_desktop_apps(project_root / "apps/desktop")
-    # A configured memory provider must remain available after the core cutover.
-    from hermes_cli.memory_provider_migration import migrate_all_homes
-
-    if offline:
-        migrate_all_homes(offline=True)
-    else:
-        try:
-            migrate_all_homes()
-        except Exception as exc:
-            print(f"  ⚠ Memory provider migration skipped: {exc}")
+    # A current release/ can still sit beside a stale installed copy (an earlier
+    # update rebuilt but never installed); healing must not wait for the next build.
+    _refresh_installed_desktop_apps(desktop_dir)
 
 
 if __name__ == "__main__":

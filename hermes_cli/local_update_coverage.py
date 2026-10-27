@@ -16,6 +16,13 @@ _SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 
 _GOOD_COPY = re.compile(r"config\.yaml\.good\.[0-9]{8}-[0-9]{6}\Z")
 
+# The updater's post-seal metric producers (update_receipt._park_metric_receipt parks
+# <update_id>.json under pending_updates; observability.shared_metrics_update's
+# _claim_update_id claims a bare <update_id> latch under recorded_updates); the id is
+# uuid4().hex.
+_METRIC_RECEIPT = re.compile(r"[0-9a-f]{32}\.json\Z")
+_METRIC_LATCH = re.compile(r"[0-9a-f]{32}\Z")
+
 
 def regenerated_member(path: Path, *, kind: str, root: Path,
                        homes: tuple[Path, ...] | set[Path], entry_kind: str) -> bool:
@@ -23,8 +30,14 @@ def regenerated_member(path: Path, *, kind: str, root: Path,
     if entry_kind != "file":
         return False
     if kind == "home":
-        return any(path.parent == home / "backups" / "config"
-                   and _GOOD_COPY.fullmatch(path.name) for home in homes)
+        return any(
+            (path.parent == home / "backups" / "config"
+             and _GOOD_COPY.fullmatch(path.name))
+            or (path.parent == home / "telemetry" / "shared_metrics" / "pending_updates"
+                and _METRIC_RECEIPT.fullmatch(path.name))
+            or (path.parent == home / "telemetry" / "shared_metrics" / "recorded_updates"
+                and _METRIC_LATCH.fullmatch(path.name))
+            for home in homes)
     if kind == "state" and path.parent == root / "bootstrap" and path.suffix == ".json":
         from hermes_constants import PROFILE_ID_RE
 

@@ -10,7 +10,7 @@ from hermes_cli.platforms import PLATFORMS as _PLATFORMS
 PLATFORMS = {k: info.label for k, info in _PLATFORMS.items() if k != "api_server"}
 
 
-def _normalize_skill_names(values) -> Set[str]:
+def _normalize_skill_names(values) -> set[str]:
     """Config value -> set of skill names (mirrors ``agent.skill_utils._normalize_string_set``):
     ``None`` (YAML null) is empty and a bare scalar is a single-item list, NOT its characters.
 
@@ -60,16 +60,16 @@ def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[st
     save_config(config)
 
 
-def _list_all_skills() -> List[dict]:
+def _list_all_skills() -> list[dict]:
     """Return all installed skills (ignoring disabled state)."""
     try:
-        from tools.skills_tool import _find_all_skills
-        return _find_all_skills(skip_disabled=True)
+        from tools.skills_tool import find_all_skills
+        return find_all_skills(skip_disabled=True)
     except Exception:
         return []
 
 
-def _get_categories(skills: List[dict]) -> List[str]:
+def _get_categories(skills: list[dict]) -> list[str]:
     """Return sorted unique category names (None -> 'uncategorized')."""
     return sorted({s["category"] or "uncategorized" for s in skills})
 
@@ -95,7 +95,7 @@ def _select_platform() -> Optional[str]:
     return None
 
 
-def _toggle_by_category(skills: List[dict], disabled: Set[str]) -> Set[str]:
+def _toggle_by_category(skills: list[dict], disabled: set[str]) -> set[str]:
     """Toggle all skills in a category at once."""
     from hermes_cli.curses_ui import curses_checklist
     categories = _get_categories(skills)

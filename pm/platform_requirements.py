@@ -185,12 +185,12 @@ def configured_platform_requirements(config: dict, lookup: Callable[[str], str |
         Platform, PlatformConfig, SHARED_LISTENER_MIRROR_PLATFORMS,
         _BUILTIN_PLATFORM_VALUES, _bool_token, normalize_platform_name,
     )
-    from gateway.config_env import _Cred, _ENV_STEPS
     from gateway.config_loader import merge_platform_sections, bridge_platform_shared_keys
     from gateway.platform_configuration import (
         credential_groups_present, credential_seed, plugin_configured, plugin_probe_and_commit,
         relay_configuration,
     )
+    from gateway.platform_env import EnvCred, bundled_env_rows
     from utils import is_truthy_value
 
     catalog, known, aliases, declared_ids = _platform_inventory(
@@ -227,7 +227,16 @@ def configured_platform_requirements(config: dict, lookup: Callable[[str], str |
         blocks[canonical] = PlatformConfig.from_dict(
             {key: value for key, value in raw.items() if key != "home_channel"}
             if "home_channel" in raw else raw)
-    steps = {step.platform.value: step for step in _ENV_STEPS if isinstance(step, _Cred)}
+    # One catalog: each bundled platform's credential row comes from its ``gateway_env``
+    # declaration (``gateway.platform_env.EnvCred``), the same rows the runtime env pass runs —
+    # there is no second in-core step list.
+    steps: dict[str, EnvCred] = {}
+    for platform_name in catalog:
+        rows = bundled_env_rows(platform_name)
+        if rows and rows[0]:
+            step = next((row for row in rows[0] if isinstance(row, EnvCred)), None)
+            if step is not None:
+                steps[platform_name] = step
     relay_block = blocks.get("relay")
     relay_explicitly_off = bool(relay_block and not relay_block.enabled
                                 and relay_block.extra.get("_enabled_explicit"))

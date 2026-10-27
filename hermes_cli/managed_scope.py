@@ -32,8 +32,8 @@ _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
 # path_key -> (*file_signature, parsed)
-_CONFIG_CACHE: Dict[str, tuple] = {}
-_ENV_CACHE: Dict[str, tuple] = {}
+_CONFIG_CACHE: dict[str, tuple] = {}
+_ENV_CACHE: dict[str, tuple] = {}
 
 
 def _under_pytest() -> bool:

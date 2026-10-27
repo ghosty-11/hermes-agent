@@ -81,9 +81,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help=(
             "Persist the update channel for THIS install (recorded per "
             "install in config.yaml under update.installs). Names are resolved "
-            "from the release archive, not a built-in list. Source installs "
-            "check out the published build's exact commit; main follows the "
-            "source branch. Package channels are baked into their identities."
+            "from the release archive, not a built-in list. Official source "
+            "checkouts default to 'stable' (the latest published vX.Y.Z "
+            "release, exact commit); 'main' follows the source branch. "
+            "Package channels are baked into their identities."
         ),
     )
     update_parser.add_argument(
@@ -117,6 +118,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
                                help="Full lowercase 40-hex descendant commit for --source-repo")
     update_parser.add_argument("--required-extra", action="append", default=[], metavar="EXTRA",
                                help="Required frozen-lock extra for a local source transaction (repeatable)")
+    update_parser.add_argument("--update-extension-context", type=str, metavar="PATH",
+                               help="Internal root-reviewed update-extension context from the guarded updater")
     update_parser.add_argument("--rollback-local-update", type=str, metavar="MANIFEST",
                                help="Restore a sealed local-update capsule without discarding later history")
     update_parser.add_argument("--acknowledge-data-rollback", action="store_true",

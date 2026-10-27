@@ -65,7 +65,7 @@ assert importlib.util.find_spec('yaml') is None
 print(json.dumps(YAML(typ='safe').load('isolated: true')))
 """
     checked = subprocess.run([str(base), "-I", "-S", "-B", "-c", probe, str(site)],
-                             cwd=tmp_path, capture_output=True, text=True, timeout=30)
+                             cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False)
     assert checked.returncode == 0, checked.stderr
     assert json.loads(checked.stdout) == {"isolated": True}
     from pm import runtime as runtime_api, paths
@@ -76,7 +76,8 @@ print(json.dumps(YAML(typ='safe').load('isolated: true')))
         environment = runtime_api.runtime_environment()
         with child_spawn(environment) as spawn:
             checked = subprocess.run(command, cwd=tmp_path, env=environment,
-                                     capture_output=True, text=True, timeout=30, **spawn)
+                                     capture_output=True, text=True, timeout=30,
+                                     check=False, **spawn)
     assert checked.returncode == 0, checked.stderr
     assert "no pm sync receipt" in checked.stdout
     assert str(root) not in (runtime / "pyvenv.cfg").read_text()
