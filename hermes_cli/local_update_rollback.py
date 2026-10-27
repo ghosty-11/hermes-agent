@@ -234,11 +234,41 @@ def _walk(root: Path, homes: set[Path], install: Path, *, include: tuple[Path, .
     yield from visit(root)
 
 
+def _admit_hardlink_groups(linked: dict[tuple[int, int], list[tuple[Path, Path, dict, os.stat_result]]]) -> None:
+    """Admit linked mutable files only as one complete group inside this image."""
+    for observed in linked.values():
+        sample = observed[0][3]
+        if len(observed) != sample.st_nlink or any(entry[3].st_nlink != sample.st_nlink
+                                                  for entry in observed):
+            raise ValueError(f"incomplete hardlink group cannot be rolled back: {observed[0][1]}")
+        canonical = min(entry[0].as_posix() for entry in observed)
+        identity = {tuple(record.get(key) for key in (
+            "mode", "uid", "gid", "mtime_ns", "xattrs_sha256", "xattrs_size", "sha256", "size"))
+            for _, _, record, _ in observed}
+        if len(identity) != 1:
+            raise ValueError(f"hardlink group members disagree: {observed[0][1]}")
+        for _, path, record, before in observed:
+            record["hardlink_group"] = canonical
+            try:
+                current = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(f"hardlink group changed during capture: {path}") from exc
+            if (current.st_dev, current.st_ino, current.st_nlink, current.st_size,
+                    current.st_mtime_ns, current.st_ctime_ns) != (
+                    before.st_dev, before.st_ino, before.st_nlink, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns):
+                raise ValueError(f"hardlink group changed during capture: {path}")
+            if _metadata(path)["xattrs_sha256"] != record["xattrs_sha256"]:
+                raise ValueError(f"hardlink group changed during capture: {path}")
+
+
 def _image(root: Path, homes: set[Path], install: Path, objects: Path | None = None,
            *, include: tuple[Path, ...] | None = None, excluded: tuple[Path, ...] = (),
            retained_dirs: frozenset[Path] | None = None,
-           immutable: bool = False) -> list[dict]:
+           immutable: bool = False, owner_kind: str = "other") -> list[dict]:
     entries = []
+    linked: dict[tuple[int, int], list[tuple[Path, Path, dict, os.stat_result]]] = {}
+    regeneration_root = include[0] if owner_kind == "state" else root
     if objects is not None:
         objects.mkdir(mode=0o700)
     for rel, path, mode in _walk(root, homes, install, include=include, excluded=excluded,
@@ -255,8 +285,14 @@ def _image(root: Path, homes: set[Path], install: Path, objects: Path | None = N
             record["kind"] = "db" if sqlite_file(path) else "file"
             record.update(_metadata(path, objects / f"x-{len(entries)}" if objects is not None else None))
             before = path.stat(follow_symlinks=False)
-            if before.st_nlink != 1 and (not immutable or record["kind"] == "db"):
-                raise ValueError(f"multiply linked mutable file cannot be rolled back: {path}")
+            if before.st_nlink != 1:
+                if record["kind"] == "db":
+                    raise ValueError(f"multiply linked mutable file cannot be rolled back: {path}")
+                if not immutable:
+                    if regenerated_member(path, kind=owner_kind, root=regeneration_root,
+                                          homes=homes, entry_kind=record["kind"]):
+                        raise ValueError(f"hardlink group contains independently regenerated data: {path}")
+                    linked.setdefault((before.st_dev, before.st_ino), []).append((rel, path, record, before))
             if objects is not None:
                 image = objects / str(len(entries))
                 if record["kind"] == "db":
@@ -307,6 +343,7 @@ def _image(root: Path, homes: set[Path], install: Path, objects: Path | None = N
             if _metadata(path)["xattrs_sha256"] != record["xattrs_sha256"]:
                 raise ValueError(f"mutable metadata changed during capture: {path}")
         entries.append(record)
+    _admit_hardlink_groups(linked)
     return entries
 
 
@@ -443,6 +480,14 @@ def _write_manifest(authority: _CapsuleAuthority, data: dict) -> None:
                 os.unlink(name, dir_fd=authority.storage_fd)
         raise
 
+def _has_group_markers(data: dict) -> bool:
+    for record in data["roots"]:
+        for phase in ("pre", "post"):
+            if phase in record and any("hardlink_group" in item for item in record[phase]):
+                return True
+    return any("hardlink_group" in item for selection in data.get("new_selections") or ()
+               for item in selection["post"])
+
 
 def _read_manifest(authority: _CapsuleAuthority) -> dict:
     authority._check()
@@ -456,12 +501,14 @@ def _read_manifest(authority: _CapsuleAuthority) -> dict:
             raise ValueError("invalid rollback manifest")
         with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
             data = json.load(stream)
-        if data["version"] != 4 or data["state"] not in {"captured", "sealed", "restored"}:
+        if data["version"] not in (4, 5) or data["state"] not in {"captured", "sealed", "restored"}:
             raise ValueError("unknown rollback capsule format or state")
         if Path(data["capsule"]) != authority.path.parent:
             raise ValueError("rollback manifest path mismatch")
         if not isinstance(data["roots"], list) or not isinstance(data["homes"], list):
             raise ValueError("invalid rollback roots")
+        if data["version"] == 4 and _has_group_markers(data):
+            raise ValueError("hardlink groups require rollback capsule version 5")
         authority._check()
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("malformed rollback capsule") from exc
@@ -526,11 +573,16 @@ def _check_members(data: dict) -> None:
     coverage = _coverage(data)
     coverage.validate_overlaps()
     for record, owner in zip(data["roots"], coverage.owners):
+        regeneration_root = owner.include[0] if owner.kind == "state" else owner.root
         for phase in ("pre", "post"):
             if phase in record:
                 _validate_members(record[phase])
                 for item in record[phase]:
                     coverage.member(owner, owner.root / item["path"], item["kind"], phase)
+                    if "hardlink_group" in item and regenerated_member(
+                            owner.root / item["path"], kind=owner.kind, root=regeneration_root,
+                            homes=owner.homes, entry_kind=item["kind"]):
+                        raise ValueError("hardlink group contains independently regenerated data")
     for item, owner in zip(data.get("new_selections", ()),
                            coverage.owners[len(data["roots"]):]):
         _validate_members(item["post"])
@@ -702,6 +754,26 @@ def _validate_members(entries: list[dict]) -> None:
             ancestor = parent.as_posix()
             if ancestor in members and members[ancestor] != "dir":
                 raise ValueError("rollback archive member crosses a recorded non-directory")
+    paths = {item["path"]: item for item in entries}
+    groups: dict[str, list[dict]] = {}
+    for item in entries:
+        if "hardlink_group" not in item:
+            continue
+        marker = item["hardlink_group"]
+        rel = Path(marker) if isinstance(marker, str) else None
+        if (item["kind"] != "file" or rel is None or not rel.parts or rel.is_absolute()
+                or rel.as_posix() != marker or any(part in {".", ".."} for part in rel.parts)):
+            raise ValueError("invalid rollback hardlink group marker")
+        groups.setdefault(marker, []).append(item)
+    for marker, items in groups.items():
+        canonical = paths.get(marker)
+        if (canonical is None or canonical["kind"] != "file" or len(items) < 2
+                or not any(item["path"] == marker for item in items)):
+            raise ValueError("invalid rollback hardlink group marker")
+        if len({tuple(item.get(key) for key in (
+                "mode", "uid", "gid", "mtime_ns", "xattrs_sha256", "xattrs_size",
+                "sha256", "size")) for item in items}) != 1:
+            raise ValueError("inconsistent rollback hardlink group members")
 
 
 def _artifact_specs(data: dict):
@@ -860,7 +932,7 @@ def _publish_artifacts(authority: _CapsuleAuthority, data: dict, private: Path) 
 
 def _same(actual: list[dict], expected: list[dict]) -> bool:
     keys = ("path", "kind", "mode", "uid", "gid", "xattrs_sha256", "xattrs_size",
-            "target", "sha256", "size")
+            "target", "sha256", "size", "hardlink_group")
     for current, saved in zip(actual, expected):
         if any(current.get(key) != saved.get(key) for key in keys):
             return False
@@ -920,7 +992,8 @@ def _record_path(path: Path, kind: str, roots: list[dict], capsule: Path, homes:
     if kind in {"home", "state"}:
         options["excluded"] = excluded
     pre = ([] if kind == "metadata" else
-           _image(root, set(homes), install, objects, immutable=kind == "resource", **options))
+           _image(root, set(homes), install, objects, immutable=kind == "resource",
+                  owner_kind=kind, **options))
     meta = _metadata(root, objects / "x-root")
     meta.update(kind="dir", mode=stat.S_IMODE(root.stat().st_mode))
     roots.append({"id": index, "kind": kind, "path": str(root), "pre_metadata": meta,
@@ -929,12 +1002,39 @@ def _record_path(path: Path, kind: str, roots: list[dict], capsule: Path, homes:
                   **({"excluded": [str(p) for p in excluded]} if excluded else {})})
 
 
+def _preflight_hardlink_group(canonical: Path, parent: Path) -> None:
+    """Prove a fresh inode can link from the canonical parent into the alias parent."""
+    with ExitStack() as stack:
+        for directory in sorted({canonical.parent, parent}):
+            saved = directory.stat()
+            if saved.st_uid == os.geteuid():
+                stack.callback(os.utime, directory, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+        source_dir = stack.enter_context(
+            tempfile.TemporaryDirectory(prefix=".rollback-link-", dir=canonical.parent))
+        target_dir = stack.enter_context(
+            tempfile.TemporaryDirectory(prefix=".rollback-link-", dir=parent))
+        source, linked = Path(source_dir) / "entry", Path(target_dir) / "entry"
+        try:
+            with source.open("xb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+            os.link(source, linked, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(f"cannot restore hardlink group of {canonical}: {exc}") from exc
+
+
 def _preflight_record(record: dict, capsule: Path) -> None:
     root = Path(record["path"])
     artifacts = capsule / record["id"]
     _preflight_metadata(root, record["pre_metadata"], artifacts / "x-root")
     for item in record["pre"]:
         _preflight_metadata(root / item["path"], item, artifacts / item["xattrs_object"])
+    groups: dict[str, list[str]] = {}
+    for item in record["pre"]:
+        if item["kind"] == "file" and item.get("hardlink_group") is not None:
+            groups.setdefault(item["hardlink_group"], []).append(item["path"])
+    for marker, names in sorted(groups.items()):
+        for parent in sorted({(root / name).parent for name in names}):
+            _preflight_hardlink_group(root / marker, parent)
 
 
 def _matches(record: dict, homes: list[Path], install: Path, field: str,
@@ -942,6 +1042,7 @@ def _matches(record: dict, homes: list[Path], install: Path, field: str,
     root = Path(record["path"])
     actual = ([] if record["kind"] == "metadata" else
               _image(root, set(homes), install, immutable=record["kind"] == "resource",
+                     owner_kind=record["kind"],
                      retained_dirs=frozenset(root / item["path"] for item in record["pre"]
                                              if item["kind"] == "dir"),
                      **_filters(record)))
@@ -1045,7 +1146,7 @@ def capture_local_update_capsule(install_root, hermes_home, source_repo, target)
                 for target_path in external
             ]
             bundle = private / "code.bundle"
-            data = {"version": 4, "state": "captured", "capsule": str(manifest.parent),
+            data = {"version": 5, "state": "captured", "capsule": str(manifest.parent),
                     "install": str(install), "source": str(source), "before": before, "target": target_sha,
                     "branch": ("refs/heads/" + name if (name := _git(install, "branch", "--show-current")) else None),
                     "invoking": str(Path(hermes_home).resolve(strict=True)),
@@ -1113,7 +1214,7 @@ def _seal_verified(authority: _CapsuleAuthority, data: dict, install_root, herme
         root = Path(record["path"])
         record["post_metadata"] = {"mode": stat.S_IMODE(root.stat().st_mode), **_metadata(root)}
         record["post"] = ([] if record["kind"] == "metadata" else
-                          _image(root, set(homes), install,
+                          _image(root, set(homes), install, owner_kind=record["kind"],
                                  retained_dirs=frozenset(root / item["path"] for item in record["pre"]
                                                          if item["kind"] == "dir"),
                                  **_filters(record)))
@@ -1125,12 +1226,14 @@ def _seal_verified(authority: _CapsuleAuthority, data: dict, install_root, herme
         _restorable_identity(root, record["post_metadata"])
         for item in record["post"]:
             _restorable_identity(root / item["path"], item)
+    if data["version"] == 4 and _has_group_markers(data):
+        raise ValueError("hardlink groups require rollback capsule version 5")
     if any(not _matches(record, homes, install, "post")
            or {"mode": stat.S_IMODE(Path(record["path"]).stat().st_mode), **_metadata(Path(record["path"]))}
            != record["post_metadata"] for record in data["roots"] if record.get("kind") != "resource"):
         raise ValueError("data changed while sealing rollback capsule")
     if any(not _same(_image(Path(item["path"]).parent, set(homes), install,
-                            include=(Path(item["path"]),)), item["post"])
+                            include=(Path(item["path"]),), owner_kind="new_selections"), item["post"])
            for item in data["new_selections"]):
         raise ValueError("new selection changed while sealing rollback capsule")
     if _git(Path(data["install"]), "rev-parse", "HEAD") != post_head:
@@ -1168,7 +1271,7 @@ def _scope(data: dict, install_root, hermes_home, *, sealing: bool = False) -> t
             if choice in selected or not any(
                     choice.parent.parent == owned_home / "environments" for owned_home in homes):
                 continue
-            post = _image(choice.parent, set(homes), install, include=(choice,))
+            post = _image(choice.parent, set(homes), install, include=(choice,), owner_kind="new_selections")
             if post:
                 data["new_selections"].append({"path": str(choice), "post": post})
         for item in data["new_selections"]:
@@ -1229,7 +1332,7 @@ def _restore_record(record: dict, capsule: Path, homes: list[Path], install: Pat
     pre = {item["path"]: item for item in record["pre"]}
     post = {item["path"]: item for item in record.get("post", [])}
     if record["kind"] in {"home", "state"}:
-        actual = _image(root, set(homes), install, **_filters(record))
+        actual = _image(root, set(homes), install, owner_kind=record["kind"], **_filters(record))
         generated, extra_dirs = _regenerated_parts(actual, record["post"], record, homes)
         sealed_generated, _ = _regenerated_parts(record["post"], record["post"], record, homes)
         for name in generated:
@@ -1245,6 +1348,7 @@ def _restore_record(record: dict, capsule: Path, homes: list[Path], install: Pat
                 dest.rmdir()
         else:
             dest.unlink()
+    aliases: list[tuple[str, str]] = []
     for name, item in sorted(pre.items(), key=lambda pair: pair[0].count("/")):
         dest = root / name
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1264,6 +1368,9 @@ def _restore_record(record: dict, capsule: Path, homes: list[Path], install: Pat
                 from hermes_cli.backup_restore import _safe_restore_db
                 if not _safe_restore_db(src, dest):
                     raise RuntimeError(f"SQLite restore refused: {dest}")
+            elif item.get("hardlink_group") not in (None, name):
+                aliases.append((name, item["hardlink_group"]))
+                continue
             else:
                 staged = dest.with_name(".rollback-" + uuid.uuid4().hex)
                 try:
@@ -1275,6 +1382,17 @@ def _restore_record(record: dict, capsule: Path, homes: list[Path], install: Pat
         _restore_metadata(dest, item, capsule / record["id"] / item["xattrs_object"])
         if item["kind"] != "dir":
             os.utime(dest, ns=(item["mtime_ns"], item["mtime_ns"]), follow_symlinks=False)
+    for name, marker in aliases:
+        # Aliases share the freshly restored canonical inode and its metadata;
+        # a failed link refuses instead of copying over a live postimage inode.
+        dest = root / name
+        try:
+            with tempfile.TemporaryDirectory(prefix=".rollback-link-", dir=dest.parent) as directory:
+                staged = Path(directory) / "entry"
+                os.link(root / marker, staged, follow_symlinks=False)
+                staged.replace(dest)
+        except OSError as exc:
+            raise ValueError(f"cannot restore hardlink group member: {dest}") from exc
     if not _matches(record, homes, install, "pre"):
         raise RuntimeError(f"restored data verification failed: {root}")
 
@@ -1379,7 +1497,8 @@ def _restore_verified(authority: _CapsuleAuthority, data: dict, install: Path, h
                 raise ValueError(f"rollback archive path crosses a symlink: {dest}")
     for item in data["new_selections"]:
         choice = Path(item["path"])
-        if not _same(_image(choice.parent, set(homes), install, include=(choice,)), item["post"]):
+        if not _same(_image(choice.parent, set(homes), install, include=(choice,),
+                            owner_kind="new_selections"), item["post"]):
             raise ValueError(f"new selection changed since seal: {choice}")
     # Git's ordinary checkout overwrites ignored paths. Inspect both path directions,
     # including ignored directories, before importing or touching user data.

@@ -809,7 +809,13 @@ def _complete_source_update(request: dict | None) -> None:
     except KeyboardInterrupt as interrupt:
         # Ctrl-C after the commit point: the tree is new, so the run is interrupted, never "failed".
         _completion_receipt.finalize_interrupted_update_receipt("KeyboardInterrupt: interrupted after the code was updated")
-        raise SystemExit(130) from interrupt
+        cancelled = SystemExit(130)
+        retained = getattr(interrupt, "retained_paths", None)
+        if retained is not None:
+            from pm.process_scope import retain_exception
+
+            retain_exception(cancelled, retained)
+        raise cancelled from interrupt
     except Exception as exc:  # health: allow BLE001 -- after the commit point a lost completion is owed, never a failed update (C3)
         result, lost = settle_lost_completion(request, f"{type(exc).__name__}: {exc}"), True
     if not lost and result.get("receipt") is None and result["exit_code"] == 130:

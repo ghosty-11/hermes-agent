@@ -64,6 +64,54 @@ shared-metrics database (`metrics.sqlite3`, `outbox`) changes remain drift.
 If publication changes the database after sealing, rollback refuses even after its
 writer exits. The refusal restores nothing rather than discarding unrelated telemetry.
 
+## Rollback capsule hardlink groups
+
+The rollback capsule records one closed hardlink group when every alias of one
+mutable regular-file inode lies inside a single admitted coverage owner and the
+observed alias count equals the inode link count. Each member keeps `kind=file`
+and its own numbered content and attribute artifacts; the manifest adds a
+`hardlink_group` key holding the canonical root-relative member path, identical
+on every member. New captures write manifest version 5. Version 4 capsules stay
+readable through the complete arm, seal and restore lifecycle, and version stays
+constant across those phases. A `hardlink_group` marker inside version 4 data
+refuses before any restoration: a pre-group reader ignores unknown keys and
+could restore a split sealed postimage as independent copies, then report
+success without the captured alias relationship.
+
+Groups whose aliases reach outside the covered image, span two independently
+restored owners, hide an alias in an excluded path, include a SQLite database,
+or contain independently regenerated data refuse before publication or restore.
+Config good copies, pending metric receipts, metric latches and bootstrap state
+may change after sealing; coupling them to another file would invalidate an
+otherwise permitted producer action. The inode link count is the closure oracle,
+and independent restore and selection-publication ordering cannot preserve one
+shared mutable inode across owners. Group topology is a drift sentinel: preimage and
+sealed-postimage comparisons compare group identity, and capture rechecks every
+member's device, inode, link count and data and metadata sentinels after
+scanning, so link replacement, addition or removal during capture refuses.
+
+Restore recreates directories and the canonical member first through a staged
+copy and atomic replace, applies the shared owner, group, mode, timestamps and
+attributes to that fresh inode, and then creates every alias through a staged
+hardlink and atomic replace. A failed link refuses without copying a member into
+place or rewriting a live postimage inode, and the reconstructed group is
+re-imaged before success. Capture probes links from the canonical parent into
+every member's parent. Exclusive private probe directories protect existing files,
+and cleanup restores directory metadata.
+
+## Interrupted local completion
+
+Local completion keeps its receipt open until the parent proves quiescence and
+seals the rollback capsule. A retained-input marker prevents sealing even when
+its path list is empty. An interrupt preserves that evidence instead of
+finalizing the receipt inside the child.
+The public exit-130 exception carries the complete retained-input set across
+command boundaries.
+
+If every writer has stopped, the parent seals the capsule before finalizing the
+receipt as `interrupted` with exit code 130. Retained writers keep the capsule
+unsealed and its inputs available for recovery.
+
 ## Local transaction extensions
 
 `--update-extension-context` supplies a caller-owned mode-0600 JSON context.

@@ -527,7 +527,7 @@ def test_cancelled_local_entry_does_not_seal_while_escaped_completion_owns_input
     snapshot_stage = None
     retained = ()
     try:
-        with pytest.raises(KeyboardInterrupt, match="owned cancellation") as caught:
+        with pytest.raises(SystemExit) as caught:
             with writer_claim(install=root):
                 with retained_directory(prefix="hermes-target-snapshot-") as temporary:
                     snapshot_stage = Path(temporary)
@@ -538,8 +538,8 @@ def test_cancelled_local_entry_does_not_seal_while_escaped_completion_owns_input
                             SimpleNamespace(source_repo=str(snapshot), target=target, required_extra=[]),
                             gateway_mode=False,
                         )
-        assert caught.value is interrupt
-        retained = interrupt.retained_paths
+        assert caught.value.code == 130
+        retained = caught.value.retained_paths
         live = json.loads(proof.read_text())
         request_path = Path(live["request"])
         request = json.loads(request_path.read_text())

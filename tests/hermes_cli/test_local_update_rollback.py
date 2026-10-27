@@ -96,6 +96,17 @@ def substituted_fifo(path):
         path.write_bytes(original)
 
 
+def _link_group(members, content, *, mode=0o640, mtime_ns=1_700_000_000_123456789):
+    """Build one closed hardlink group sharing content, mode and timestamps."""
+    members[0].parent.mkdir(parents=True, exist_ok=True)
+    members[0].write_bytes(content)
+    for alias in members[1:]:
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        os.link(members[0], alias)
+    members[0].chmod(mode)
+    os.utime(members[0], ns=(mtime_ns, mtime_ns))
+
+
 def test_roundtrip_multiple_homes_and_wal(transaction):
     install, source, home, sibling, before, target = transaction
     large = sibling / "skills" / "large.bin"
@@ -1573,9 +1584,16 @@ def test_pm_uv_cache_hardlinks_are_outside_rollback_image_and_coverage(
 
     mutable = home / "user-data.bin"
     mutable.write_bytes(b"durable data\n")
-    os.link(mutable, tmp_path / "external-user-data.bin")
-    with pytest.raises(ValueError, match="multiply linked mutable file cannot be rolled back"):
+    external = tmp_path / "external-user-data.bin"
+    os.link(mutable, external)
+    capsules = home / "local-update-capsules"
+    published = sorted(path.parent.name for path in capsules.glob("*/manifest.json"))
+    with pytest.raises((ValueError, RuntimeError)):
         capture_local_update_capsule(install, home, source, target)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert mutable.read_bytes() == external.read_bytes() == b"durable data\n"
+    assert mutable.stat().st_ino == external.stat().st_ino
+    assert sorted(path.parent.name for path in capsules.glob("*/manifest.json")) == published
 
 
 def test_capture_refuses_sqlite_with_foreign_hardlink(transaction, tmp_path):
@@ -1587,6 +1605,539 @@ def test_capture_refuses_sqlite_with_foreign_hardlink(transaction, tmp_path):
     assert git(install, "rev-parse", "HEAD") == before
     with closing(sqlite3.connect(alias)) as conn:
         assert conn.execute("SELECT value FROM events").fetchall() == [("before",)]
+
+
+@pytest.mark.parametrize("postimage", ["in-place", "split", "relinked"])
+@pytest.mark.parametrize("count", [2, 3])
+def test_closed_hardlink_group_roundtrip_restores_shared_inode(transaction, count, postimage):
+    """A closed group wholly inside one admitted image captures, arms, seals and
+    restores original bytes, owner, mode, timestamps and the shared-inode
+    relationship, whatever the update did to the group meanwhile."""
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", sibling / "assets" / "beta.bin"]
+    if count == 3:
+        members.append(home / "archive" / "deep" / "gamma.bin")
+    payload = b"closed group payload\n"
+    _link_group(members, payload)
+    owner = (members[0].stat().st_uid, members[0].stat().st_gid)
+    mtime_ns = members[0].stat().st_mtime_ns
+
+    manifest = capture_local_update_capsule(install, home, source, target)
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    manifest_version = json.loads(manifest.read_text())["version"]
+
+    advance(install, source, target)
+    if postimage == "in-place":
+        members[0].write_bytes(b"target payload\n")
+        members[0].chmod(0o600)
+    elif postimage == "split":
+        for index, member in enumerate(members):
+            member.unlink()
+            member.write_bytes(f"split target {index}\n".encode())
+            member.chmod(0o600)
+    else:
+        staged = home / "data" / ".relink-stage"
+        staged.write_bytes(b"relinked target payload\n")
+        staged.chmod(0o600)
+        for member in members:
+            member.unlink()
+            os.link(staged, member)
+        staged.unlink()
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    restored = restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert restored["state"] == "restored"
+    assert git(install, "rev-parse", "HEAD") == before
+    assert json.loads(manifest.read_text())["version"] == manifest_version
+    inodes = set()
+    for member in members:
+        current = member.stat()
+        inodes.add(current.st_ino)
+        assert member.read_bytes() == payload
+        assert current.st_mode & 0o777 == 0o640
+        assert current.st_mtime_ns == mtime_ns
+        assert (current.st_uid, current.st_gid) == owner
+        assert current.st_nlink == count
+    assert len(inodes) == 1
+
+
+def test_product_root_closed_group_roundtrip(transaction):
+    """The npm-style esbuild aliases spanning several product directories are one
+    closed group inside the single mutable product image."""
+    install, source, home, sibling, before, target = transaction
+    members = [install / "node_modules" / ".bin" / "esbuild",
+               install / "node_modules" / "@esbuild" / "linux-x64" / "bin" / "esbuild",
+               install / "ui-tui" / "node_modules" / ".bin" / "esbuild"]
+    payload = b"esbuild binary payload\n"
+    _link_group(members, payload, mode=0o755)
+    mtime_ns = members[0].stat().st_mtime_ns
+    stamp = install / "install-stamp.json"
+    stamp.write_text("{}")
+
+    manifest = capture_local_update_capsule(install, home, source, target)
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+
+    advance(install, source, target)
+    for index, member in enumerate(members):
+        member.unlink()
+        member.write_bytes(f"target esbuild {index}\n".encode())
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert stamp.read_text() == "{}"
+    assert len({member.stat().st_ino for member in members}) == 1
+    for member in members:
+        assert member.read_bytes() == payload
+        assert member.stat().st_mode & 0o777 == 0o755
+        assert member.stat().st_mtime_ns == mtime_ns
+        assert member.stat().st_nlink == 3
+
+
+def test_closed_group_extended_attributes_roundtrip(transaction):
+    """Attributes captured on the shared inode come back on every member."""
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", sibling / "assets" / "beta.bin"]
+    _link_group(members, b"closed group payload\n")
+    try:
+        os.setxattr(members[0], "user.rollback", b"group preimage attribute")
+    except (AttributeError, OSError) as exc:
+        pytest.skip(f"user extended attributes unavailable: {exc}")
+    manifest = capture_local_update_capsule(install, home, source, target)
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    advance(install, source, target)
+    members[0].write_bytes(b"target payload\n")
+    os.setxattr(members[0], "user.rollback", b"group postimage attribute")
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert members[0].stat().st_ino == members[1].stat().st_ino
+    for member in members:
+        assert member.read_bytes() == b"closed group payload\n"
+        assert os.getxattr(member, "user.rollback") == b"group preimage attribute"
+
+
+def test_historical_plain_capsule_restores_under_current_reader(transaction):
+    """Capsules captured before group support remain fully usable: the current
+    reader arms, seals and restores them without altering their manifest version."""
+    from hermes_cli.local_update_attestation import publish
+
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    data = json.loads(manifest.read_text())
+    data["version"] = 4
+    manifest.write_text(json.dumps(data))
+    ref = f"refs/hermes/local-update-attestations/{manifest.parent.name}/capture"
+    git(install, "update-ref", "-d", ref)
+    publish(install, manifest, data, "capture")
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    advance(install, source, target)
+    (home / "config.yaml").write_bytes(b"target config\n")
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    assert json.loads(manifest.read_text())["version"] == 4
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert (home / "config.yaml").read_bytes() == b"old config\n"
+    assert json.loads(manifest.read_text())["version"] == 4
+
+
+@pytest.mark.parametrize("marker", ["singleton", "paired"])
+def test_group_markers_in_historical_manifest_refuse_restore(transaction, marker):
+    """Pre-group manifests never carry markers: the current reader refuses such a
+    capsule before restoring anything, whatever the marker shape."""
+    from hermes_cli.local_update_attestation import publish
+
+    install, source, home, sibling, before, target = transaction
+    twins = [home / "twin-a.bin", home / "twin-b.bin"]
+    for twin in twins:
+        twin.write_bytes(b"twin payload\n")
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    (home / "config.yaml").write_bytes(b"target config\n")
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    data = json.loads(manifest.read_text())
+    data["version"] = 4
+    record = next(row for row in data["roots"]
+                  if row["kind"] == "home" and row["path"] == str(home))
+    items = {item["path"]: item for item in record["pre"]}
+    if marker == "singleton":
+        items["config.yaml"]["hardlink_group"] = "config.yaml"
+    else:
+        items["twin-a.bin"]["hardlink_group"] = "twin-a.bin"
+        items["twin-b.bin"]["hardlink_group"] = "twin-a.bin"
+    manifest.write_text(json.dumps(data))
+    for phase in ("capture", "seal"):
+        ref = f"refs/hermes/local-update-attestations/{manifest.parent.name}/{phase}"
+        git(install, "update-ref", "-d", ref)
+        publish(install, manifest, data, phase)
+    with pytest.raises((ValueError, RuntimeError)):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert (home / "config.yaml").read_bytes() == b"target config\n"
+    assert json.loads(manifest.read_text())["state"] == "sealed"
+
+
+@pytest.mark.parametrize("malformation",
+                         ["singleton", "traversal", "absolute", "cycle", "missing-canonical", "null"])
+def test_forged_group_marker_refuses_attestation_consistent_restore(transaction, malformation):
+    """Marker validation stands on its own: a capsule whose manifest and
+    attestations agree still refuses malformed group markers before any mutation."""
+    from hermes_cli.local_update_attestation import publish
+
+    install, source, home, sibling, before, target = transaction
+    twins = [home / "twin-a.bin", home / "twin-b.bin"]
+    for twin in twins:
+        twin.write_bytes(b"twin payload\n")
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    (home / "config.yaml").write_bytes(b"target config\n")
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    data = json.loads(manifest.read_text())
+    record = next(row for row in data["roots"]
+                  if row["kind"] == "home" and row["path"] == str(home))
+    items = {item["path"]: item for item in record["pre"]}
+    if malformation == "singleton":
+        items["config.yaml"]["hardlink_group"] = "config.yaml"
+    elif malformation == "null":
+        items["config.yaml"]["hardlink_group"] = None
+    elif malformation == "traversal":
+        items["config.yaml"]["hardlink_group"] = "../outside.bin"
+    elif malformation == "absolute":
+        items["config.yaml"]["hardlink_group"] = "/etc/passwd"
+    elif malformation == "cycle":
+        items["twin-a.bin"]["hardlink_group"] = "twin-b.bin"
+        items["twin-b.bin"]["hardlink_group"] = "twin-a.bin"
+    else:
+        items["twin-a.bin"]["hardlink_group"] = "twin-c.bin"
+        items["twin-b.bin"]["hardlink_group"] = "twin-c.bin"
+    manifest.write_text(json.dumps(data))
+    for phase in ("capture", "seal"):
+        ref = f"refs/hermes/local-update-attestations/{manifest.parent.name}/{phase}"
+        git(install, "update-ref", "-d", ref)
+        publish(install, manifest, data, phase)
+    with pytest.raises((ValueError, RuntimeError)):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert (home / "config.yaml").read_bytes() == b"target config\n"
+    assert json.loads(manifest.read_text())["state"] == "sealed"
+    for twin in twins:
+        assert twin.read_bytes() == b"twin payload\n"
+
+
+def test_unknown_external_alias_refuses_capture_without_mutation(transaction, tmp_path):
+    """A group with an alias outside every admitted image is not closed and never
+    enters a capsule."""
+    install, source, home, sibling, before, target = transaction
+    durable = home / "user-data.bin"
+    durable.write_bytes(b"durable payload\n")
+    external = tmp_path / "external-user-data.bin"
+    os.link(durable, external)
+    with pytest.raises((ValueError, RuntimeError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert durable.stat().st_ino == external.stat().st_ino
+    assert durable.read_bytes() == external.read_bytes() == b"durable payload\n"
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+
+
+def test_excluded_cache_alias_refuses_capture_and_preserves_cache(transaction):
+    """An alias inside an excluded path leaves the observed group incomplete; the
+    cache it hides in is never touched."""
+    install, source, home, sibling, before, target = transaction
+    durable = home / "user-data.bin"
+    durable.write_bytes(b"durable payload\n")
+    cached = home / "cache" / "alias.bin"
+    cached.parent.mkdir(parents=True)
+    os.link(durable, cached)
+    with pytest.raises((ValueError, RuntimeError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert durable.stat().st_ino == cached.stat().st_ino
+    assert durable.read_bytes() == cached.read_bytes() == b"durable payload\n"
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+
+
+@pytest.mark.parametrize("other_owner", ["product", "selection"])
+def test_cross_owner_hardlink_group_refuses_capture(transaction, other_owner):
+    """Aliases spanning two independently restored roots cannot preserve one shared
+    mutable inode, so capture refuses them outright."""
+    install, source, home, sibling, before, target = transaction
+    member = home / "data" / "home-side.bin"
+    member.parent.mkdir(parents=True)
+    if other_owner == "product":
+        foreign = install / "node_modules" / "cross-owner.bin"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(b"cross owner payload\n")
+        os.link(foreign, member)
+    else:
+        generation = install_state_dir(install) / "environments" / "old"
+        venv = generation / "venv"
+        venv.mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text("home = old\n")
+        Facts(runtime_facts_path(install)).record_state("venv", "old", [], environment=venv)
+        foreign = runtime_facts_path(install)
+        os.link(foreign, member)
+    with pytest.raises((ValueError, RuntimeError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert member.stat().st_ino == foreign.stat().st_ino
+    assert member.read_bytes() == foreign.read_bytes()
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+
+
+def test_hardlinked_sqlite_pair_refuses_closed_group_capture(transaction):
+    """SQLite members stay outside closed-group support: database hardlinks refuse."""
+    install, source, home, sibling, before, target = transaction
+    alias_db = sibling / "state-copy.db"
+    os.link(sibling / "state.db", alias_db)
+    with pytest.raises((ValueError, RuntimeError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert alias_db.stat().st_ino == (sibling / "state.db").stat().st_ino
+    with closing(sqlite3.connect(alias_db)) as conn:
+        assert conn.execute("SELECT value FROM events").fetchall() == [("before",)]
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+
+
+@pytest.mark.parametrize("change", ["added-alias", "removed-alias"])
+def test_preimage_group_topology_drift_refuses_arming(transaction, change):
+    """Group topology is a preimage sentinel: link changes after capture refuse
+    arming before any checkout happens."""
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", sibling / "assets" / "beta.bin"]
+    payload = b"closed group payload\n"
+    _link_group(members, payload)
+    manifest = capture_local_update_capsule(install, home, source, target)
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    added = home / "data" / "added.bin"
+    if change == "added-alias":
+        os.link(members[0], added)
+    else:
+        members[1].unlink()
+    with pytest.raises((ValueError, RuntimeError)):
+        verify_local_update_preimage(
+            manifest, expected_install_root=install, expected_hermes_home=home)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert members[0].read_bytes() == payload
+    if change == "added-alias":
+        assert added.read_bytes() == payload
+    else:
+        assert not members[1].exists()
+
+
+@pytest.mark.parametrize("change", ["inside-alias", "external-alias", "removed-alias"])
+def test_postimage_group_drift_after_seal_refuses_restore(transaction, tmp_path, change):
+    """Link changes between seal and restore are postimage drift: nothing is
+    restored and every byte and inode stays as the update left it."""
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", sibling / "assets" / "beta.bin"]
+    _link_group(members, b"closed group payload\n")
+    manifest = capture_local_update_capsule(install, home, source, target)
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    advance(install, source, target)
+    for index, member in enumerate(members):
+        member.unlink()
+        member.write_bytes(f"target {index}\n".encode())
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    postimage = {member: (member.stat().st_ino, member.read_bytes()) for member in members}
+    added = home / "data" / "added.bin"
+    external = tmp_path / "after-seal.bin"
+    if change == "inside-alias":
+        os.link(members[0], added)
+    elif change == "external-alias":
+        os.link(members[0], external)
+    else:
+        members[1].unlink()
+    with pytest.raises((ValueError, RuntimeError)):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    if change == "removed-alias":
+        assert not members[1].exists()
+    else:
+        for member in members:
+            assert (member.stat().st_ino, member.read_bytes()) == postimage[member]
+    if change == "inside-alias":
+        assert added.read_bytes() == postimage[members[0]][1]
+    if change == "external-alias":
+        assert external.read_bytes() == postimage[members[0]][1]
+    assert json.loads(manifest.read_text())["state"] == "sealed"
+
+
+@pytest.mark.parametrize("change", ["add-alias", "replace-member", "remove-alias"])
+def test_hardlink_group_changed_during_capture_refuses(transaction, monkeypatch, change):
+    """Link replacement, addition or removal while the image is scanned refuses
+    capture instead of sealing inconsistent group state."""
+    from hermes_cli import local_update_rollback as rollback
+
+    install, source, home, sibling, before, target = transaction
+    group_dir = home / "data"
+    members = [group_dir / "m-alpha.bin", group_dir / "m-beta.bin"]
+    _link_group(members, b"race payload\n")
+    probe = group_dir / "z-probe.bin"
+    probe.write_bytes(b"probe\n")
+    original_metadata = rollback._metadata
+    injected = False
+
+    def racing_metadata(path, artifact=None):
+        nonlocal injected
+        if not injected and Path(path) == probe and artifact is not None:
+            injected = True
+            if change == "add-alias":
+                os.link(members[0], group_dir / "a-race.bin")
+            elif change == "replace-member":
+                members[1].unlink()
+                members[1].write_bytes(b"replaced independent payload\n")
+            else:
+                members[1].unlink()
+        return original_metadata(path, artifact)
+
+    monkeypatch.setattr(rollback, "_metadata", racing_metadata)
+    with pytest.raises((ValueError, RuntimeError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert injected
+    assert git(install, "rev-parse", "HEAD") == before
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+
+
+def test_failed_alias_hardlink_restoration_refuses_without_copy_or_truncation(
+        transaction, monkeypatch):
+    """When alias linking fails, restore refuses: no member is silently copied into
+    place and the live postimage inodes are never rewritten."""
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", home / "data" / "beta.bin",
+               home / "data" / "gamma.bin"]
+    payload = b"closed group payload\n"
+    _link_group(members, payload)
+    manifest = capture_local_update_capsule(install, home, source, target)
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    advance(install, source, target)
+    for index, member in enumerate(members):
+        member.unlink()
+        member.write_bytes(f"target {index}\n".encode())
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    postimage = {member: (member.stat().st_ino, member.read_bytes()) for member in members}
+    original_link = os.link
+
+    def refusing_link(src, dst, *args, **kwargs):
+        if Path(dst).is_relative_to(home / "data"):
+            raise OSError("injected alias link failure")
+        return original_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", refusing_link)
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    replaced = [member for member in members if member.read_bytes() == payload]
+    assert len(replaced) <= 1
+    for member in members:
+        if member not in replaced:
+            assert (member.stat().st_ino, member.read_bytes()) == postimage[member]
+    assert json.loads(manifest.read_text())["state"] == "sealed"
+
+
+def test_cross_directory_link_failure_refuses_capture_before_publication(transaction, monkeypatch):
+    """Creating local files and local links does not prove aliases can cross parents."""
+    import errno
+
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", home / "assets" / "beta.bin"]
+    payload = b"cross-directory group payload\n"
+    _link_group(members, payload)
+    parents = {member.parent for member in members}
+    original_link = os.link
+    rejected = False
+
+    def no_cross_parent_links(src, dst, *args, **kwargs):
+        nonlocal rejected
+        source_owner = next((parent for parent in parents if Path(src).is_relative_to(parent)), None)
+        target_owner = next((parent for parent in parents if Path(dst).is_relative_to(parent)), None)
+        if source_owner is not None and target_owner is not None and source_owner != target_owner:
+            rejected = True
+            raise OSError(errno.EXDEV, "cross-mount links unavailable")
+        return original_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", no_cross_parent_links)
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert rejected
+    assert git(install, "rev-parse", "HEAD") == before
+    assert members[0].stat().st_ino == members[1].stat().st_ino
+    assert all(member.read_bytes() == payload for member in members)
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+
+
+def test_link_probe_collision_preserves_existing_user_file(transaction, monkeypatch):
+    """An exclusive-create failure never authorizes removing the colliding file."""
+    from hermes_cli import local_update_rollback as rollback
+
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", home / "data" / "beta.bin"]
+    _link_group(members, b"closed group payload\n")
+    nonce = "c" * 32
+    foreign = home / "data" / f".rollback-link-{nonce}"
+    foreign.write_bytes(b"unrelated user data\n")
+    inode = foreign.stat().st_ino
+    monkeypatch.setattr(rollback.uuid, "uuid4", lambda: SimpleNamespace(hex=nonce))
+    try:
+        capture_local_update_capsule(install, home, source, target)
+    except (ValueError, RuntimeError, OSError):
+        pass
+    assert foreign.exists()
+    assert (foreign.stat().st_ino, foreign.read_bytes()) == (inode, b"unrelated user data\n")
+    assert git(install, "rev-parse", "HEAD") == before
+    assert members[0].stat().st_ino == members[1].stat().st_ino
+    assert all(member.read_bytes() == b"closed group payload\n" for member in members)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory mode checks")
+def test_unwritable_alias_parent_refuses_capture_then_roundtrip_after_repair(transaction):
+    """Capture never seals a group whose alias parent cannot receive new links;
+    once the parent is writable again the same group completes a full rollback."""
+    install, source, home, sibling, before, target = transaction
+    members = [home / "data" / "alpha.bin", home / "locked" / "beta.bin"]
+    payload = b"locked parent payload\n"
+    _link_group(members, payload)
+    (home / "locked").chmod(0o500)
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+    (home / "locked").chmod(0o700)
+    manifest = capture_local_update_capsule(install, home, source, target)
+    verify_local_update_preimage(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    advance(install, source, target)
+    for member in members:
+        member.unlink()
+        member.write_bytes(b"target bytes\n")
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert members[0].stat().st_ino == members[1].stat().st_ino
+    for member in members:
+        assert member.read_bytes() == payload
 
 
 def test_nested_external_skill_category_refuses_capture(transaction, tmp_path):
@@ -3183,3 +3734,104 @@ def test_sqlite_sidecar_product_dependency_survives_collection_or_refuses_captur
     assert link.is_symlink() and link.read_bytes() == sidecar_bytes
     with closing(sqlite3.connect(db)) as conn:
         assert conn.execute("SELECT value FROM entries").fetchall() == [("captured",)]
+
+
+@pytest.mark.parametrize("producer", ["config-backup", "metric-receipt", "metric-latch", "bootstrap"])
+def test_regenerated_member_hardlink_group_refuses_capture(transaction, producer):
+    """Independently regenerated aliases cannot belong to a restorable closed group."""
+    install, source, home, sibling, before, target = transaction
+    if producer == "bootstrap":
+        owner = install_state_dir(install)
+        alias = owner / "bootstrap" / "default.json"
+    else:
+        owner = home
+        alias = {
+            "config-backup": home / "backups/config/config.yaml.good.20261021-170707",
+            "metric-receipt": home / "telemetry/shared_metrics/pending_updates" / ("a" * 32 + ".json"),
+            "metric-latch": home / "telemetry/shared_metrics/recorded_updates" / ("a" * 32),
+        }[producer]
+    stable = owner / "durable.json"
+    payload = b"{}\n"
+    _link_group([stable, alias], payload)
+    with pytest.raises((ValueError, RuntimeError)):
+        capture_local_update_capsule(install, home, source, target)
+    assert git(install, "rev-parse", "HEAD") == before
+    assert stable.stat().st_ino == alias.stat().st_ino
+    assert stable.read_bytes() == alias.read_bytes() == payload
+    assert not list((home / "local-update-capsules").glob("*/manifest.json"))
+
+
+@pytest.mark.parametrize("owner_kind", ["home", "state"])
+def test_forged_regenerated_group_refuses_restore_before_mutation(transaction, owner_kind):
+    """Attestation-consistent group metadata cannot grant coupled regeneration rights."""
+    from hermes_cli.local_update_attestation import publish
+
+    install, source, home, sibling, before, target = transaction
+    owner = home if owner_kind == "home" else install_state_dir(install)
+    stable = owner / "durable.json"
+    alias = (home / "backups/config/config.yaml.good.20261021-170707"
+             if owner_kind == "home" else owner / "bootstrap/default.json")
+    for path in (stable, alias):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"{}\n")
+        path.chmod(0o640)
+        os.utime(path, ns=(1_700_000_000_123456789, 1_700_000_000_123456789))
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    stable.write_bytes(b'{"new": true}\n')
+    alias.write_bytes(b'{"new": true}\n')
+    seal_local_update_capsule(manifest, expected_install_root=install, expected_hermes_home=home)
+    data = json.loads(manifest.read_text())
+    record = next(row for row in data["roots"] if row["kind"] == owner_kind)
+    base = Path(record["path"])
+    members = {path.relative_to(base).as_posix() for path in (stable, alias)}
+    for item in record["pre"]:
+        if item["path"] in members:
+            item["hardlink_group"] = min(members)
+    manifest.write_text(json.dumps(data))
+    for phase in ("capture", "seal"):
+        git(install, "update-ref", "-d",
+            f"refs/hermes/local-update-attestations/{manifest.parent.name}/{phase}")
+        publish(install, manifest, data, phase)
+    with pytest.raises((ValueError, RuntimeError)):
+        restore_local_update_capsule(
+            manifest, expected_install_root=install, expected_hermes_home=home,
+            acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == target
+    assert stable.read_bytes() == alias.read_bytes() == b'{"new": true}\n'
+    assert json.loads(manifest.read_text())["state"] == "sealed"
+
+
+def test_interrupted_completion_defers_receipt_until_local_capsule_seal(transaction, monkeypatch, tmp_path):
+    """A quiet local cancellation keeps its receipt open until the parent seals the capsule."""
+    from hermes_cli import update_completion, update_receipt
+
+    install, source, home, sibling, before, target = transaction
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    receipt = update_receipt.UpdateReceipt().data
+    request = {
+        "source": str(install), "home": str(home), "expected_sha": target,
+        "receipt": receipt, "gateway_mode": False, "windows_resume": None,
+        "local_rollback_manifest": str(manifest), "apply_mode": "local",
+    }
+    result_path = tmp_path / "completion-result.json"
+
+    def interrupted(_request):
+        raise KeyboardInterrupt("local completion interrupted")
+
+    monkeypatch.setattr(update_completion, "_complete_selected", interrupted)
+    original = update_receipt._current.get()
+    try:
+        assert update_completion._finish(request, result_path) == 130
+        assert update_receipt.finalized_receipt(receipt["update_id"]) is None
+        assert json.loads(manifest.read_text())["state"] == "captured"
+        assert json.loads(result_path.read_text())["seal_pending"] is True
+        assert update_completion._seal(request, result_path) == 130
+        terminal = update_receipt.finalized_receipt(receipt["update_id"])
+        assert terminal["outcome"] == "interrupted"
+        assert terminal["exit_code"] == 130
+        assert json.loads(manifest.read_text())["state"] == "sealed"
+        assert git(install, "rev-parse", "HEAD") == target
+    finally:
+        update_receipt._current.set(original)

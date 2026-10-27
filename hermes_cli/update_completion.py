@@ -689,11 +689,13 @@ def _finish(request: dict, result_path: Path) -> int:
                 install_root=Path(request["source"]), home=Path(request["home"]),
                 target=request["expected_sha"])
             extension_completed = True
-    except KeyboardInterrupt:
-        # An operator interrupt is not a step failure, and the code already moved: the run is
-        # ``interrupted`` (never "failed"), and the armed obligations finish the tail.
+    except KeyboardInterrupt as exc:
+        # Local sealing and unproved child cleanup still need the open receipt.
         code, reason = 130, "KeyboardInterrupt: interrupted after the code was updated"
-        update_receipt.finalize_interrupted_update_receipt(reason, exit_code=code)
+        retained_paths = getattr(exc, "retained_paths", None)
+        cancelled = True
+        if retained_paths is None and not request.get("local_rollback_manifest"):
+            update_receipt.finalize_interrupted_update_receipt(reason, exit_code=code)
     except SystemExit as exc:
         if isinstance(exc.code, int) and exc.code:
             code = _exit_status(exc.code)
@@ -794,7 +796,10 @@ def _seal(request: dict, result_path: Path) -> int:
         code, reason = 1, f"local rollback capsule seal failed: {exc}"
         update_receipt.record_stage("rollback_capsule", "failed")
         print(f"✗ {reason}")
-    update_receipt.finalize_pending_update_receipt(code, reason)
+    if code == 130:
+        update_receipt.finalize_interrupted_update_receipt(reason, exit_code=code)
+    else:
+        update_receipt.finalize_pending_update_receipt(code, reason)
     terminal_receipt = _read_terminal_receipt(request)
     if not terminal_receipt:
         code = code or 1
