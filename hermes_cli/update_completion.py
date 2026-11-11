@@ -489,7 +489,9 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     with receipt.worker_context(update_id):
         try:
             # The parent kept this verified private closure alive across the
-            # checkout. Copy it into the live store before selecting anything.
+            # checkout. Publish it into the live store before selecting
+            # anything: reuse verified current live entries as-is, installing
+            # only missing or new pins from the closure.
             if request.get("offline"):
                 from pm.build_operations import stage_tools
                 from pm.lock import Lockfile
@@ -498,7 +500,8 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
                 from pm.store import current_target
                 stage_tools(list(dict.fromkeys((*tool_roots(Lockfile(lockfile_path()).names()), "uv"))),
                             source_store=Path(request["staged_tools"]),
-                            out=writable_store_root(), target=current_target())
+                            out=writable_store_root(), target=current_target(),
+                            reuse_current=True)
             ensure_tools_for_sync(**({"offline": True} if request.get("offline") else {}))
             pm.sync_venv(extras=request.get("required_extras"), explicit=True, project_root=root,
                          evict_incompatible_plugins=not request.get("offline", False),

@@ -116,6 +116,90 @@ def test_stage_tools_copies_verified_closure_without_acquiring_or_live_state(tmp
         pm.stage_tools(["copy-tool"], source_store=source, out=tmp_path / "other-output", target=target)
 
 
+def test_stage_tools_preserves_current_destination_resources_while_installing_missing_pins(tmp_path, client, monkeypatch, served):
+    """Completion publishes into the live store: a verified destination entry the
+    lock still pins must be reused byte-for-byte with its metadata intact, while
+    missing pins install from the verified source and a corrupt source refuses."""
+    import importlib.util
+    import pm
+    from pm import build_operations
+    from pm.lock import Facts, Lockfile
+    from pm.registry import _packages
+    from pm.store import current_target
+
+    target = current_target()
+    source = tmp_path / "canonical"
+    destination = tmp_path / "payload-tools"
+    lock = Lockfile(tmp_path / "lock.json")
+    definition = tmp_path / "copy_fixture.py"
+    definition.write_text(
+        "from pm.package import Package\n"
+        "class CopyLeaf(Package):\n"
+        "    name = 'copy-leaf'\n"
+        "    def env(self, entry, target): return {'COPY_ROOT': str(entry)}\n"
+        "class CopyTool(CopyLeaf):\n"
+        "    name = 'copy-tool'\n"
+        "    deps = ('copy-leaf',)\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("copy_fixture", definition)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "copy_fixture", module)
+    spec.loader.exec_module(module)
+    for package in (module.CopyLeaf(), module.CopyTool()):
+        monkeypatch.setitem(_packages, package.name, package)
+    from tests.pm._fixtures import make_tar
+    directory, base = served
+    pins = {}
+    for name in ("copy-leaf", "copy-tool"):
+        archive, sha = make_tar(directory, name + ".tgz", {"data": name})
+        lock.set_pin(name, "1.0", {target: {"url": base + "/" + archive, "sha256": sha}})
+        pins[name] = sha
+    lock.save()
+    assert pm.prepare_tools(["copy-tool"], out=source, target=target, cache=tmp_path / "python-cache") == source
+    assert pm.prepare_tools(["copy-leaf"], out=destination, target=target, cache=tmp_path / "python-cache") == destination
+    source_facts, destination_facts = Facts(source / "facts.json"), Facts(destination / "facts.json")
+    assert destination_facts.installed("copy-leaf", "1.0", destination, (target, (pins["copy-leaf"],)))
+    leaf_entry = destination_facts.get("copy-leaf")["entry"]
+    # The destination's retained tree was realized earlier than the source's:
+    # freeze its metadata where no fresh copy could land.
+    stamp = 1_000_000_000_000_000_000
+    entry_root = destination / leaf_entry
+    for path in [entry_root, *entry_root.rglob("*")]:
+        os.utime(path, ns=(stamp, stamp))
+    preserved = {str(path.relative_to(entry_root)):
+                 (None if path.is_dir() else path.read_bytes(), path.lstat().st_mtime_ns)
+                 for path in [entry_root, *entry_root.rglob("*")]}
+    leaf_fact = destination_facts.get("copy-leaf")
+    source_facts_bytes = (source / "facts.json").read_bytes()
+    result = build_operations.stage_tools(["copy-tool"], source_store=source, out=destination,
+                                          target=target, lock=lock, reuse_current=True)
+    assert result == destination
+    # The verified same-pin destination entry is reused as-is: byte- and
+    # metadata-identical, never republished from the source copy.
+    reused = {str(path.relative_to(entry_root)):
+              (None if path.is_dir() else path.read_bytes(), path.lstat().st_mtime_ns)
+              for path in [entry_root, *entry_root.rglob("*")]}
+    assert reused == preserved
+    assert not (entry_root / "data").samefile(source / source_facts.get("copy-leaf")["entry"] / "data")
+    # Only the missing pin is added, as an independent copy of the source bytes.
+    staged = Facts(destination / "facts.json")
+    tool_fact = source_facts.get("copy-tool")
+    assert staged.get("copy-tool")["version"] == "1.0"
+    assert staged.get("copy-tool")["entry"] == tool_fact["entry"]
+    assert staged.get("copy-tool")["digest"] == tool_fact["digest"]
+    installed = destination / tool_fact["entry"] / "data"
+    assert installed.read_bytes() == (source / tool_fact["entry"] / "data").read_bytes()
+    assert not installed.samefile(source / tool_fact["entry"] / "data")
+    assert staged.env_for("copy-tool", destination)["COPY_ROOT"] == str(destination / tool_fact["entry"])
+    assert staged.env_for("copy-leaf", destination)["COPY_ROOT"] == str(entry_root)
+    assert staged.get("copy-leaf") == leaf_fact
+    assert (source / "facts.json").read_bytes() == source_facts_bytes
+    # Reuse never skips admission: a corrupt source still refuses publication.
+    (source / source_facts.get("copy-tool")["entry"] / "data").write_text("corrupt", encoding="utf-8")
+    with pytest.raises(InstallError, match="source failed verification"):
+        build_operations.stage_tools(["copy-tool"], source_store=source, out=destination,
+                                     target=target, lock=lock, reuse_current=True)
+
+
 @pytest.mark.parametrize("damage", [None, "entry", "env", "bytes", "pin", "binary"])
 def test_verified_tools_admits_only_locked_entries_without_execution(tmp_path, monkeypatch, damage):
     import subprocess

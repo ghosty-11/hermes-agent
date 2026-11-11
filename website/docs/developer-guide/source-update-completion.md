@@ -46,6 +46,11 @@ checks must complete across all profile homes, or offline completion refuses.
 The offline tail records release-history fetch, Honcho peer creation and
 optional new default-tool acquisition as not attempted.
 
+Completion publishes the verified private tool closure into the writable store.
+It reuses entries that already match the target pin and digest without replacing
+their bytes, timestamps or other metadata. Those resources remain part of the
+rollback preimage. Build and preflight staging still produce independent copies.
+
 The existing per-kind restart and abort-recovery algorithms remain; transient
 supervisor/process failures are real even without mixed-generation imports. Only
 the purge/reload workaround and independent retry/ZIP tail compositions disappear.

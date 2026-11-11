@@ -202,11 +202,17 @@ def verified_tools(names: Sequence[str], *, source_store: Path, target: str,
 
 
 def stage_tools(names: Sequence[str], *, source_store: Path, out: Path, target: str,
-                lock: Lockfile | None = None) -> Path:
-    """Copy a current, verified tool closure without acquisition or live selection.
+                lock: Lockfile | None = None, reuse_current: bool = False) -> Path:
+    """Publish a verified tool closure without acquisition.
 
     Writable stores are locked during verification and copying. A sealed source
     is immutable; the destination publication lock still covers each copy.
+    Staging defaults to independent copies: even a current destination entry is
+    fresh-copied, breaking hardlink aliases into the source or another caller's
+    tree. ``reuse_current=True`` — completion's live-store publication — instead
+    reuses a destination entry the lock still pins: the same current pin/digest
+    verification runs, then the realized entry stays byte- and metadata-identical
+    while noncurrent pins install from the source.
     """
     from contextlib import ExitStack, nullcontext
     from pm.install import _entry_verified, _install, _lockfile
@@ -244,9 +250,9 @@ def stage_tools(names: Sequence[str], *, source_store: Path, out: Path, target: 
         for package in packages:
             started = time.monotonic()
             _install(package, lock, staged, destination, target,
-                     copy_from=(facts, source), _lock_held=True, _fresh_copy=True)
-            # Copy plus re-digest of a large tree runs silently for minutes on Windows.
-            print(f"    copied {package.name} ({time.monotonic() - started:.1f}s)", flush=True)
+                     copy_from=(facts, source), _lock_held=True, _fresh_copy=not reuse_current)
+            # Publication can hash large trees silently for minutes on Windows.
+            print(f"    ready {package.name} ({time.monotonic() - started:.1f}s)", flush=True)
     return out
 
 
