@@ -173,6 +173,13 @@ def _get_enabled_plugins() -> Optional[set]:
         return None
 
 
+def is_skipped_plugin_dir(name: str) -> bool:
+    """True for directory names discovery never treats as plugins. Cache/dunder dirs (__pycache__,
+    __MACOSX__, …) can raise PermissionError when walked and take down every later tool call
+    (#86996); foreign-harness dirs hold another tool's manifest convention."""
+    return (name.startswith("__") and name.endswith("__")) or name in _FOREIGN_HARNESS_MANIFEST_DIRS
+
+
 def scan_directory(
     path: Path, source: str, *, skip_names: Optional[Set[str]] = None, prefix: str = "", depth: int = 0,
     strict: bool = False,
@@ -196,14 +203,8 @@ def scan_directory(
             logger.warning("Skipping unreadable plugin directory %s: %s", path, exc)
             return manifests
     for child in children:
-        # Cache/dunder dirs (__pycache__, __MACOSX__, …) are never
-        # plugins. Walking them can raise PermissionError and take
-        # down every subsequent tool call (#86996).
-        if child.name.startswith("__") and child.name.endswith("__"):
-            logger.debug("Skipping dunder plugin path %s", child)
-            continue
-        if child.name in _FOREIGN_HARNESS_MANIFEST_DIRS:
-            logger.debug("Skipping %s (foreign-harness manifest convention)", child)
+        if is_skipped_plugin_dir(child.name):
+            logger.debug("Skipping %s (dunder or foreign-harness manifest dir)", child)
             continue
         # pathlib.Path.is_dir() swallows OSError, but injected Path-likes
         # and test doubles can still raise. Fail closed per child.
@@ -282,7 +283,7 @@ def collect_directory_manifests(*, strict: bool = False, source_root: Path | Non
     repo_plugins = bundled_plugins_dir(source_root)
     logger.debug("Scanning bundled plugins: %s", repo_plugins)
     _scan("bundled (top-level)", repo_plugins, "bundled",
-          {"memory", "context_engine", "model-providers", "cron_providers", "computer_use"})
+          {"memory", "context_engine", "model-providers", "cron_providers", "computer_use", "config_backends"})
     user_dir = get_hermes_home() / "plugins"
     logger.debug("Scanning user plugins: %s", user_dir)
     _scan("user", user_dir, "user")

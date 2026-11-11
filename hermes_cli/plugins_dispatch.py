@@ -282,7 +282,8 @@ class PluginDispatchMixin:
         caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a string) to inject
         context into the API-bound user message, never the system prompt or clean transcript.
         The composed bytes persist in the session ``api_content`` sidecar and replay on later
-        turns, so plugins must treat injected context as session-lifetime data, not ephemeral.
+        turns, so plugins must treat injected context as session-lifetime data, not ephemeral;
+        ``{"action": "block", "message": "..."}`` ends the turn before any inference request.
         """
         from agent.safe_worker_policy import safe_worker_enabled
 

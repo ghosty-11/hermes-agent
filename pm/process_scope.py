@@ -68,6 +68,7 @@ def require_child_quiescence(status: Path, retained) -> None:
 
 def owned_spawn_kwargs() -> dict:
     """Only a child started with these options may be signalled as a group."""
+    # detached-spawn: ok — updater groups inherit writer claims; cleanup requires group exit and liveness EOF.
     return {"start_new_session": True}
 
 

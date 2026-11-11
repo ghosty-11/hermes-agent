@@ -20,6 +20,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.relay.egress import EGRESS_DECLINE_CODE
 from gateway.session import SessionSource, SessionStore
+from gateway.turn_context import TurnContext
 
 
 CHAT = "C1"
@@ -124,7 +125,7 @@ async def test_declined_destination_queued_edit_cannot_reenter_completion(tmp_pa
         runner._pop_post_delivery_callback = lambda *_args: None
         runner._should_send_voice_reply = lambda *_args, **_kwargs: False
         adapter.gateway_runner = runner
-        ctx = SimpleNamespace(
+        ctx = TurnContext(
             mute_notification_reply=False, session_key=SESSION_KEY, session_id=sid,
             source=_event().source, stream_consumer_holder=[consumer],
             _status_thread_metadata={}, event_message_id="inbound-1",

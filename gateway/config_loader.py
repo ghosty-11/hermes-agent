@@ -506,24 +506,25 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
 
 
 def read_yaml_layers(home: Path, *, strict: bool = False) -> dict:
-    """Read the user YAML and managed overlay; strict inspection rejects invalid metadata."""
-    config_yaml_path = home / "config.yaml"
+    """User ``config.yaml`` with the managed overlay applied — the YAML the gateway loader sees.
+
+    Raises on a malformed user file (the loader then falls back to env + gateway.json WITHOUT the
+    managed layer). An ABSENT user file is an empty layer, not a reason to skip the administrator's
+    values: a fleet host with no ``config.yaml`` must still honor them. Any pre-activation predicate
+    (``gateway.relay.relay_explicitly_disabled``) reads through here so it cannot disagree with
+    ``load_gateway_config()`` on which files count. ``strict=True`` (the native updater's passive
+    inspection) additionally refuses unreadable metadata — dangling links, wrong file types — and
+    a non-mapping document, instead of trusting whatever the read returns.
+    """
+    from hermes_cli.config_backend import config_exists, read_config_doc
+    from hermes_cli.config_paths import strict_file_present
+
+    config_path = Path(home) / "config.yaml"
     yaml_cfg: dict = {}
-    if strict:
-        from hermes_cli.config_paths import strict_file_present
-        if strict_file_present(config_yaml_path):
-            from utils import fast_safe_load
-            with open(config_yaml_path, encoding="utf-8-sig") as f:
-                yaml_cfg = fast_safe_load(f)
-            if yaml_cfg is None:
-                yaml_cfg = {}
-            if not isinstance(yaml_cfg, dict):
-                raise ValueError(f"gateway configuration is not a mapping: {config_yaml_path}")
-    elif config_yaml_path.exists():
-        # The installer seeds a large, mostly commented example.
-        from utils import fast_safe_load
-        with open(config_yaml_path, encoding="utf-8-sig") as f:
-            yaml_cfg = fast_safe_load(f) or {}
+    if strict_file_present(config_path) if strict else config_exists(config_path):
+        yaml_cfg = read_config_doc(config_path) or {}
+        if strict and not isinstance(yaml_cfg, dict):
+            raise ValueError(f"gateway configuration is not a mapping: {config_path}")
 
     from hermes_cli.config_primitives import _expand_env_vars
 
@@ -581,3 +582,14 @@ def load_yaml_layer(home: Path, gw_data: dict, *, strict: bool = False) -> None:
                             warned=warned, authored=authored, managed_extra=managed_extra,
                             entries=entries, strict=strict)
     bridge_core_env_settings(yaml_cfg, platforms_data)
+
+
+def load_gateway_config_file(gateway_config_file: str):
+    """``gateway --config <file>``: a ``GatewayConfig`` from an explicit local YAML file. Refused
+    when the config backend has no file tooling (Remote Config: config comes only from the plane)."""
+    import hermes_yaml as yaml
+    from gateway.config import GatewayConfig
+    from hermes_cli.config_backend import require_file_tooling
+    require_file_tooling("gateway --config <file>")
+    with open(gateway_config_file, encoding="utf-8-sig") as f:
+        return GatewayConfig.from_dict(yaml.safe_load(f) or {})

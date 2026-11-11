@@ -31,6 +31,7 @@ import pytest
 from gateway import delivery_ledger as dl
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.turn_context import TurnContext
 
 SESSION_KEY = "agent:main:telegram:dm:5230977008"
 TOPIC_SESSION_KEY = "agent:main:telegram:group:-1001:topic:7"
@@ -486,7 +487,7 @@ async def test_ambiguous_first_reply_is_durable_before_successful_recursive_foll
         runner._delivery_adapter_for = lambda source: adapter
         runner._refresh_agent_cache_message_count = AsyncMock()
         adapter.gateway_runner = runner
-        ctx = SimpleNamespace(
+        ctx = TurnContext(
             mute_notification_reply=False, session_key=SESSION_KEY, session_id=sid,
             source=_source(), stream_consumer_holder=[consumer],
             _status_thread_metadata={}, event_message_id=INBOUND_ID,
@@ -588,7 +589,7 @@ async def test_queued_raised_timeout_keeps_head_and_one_original_bracket_before_
         runner._pop_post_delivery_callback = lambda *_args: None
         runner._delivery_adapter_for = lambda source: adapter
         adapter.gateway_runner = runner
-        ctx = SimpleNamespace(
+        ctx = TurnContext(
             mute_notification_reply=False, session_key=SESSION_KEY, session_id=sid,
             source=_source(), stream_consumer_holder=[consumer],
             _status_thread_metadata={}, event_message_id=INBOUND_ID,

@@ -545,6 +545,10 @@ def test_external_secret_values_are_isolated_between_homes(tmp_path, monkeypatch
         str(home_b.resolve()): "value-b",
     }
 
+    # Registered for teardown restore, then removed: the loader publishes the source's write itself.
+    monkeypatch.setenv("SHARED_API_KEY", "unset")
+    monkeypatch.delenv("SHARED_API_KEY")
+
     class _TestSource(SecretSource):
         name = "test-source"
         label = "Test Source"
@@ -764,3 +768,67 @@ def test_home_scoped_reset_preserves_sibling_snapshot(tmp_path, monkeypatch, _fr
     assert env_loader.get_secret_source_values(home) == {}
     assert env_loader.get_secret_source_values(sibling) == {"GLM_API_KEY": "vault-b"}
     assert str(sibling.resolve()) in env_loader._APPLIED_HOMES
+
+
+class _RemoteDeclarationsBackend:
+    """A non-file config backend serving a home's declarations with no local config.yaml."""
+
+    name = "remote"
+
+    def __init__(self, home: Path, doc: dict):
+        self._home = home.resolve()
+        self._doc = doc
+
+    def exists(self, home):
+        return Path(home).resolve() == self._home
+
+    def read_user_doc(self, home):
+        if Path(home).resolve() != self._home:
+            raise FileNotFoundError(Path(home))
+        return self._doc
+
+    def read_user_doc_readonly(self, home):
+        return self.read_user_doc(home)
+
+    def version(self, home):
+        return ("remote-etag",)
+
+    def cache_version(self, home, version):
+        return version
+
+
+def test_authoritative_secret_values_refuse_remote_declarations_without_snapshot(
+    tmp_path, monkeypatch
+):
+    """Declared sources behind a non-file config backend with no in-process snapshot
+    refuse instead of answering empty: an empty answer would certify no credentials
+    for a home whose declarations this process never read."""
+    from hermes_cli import config_backend
+
+    home = tmp_path / "remote-home"
+    home.mkdir()  # deliberately no local config.yaml
+    backend = _RemoteDeclarationsBackend(home, {"secrets": {"onepassword": {"enabled": True}}})
+    monkeypatch.setattr(config_backend, "get_config_backend", lambda: backend)
+
+    with pytest.raises(RuntimeError, match="not authoritative"):
+        env_loader.get_authoritative_secret_source_values(home)
+
+
+def test_authoritative_secret_values_raise_on_dangling_local_config(tmp_path):
+    """A config.yaml symlink with no target is a broken profile, not an empty one:
+    the passive reader raises."""
+    home = tmp_path / "dangling"
+    home.mkdir()
+    (home / "config.yaml").symlink_to(home / "does-not-exist.yaml")
+
+    with pytest.raises(ValueError, match="no readable target"):
+        env_loader.get_authoritative_secret_source_values(home)
+
+
+def test_authoritative_secret_values_raise_on_wrong_type_local_config(tmp_path):
+    """A config.yaml directory is a corrupted profile: same refusal as a dangling link."""
+    home = tmp_path / "wrong-type"
+    (home / "config.yaml").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        env_loader.get_authoritative_secret_source_values(home)

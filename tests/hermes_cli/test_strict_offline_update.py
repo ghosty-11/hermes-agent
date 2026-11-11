@@ -402,20 +402,34 @@ def test_offline_maintenance_refuses_unrestored_corrupt_state(
         conn.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY, name TEXT)")
         conn.execute("INSERT INTO sessions (name) VALUES ('saved')")
     assert verify_sqlite_integrity(snapshot, check_header=True, run_pragma=True)["valid"]
-    state.write_bytes(b"\x00" * 4096)
+    # A corrupted live database whose schema page still opens: the guard flags it as
+    # corrupt while the restore still reaches its publication step (the pre-publication
+    # epoch floor can read the destination), so the failed copy below is what refuses
+    # the restore — a zeroed file is refused earlier at the epoch floor, before any copy.
+    with sqlite3.connect(state) as conn:
+        conn.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO sessions (name) VALUES ('broken')")
+    raw = state.read_bytes()
+    page_size = int.from_bytes(raw[16:18], "big")
+    page_size = 65536 if page_size == 1 else page_size
+    damaged = bytearray(raw)
+    damaged[page_size:] = b"\xde" * (len(damaged) - page_size)  # every page after the schema page
+    state.write_bytes(damaged)
     assert not verify_sqlite_integrity(state, check_header=True, run_pragma=True)["valid"]
     monkeypatch.setattr("hermes_cli.backup_restore._foreign_db_holder_pids", lambda path: [])
     monkeypatch.setattr("hermes_cli.model_catalog.seed_cache_from_checkout", lambda path: False)
     monkeypatch.setattr("hermes_cli.update_receipt.record_skip", lambda *args: None)
     if failure == "copy":
-        real_copy = update_cmd_maint.shutil.copy2
+        # The snapshot→state copy no longer lives in update_cmd_maint: restoration
+        # publishes through backup_restore._safe_restore_db, whose _restore_db_pages owns
+        # the copy (SQLite backup() page writes, unlink+move fallback). Fail that
+        # publication; the primary page-copy API is a static C method no test can patch.
+        from hermes_cli import backup_restore
 
-        def fail_state_copy(source, destination, *args, **kwargs):
-            if Path(source) == snapshot and Path(destination) == state:
-                raise OSError("snapshot copy failed")
-            return real_copy(source, destination, *args, **kwargs)
+        def fail_state_copy(source, destination):
+            raise OSError("snapshot copy failed")
 
-        monkeypatch.setattr(update_cmd_maint.shutil, "copy2", fail_state_copy)
+        monkeypatch.setattr(backup_restore, "_restore_db_pages", fail_state_copy)
     else:
         from hermes_cli.sqlite_safe_read import connect_tracked
 

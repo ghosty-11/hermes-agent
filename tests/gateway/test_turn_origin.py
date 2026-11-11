@@ -22,7 +22,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_turn import GatewayTurnMixin, _unexpected_silence_reply
+from gateway.session import SessionSource
+from gateway.config import Platform
+from gateway.turn_context import TurnContext
 from gateway.turn_origin import (
     RESPONSE_POLICY_DISCRETIONARY,
     RESPONSE_POLICY_REQUIRED,
@@ -93,7 +97,7 @@ class _NoOriginAdapter:
     pass
 
 
-class _Runner(GatewayTurnMixin):
+class _Runner(GatewayConfigLoadersMixin, GatewayTurnMixin):
     def __init__(self, adapter=None, session_entry=None):
         self._adapter = adapter
         self._session_entry = session_entry or SimpleNamespace(resume_pending=False)
@@ -111,7 +115,7 @@ class _Runner(GatewayTurnMixin):
 
 
 def _source():
-    return SimpleNamespace(chat_id="c1", platform=SimpleNamespace(value="discord"))
+    return SessionSource(platform=Platform.DISCORD, chat_id="c1")
 
 
 class TestGatewayOriginResolution:
@@ -257,9 +261,8 @@ class TestQueuedFirstResponseSilencePolicy:
     """The queued-first-response lane must use the completion path's two-lane silence
     gate: machinery display kind OR discretionary origin. A companion surface must not
     receive the silence-fallback sentence mid-chain (review finding)."""
-
     def _turn_ctx(self, origin):
-        return SimpleNamespace(
+        return TurnContext(
             mute_notification_reply=False, session_key="sk:queued", stream_consumer_holder=[None],
             persist_user_display_kind=None, turn_origin=origin, source=_source(), reply_expected=None,
             _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,

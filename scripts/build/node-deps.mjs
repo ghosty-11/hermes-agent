@@ -90,8 +90,9 @@ function runNpmCi(node, npm, args, { source, env }) {
   }
 }
 
-/** Install the full requested workspace union in one strict, locked operation. */
-export function prepareNodeDependencies({ source, workspaces, env = process.env, reuse = false, install = true, nativeToolchain, preparedSource = source }) {
+/** Install the full requested workspace union in one strict, locked operation.
+ *  ``electron: false`` leaves Desktop's Electron binary unprepared, for builds that never run it. */
+export function prepareNodeDependencies({ source, workspaces, env = process.env, reuse = false, install = true, nativeToolchain, preparedSource = source, electron = true }) {
   source = resolve(source)
   preparedSource = resolve(preparedSource)
   if (!Array.isArray(workspaces) || workspaces.length === 0) {
@@ -109,7 +110,7 @@ export function prepareNodeDependencies({ source, workspaces, env = process.env,
     }
     return path
   }))].sort()
-  const prepareElectron = selected.includes('apps/desktop')
+  const prepareElectron = electron && selected.includes('apps/desktop')
     && Boolean(JSON.parse(readFileSync(join(source, 'apps/desktop/package.json'), 'utf8')).devDependencies?.electron)
   const [node, npm] = npmCommand({ env })
   const npmVersion = npmManifestVersion(npm) ?? execFileSync(

@@ -18,6 +18,7 @@ the routes mechanism rescues one platform routed to one profile, the knob
 covers a deployment where the primary's adapters front every satellite.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -149,3 +150,45 @@ class TestSatelliteDeliveryViaPrimaryEnabled:
         as unset. Anything YAML resolves to a bool is honored as written."""
         satellite_home({"gateway": {"satellite_cron_delivery_via_primary": "yes"}})
         assert _satellite_delivery_via_primary_enabled() is True
+
+
+    def test_remote_primary_config_without_local_file_enables_satellite_delivery(
+        self, tmp_path, monkeypatch
+    ):
+        """The knob may live in the primary home's remote config layer with no local
+        config.yaml; the enablement read goes through the config backend."""
+        from hermes_cli import config_backend
+
+        root = tmp_path / "root"
+        satellite = root / "profiles" / "satellite"
+        satellite.mkdir(parents=True)
+        monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+
+        class _RemoteKnobBackend:
+            name = "remote"
+
+            def exists(self, home):
+                return Path(home) == root
+
+            def read_user_doc(self, home):
+                if Path(home) != root:
+                    raise FileNotFoundError(Path(home))
+                return {"gateway": {"multiplex_profiles": True,
+                                    "satellite_cron_delivery_via_primary": True}}
+
+            def read_user_doc_readonly(self, home):
+                return self.read_user_doc(home)
+
+            def version(self, home):
+                return ("remote-etag",)
+
+            def cache_version(self, home, version):
+                return version
+
+        monkeypatch.setattr(config_backend, "get_config_backend",
+                            lambda: _RemoteKnobBackend())
+        token = set_hermes_home_override(str(satellite))
+        try:
+            assert _satellite_delivery_via_primary_enabled() is True
+        finally:
+            reset_hermes_home_override(token)

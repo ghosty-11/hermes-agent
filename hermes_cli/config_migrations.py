@@ -8,6 +8,7 @@ step may only persist values that differ from the schema default (plus removals/
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import functools
 import logging
@@ -25,6 +26,18 @@ logger = logging.getLogger(__name__)
 #: untouched — the process continues with defaults deep-merged at read time, matching the
 #: non-fatal posture for unparseable configs — and a message tells the user how to proceed.
 SUPPORT_FLOOR_VERSION = 12
+
+#: True while :func:`run_migrations` runs with ``config_only=True``: the remote config backend's
+#: in-memory migrations (D12) and its write-validation simulation. Such a run transforms the config
+#: document and nothing else: steps that also touch local files (``.env``, profile ``SOUL.md``,
+#: ``logs/``) skip that part, so reading a profile's remote config, or a refused write's check, never
+#: changes a file on disk — a sibling profile's least of all.
+_CONFIG_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("config_migrations_config_only", default=False)
+
+
+def _local_files_allowed() -> bool:
+    """Whether the running step may change files other than the config document itself."""
+    return not _CONFIG_ONLY.get()
 
 
 def support_floor_message() -> str:
@@ -174,6 +187,8 @@ def _migrate_to_12(results: dict[str, Any], quiet: bool) -> None:
 def _migrate_to_13(results: dict[str, Any], quiet: bool) -> None:
     # 12 → 13: clear dead LLM_MODEL / OPENAI_MODEL from .env (written by the old setup wizard;
     # nothing reads them — config.yaml is the sole source of truth).
+    if not _local_files_allowed():
+        return  # .env only
     _c = _cfg()
     for dead_var in ("LLM_MODEL", "OPENAI_MODEL"):
         if _c.get_env_value(dead_var):
@@ -346,8 +361,9 @@ def _migrate_to_23(results: dict[str, Any], quiet: bool) -> None:
     _c = _cfg()
     DEFAULT_CONFIG = _c.DEFAULT_CONFIG
 
-    curator_dir = _c.get_hermes_home() / "logs" / "curator"
-    curator_dir.mkdir(parents=True, exist_ok=True)
+    if _local_files_allowed():
+        curator_dir = _c.get_hermes_home() / "logs" / "curator"
+        curator_dir.mkdir(parents=True, exist_ok=True)
 
     config = read_raw_config()
 
@@ -541,9 +557,15 @@ def _migrate_to_39(results: dict[str, Any], quiet: bool) -> None:
             "Video Generation (Nous Subscription or FAL).")
 
 
-def _migrate_to_41(results: Dict[str, Any], quiet: bool) -> None:
-    # Remove the legacy Bot Mode append only from live profiles; failed inspection
-    # must leave the version retryable through the migration dispatcher.
+def _migrate_to_41(results: dict[str, Any], quiet: bool) -> None:
+    # 40 → 41: drop the plugin-era "## Messaging other agents" append from SOUL.md. The
+    # server injects the live Bot Mode section in Bot Chat sessions; the frozen SOUL copy taxed
+    # every other session (~600 tok) and shadowed the live roster in Bot Chat itself.
+    # Downstream: only LIVE profiles are rewritten (a parked sibling's file is not ours to
+    # touch mid-run) and a failed inspection must leave the version retryable through the
+    # migration dispatcher.
+    if not _local_files_allowed():
+        return  # SOUL.md files only — a config-only pass never touches them
     import stat
     from hermes_constants import named_profile_is_live
     from hermes_cli.backup import _sibling_profile_homes
@@ -694,6 +716,8 @@ def _migrate_to_49(results: dict[str, Any], quiet: bool) -> None:
                 f"({DEFAULT_VERCEL_IMAGE})",
     )(results, quiet)
     _c = _cfg()
+    if not _local_files_allowed():
+        return  # the .env mirror is a local file
     if (_c.get_env_value_prefer_dotenv("TERMINAL_VERCEL_RUNTIME") or "").strip() == LEGACY_VERCEL_RUNTIME:
         _c.remove_env_value("TERMINAL_VERCEL_RUNTIME")
         if not quiet:
@@ -892,33 +916,43 @@ STAMP_INDEPENDENT_STEPS = frozenset({46, 50})
 
 
 def run_migrations(
-    current_ver: int, results: Dict[str, Any], quiet: bool, *,
-    unversioned: bool = False, strict: bool = False,
+    current_ver: int, results: dict[str, Any], quiet: bool, *,
+    unversioned: bool = False, strict: bool = False, config_only: bool = False,
 ) -> None:
     """Apply every registered migration whose target version exceeds *current_ver* (plus
     :data:`STAMP_INDEPENDENT_STEPS`); a config with no ``_config_version`` (*unversioned*) gets
     only :data:`LEGACY_KEY_STEPS`.
 
+    *current_ver* is the on-disk schema version captured ONCE before any step runs and does not
+    advance between steps — each step is gated on the same initial value.
+
+    *config_only* transforms the config document alone (see :data:`_CONFIG_ONLY`).
+
     Strict callers stop at the first failed step so the caller cannot stamp an
     incomplete migration as current. Online migration keeps warning and moving on.
     """
-    for target_ver, migration_fn in MIGRATIONS:
-        due = current_ver < target_ver or target_ver in STAMP_INDEPENDENT_STEPS
-        if due and (target_ver in LEGACY_KEY_STEPS or not unversioned):
-            try:
-                migration_fn(results, quiet)
-            except Exception as exc:
-                if strict:
-                    raise RuntimeError(f"config migration to v{target_ver} failed") from exc
-                results.setdefault("failed_steps", []).append(
-                    {"version": target_ver, "error": str(exc)}
-                )
-                # A malformed nested value in one step must not abort the rest of the
-                # ladder (config loading itself fails otherwise). Loud, not silent.
-                warning = f"config migration to v{target_ver} failed and was skipped: {exc}"
-                results.setdefault("warnings", []).append(warning)
-                # Quiet callers may discard results; the version remains retryable, and
-                # the warning remains visible in the log.
-                logger.warning("%s", warning)
-                if not quiet:
-                    print(f"  ⚠ {warning}")
+    token = _CONFIG_ONLY.set(config_only)
+    try:
+        for target_ver, migration_fn in MIGRATIONS:
+            due = current_ver < target_ver or target_ver in STAMP_INDEPENDENT_STEPS
+            if due and (target_ver in LEGACY_KEY_STEPS or not unversioned):
+                try:
+                    migration_fn(results, quiet)
+                except Exception as exc:
+                    if strict:
+                        raise RuntimeError(f"config migration to v{target_ver} failed") from exc
+                    results.setdefault("failed_steps", []).append(
+                        {"version": target_ver, "error": str(exc)}
+                    )
+                    # A malformed nested value in one step must not abort the rest of the
+                    # ladder (config loading itself fails otherwise). Loud, not silent.
+                    warning = f"config migration to v{target_ver} failed and was skipped: {exc}"
+                    results.setdefault("warnings", []).append(warning)
+                    # Quiet callers (profile creation, unattended update) discard ``results`` and
+                    # migrate_config still stamps the latest version, so without a log line the
+                    # skipped step vanishes for good.
+                    logger.warning("%s", warning)
+                    if not quiet:
+                        print(f"  ⚠ {warning}")
+    finally:
+        _CONFIG_ONLY.reset(token)

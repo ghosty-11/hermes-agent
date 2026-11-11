@@ -115,7 +115,8 @@ def apply_requested_tool_rebuild(agent: Any) -> bool:
     session routes on) if ``set_global_backend(apply_now=True)`` asked for this session, and pin both to the
     session row so a later fresh agent restores them. True when the tool list changed. Forks (background review, ``/btw``) and
     subagents share the session's key but never take its request."""
-    if getattr(agent, "_turn_origin", None) or getattr(agent, "_delegate_depth", 0):
+    origin = getattr(agent, "_turn_origin", None)
+    if (isinstance(origin, str) and origin) or getattr(agent, "_delegate_depth", 0):
         return False
     key = _current_session_key(agent)
     with _lock:

@@ -14,6 +14,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_turn import GatewayTurnMixin
 from gateway.session import SessionSource
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.turn_context import TurnContext
 from hermes_state import AsyncSessionDB, SessionDB
 from gateway.delivery_handoff import StreamDeliveryHandoff, delivery_handoff_from_receipt
 
@@ -393,7 +394,7 @@ async def test_queued_receipt_reaches_real_turn_record_without_replaying_prior_a
         result = {"final_response": "Hello", "response_previewed": True,
                   "turn_id": "queued", "messages": [
                       {"role": "assistant", "content": "Hello", "_row_id": row_id}]}
-        ctx = SimpleNamespace(
+        ctx = TurnContext(
             mute_notification_reply=False, session_key="agent:main:slack:channel:C1",
             session_id=session_id, stream_consumer_holder=[consumer], source=_event().source,
             _status_thread_metadata={}, event_message_id="inbound-1",
@@ -582,7 +583,7 @@ async def test_plain_queued_refusal_stays_owed_on_normal_reentry(tmp_path):
         adapter.gateway_runner = runner
         result = {"final_response": "Hello", "turn_id": "resolved", "messages": [
             {"role": "assistant", "content": "Hello", "_row_id": row_id}]}
-        ctx = SimpleNamespace(
+        ctx = TurnContext(
             mute_notification_reply=False, session_key="agent:main:slack:channel:C1",
             session_id=session_id, stream_consumer_holder=[None], source=_event().source,
             _status_thread_metadata={}, event_message_id="inbound-1",
@@ -654,7 +655,7 @@ async def test_first_queued_failure_keeps_one_bracket_on_early_return_and_reentr
         adapter.gateway_runner = runner
         result = {"final_response": "Hello", "turn_id": "first-queued",
                   "messages": [{"role": "assistant", "content": "Hello", "_row_id": row_id}]}
-        ctx = SimpleNamespace(
+        ctx = TurnContext(
             mute_notification_reply=False, session_key="agent:main:slack:channel:C1",
             session_id=sid, stream_consumer_holder=[consumer], source=_event().source,
             _status_thread_metadata={}, event_message_id="inbound-1",
@@ -1049,7 +1050,7 @@ async def test_queued_reconciliation_edit_accounts_for_carriage_before_fallback(
         adapter.gateway_runner = runner
         result = {"final_response": final, "turn_id": "queued-edit",
                   "messages": [{"role": "assistant", "content": final, "_row_id": row_id}]}
-        ctx = SimpleNamespace(
+        ctx = TurnContext(
             mute_notification_reply=False, session_key="agent:main:slack:channel:C1",
             session_id=sid, stream_consumer_holder=[consumer], source=_event().source,
             _status_thread_metadata={}, event_message_id="inbound-1",

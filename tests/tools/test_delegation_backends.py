@@ -267,6 +267,36 @@ def test_a_saved_switch_refuses_the_previous_backends_parameter_and_names_the_fi
         manager.unload()
 
 
+def test_gateway_origin_applies_switch_without_a_fork_consuming_it(tmp_path, monkeypatch):
+    from agent import delegation_backends
+    from tools.registry import registry
+
+    _, manager = _home(tmp_path, monkeypatch, {"backend": "default",
+                                              "backends": {"probe-options": {"options": OPTIONS}}})
+    monkeypatch.setattr(delegation_backends, "_rebuild_requests", set())
+    monkeypatch.setattr(delegation_backends, "_current_session_key", lambda agent: agent.session_id)
+    parent = _parent("chat-switch")
+    parent.tools = registry.get_definitions({"delegate_task"})
+
+    def rebuild(agent, **_kwargs):
+        agent.tools = registry.get_definitions({"delegate_task"})
+
+    monkeypatch.setattr("tools.mcp_tool_agent.refresh_agent_mcp_tools", rebuild)
+    try:
+        assert "option" not in _task_props(parent.tools[0]["function"])
+        delegation_backends.set_global_backend("probe-options", session_key="chat-switch", apply_now=True)
+        parent._turn_origin = "background_review"
+        assert delegation_backends.apply_requested_tool_rebuild(parent) is False
+        assert "option" not in _task_props(parent.tools[0]["function"])
+
+        parent._turn_origin = {"event_id": "turn-2", "kind": "direct", "response_policy": "required"}
+        assert delegation_backends.apply_requested_tool_rebuild(parent) is True
+        assert _task_props(parent.tools[0]["function"])["option"]["enum"] == ["fast", "deep", "refused"]
+        assert delegation_backends.apply_requested_tool_rebuild(parent) is False
+    finally:
+        manager.unload()
+
+
 def test_a_global_backend_switch_is_refused_on_a_managed_install(tmp_path, monkeypatch):
     """Like every other config writer: a package-manager-managed install's config.yaml is never written."""
     home, manager = _home(tmp_path, monkeypatch, {"backend": "probe-options"})

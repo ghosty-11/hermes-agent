@@ -59,7 +59,7 @@ behavior-affecting hooks:
 
 | Hook | Return behavior |
 | --- | --- |
-| `pre_llm_call` | May return a string or `{"context": "..."}` to inject context into the API-bound current user message. The composed bytes persist in the session's `api_content` sidecar and replay on later turns; clean transcript content remains unchanged. |
+| `pre_llm_call` | May return a string or `{"context": "..."}` to inject context into the API-bound current user message: the composed bytes persist in the session's `api_content` sidecar and replay on later turns, while the clean transcript content remains unchanged. May instead return `{"ephemeral_context": "..."}` for private per-turn context that rides only the wire copy of the current user message and is never persisted, exported, or summarized. May return `{"action": "block", "message": "..."}` to end the turn before any inference request (the message becomes the reply and the prompt is stored as a withheld placeholder; see [Event Hooks](../user-guide/features/hooks.md)). A callback that raises or times out is skipped, so it never blocks. |
 | `pre_tool_call` | May return `{"action": "block", "message": "..."}` to block a tool before execution, or `{"action": "modify", "args": {...}}` to transform the tool's input arguments. |
 | `transform_tool_result` | May return a replacement tool result string after `post_tool_call`. |
 | `transform_llm_output` | May return a replacement final assistant text string. |
@@ -119,7 +119,12 @@ These hooks frame the user turn, not individual provider API attempts:
 
 Common `pre_llm_call` fields include `session_id`, `turn_id`,
 `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`,
-and `sender_id`.
+`sender_id`, and `turn_origin`.
+
+`turn_origin` is `None` or a validated server-created mapping with `event_id`,
+`kind`, and `response_policy`. It is never parsed from user message text. This
+mapping does not mark a background fork: bot-chain limits and pending chat-tool
+rebuild requests still apply.
 
 Common `post_llm_call` fields include `session_id`, `turn_id`,
 `user_message`, `assistant_response`, `conversation_history`, `model`, and

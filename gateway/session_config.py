@@ -81,6 +81,7 @@ async def config_get(connection, ref, params):
     def read():
         from gateway.run import _profile_runtime_scope
         from hermes_cli.config import load_config
+        from hermes_cli.config_backend import config_version_or_none, version_token
         from hermes_cli.config_effective import load_user_config_effective
         from hermes_constants import DEFAULT_INDICATOR_STYLE
         from tools.approval_context import _get_approval_mode
@@ -92,12 +93,13 @@ async def config_get(connection, ref, params):
                 # The user's own settings, not DEFAULT_CONFIG: clients read an absent key as their
                 # own default (the TUI streams unless display.streaming is explicitly false).
                 'full': lambda: {'config': _client_config(load_user_config_effective(home / 'config.yaml'))},
-                'mtime': lambda: {'mtime': (home / 'config.yaml').stat().st_mtime
-                                 if (home / 'config.yaml').exists() else 0,
+                'mtime': lambda: {'mtime': version_token(config_version_or_none(home / 'config.yaml')),
                                  # Frozen tool policy is not a live MCP reload request.
                                  'mcp_rev': mcp_revision(policy, cfg)},
                 'reasoning': lambda: _reasoning(agent, policy, cfg, connection, ref),
                 'fast': lambda: _fast(connection, ref, policy, agent, cfg),
+                'service_tier': lambda: _service_tier(connection, ref, policy),
+                'daybreak': lambda: {'value': (cfg.get('agent') or {}).get('daybreak') is True},
                 'skin': lambda: {'value': display.get('skin', 'default')},
                 'theme': lambda: {'value': display.get('tui_theme', 'auto')},
                 'indicator': lambda: {'value': display.get('tui_status_indicator', DEFAULT_INDICATOR_STYLE)},
@@ -184,6 +186,15 @@ def _fast(connection, ref, policy, agent, cfg):
     else:
         tier = getattr(agent, 'service_tier', None) or parse_service_tier(cfg.get('agent', {}).get('service_tier'))
     return {'value': {'priority': 'fast', 'ultrafast': 'ultrafast'}.get(tier, 'normal')}
+
+
+def _service_tier(connection, ref, policy):
+    from agent.fast_mode import service_tier_word
+    from gateway.session_tui_config import current_tier, service_tier_options
+    if not ref.session_id:
+        raise RuntimeStoreError('invalid_params')
+    return {'value': service_tier_word(current_tier(connection, ref, policy)),
+            'options': service_tier_options(connection, ref, policy)}
 
 
 def _reasoning(agent, policy, cfg, connection=None, ref=None):

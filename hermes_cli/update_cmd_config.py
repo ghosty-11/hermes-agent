@@ -62,7 +62,7 @@ def _migrate_sibling_profile_configs(notes: dict[str, list[str]] | None = None, 
                 from hermes_cli.config_paths import strict_file_present
                 if not strict_file_present(config_path):
                     continue
-            elif not config_path.is_file():
+            elif not config_path.is_file():  # config-reader: ok — profile directory discovery marker
                 continue
             token = set_hermes_home_override(profile_home)
             try:

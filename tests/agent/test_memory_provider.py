@@ -237,7 +237,7 @@ class TestMemoryManager:
 
         # Exercise the independent plugin-hook consumer, not just the spill helper.
         monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *a, **kw: [{"context": text}])
-        result = _collect_pre_llm_call_context(
+        result, _ephemeral = _collect_pre_llm_call_context(
             SimpleNamespace(session_id="hook", model="test"), effective_task_id="task",
             turn_id="turn", original_user_message="recall", messages=[], conversation_history=[],
         )
