@@ -57,7 +57,7 @@ def test_restore_refuses_live_authority_without_changing_data(tmp_path):
             import hashlib
             bundle = [Path(str(home / 'state.db') + suffix) for suffix in ('', '-wal', '-shm')]
             hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in bundle if p.exists()}
-            restored = _restore_state_db_from_snapshot(home / 'state.db', home / 'state-snapshots' / snapshot / 'state.db')
+            restored = _restore_state_db_from_snapshot(home / 'state.db', home / 'state-snapshots' / snapshot / 'state.db', home=home)
             assert hashes == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in bundle if p.exists()}
             after = rows()
             print(json.dumps({'live_restore': restored, 'before': before, 'after': after}), flush=True)
@@ -69,7 +69,7 @@ def test_restore_refuses_live_authority_without_changing_data(tmp_path):
             snapshot = asyncio.run(exercise(desc))
             old_epoch = desc['authority_epoch']
         peer.release.set()
-        assert _restore_state_db_from_snapshot(home / 'state.db', home / 'state-snapshots' / snapshot / 'state.db')
+        assert _restore_state_db_from_snapshot(home / 'state.db', home / 'state-snapshots' / snapshot / 'state.db', home=home)
         assert rows() == [('warm', 'terminal')]
         with daemon(root, home, env, barrier=False) as (_, restarted):
             assert restarted['instance_id'] != desc['instance_id']
@@ -77,7 +77,7 @@ def test_restore_refuses_live_authority_without_changing_data(tmp_path):
             assert rows() == [('warm', 'terminal')]
             later_epoch = restarted['authority_epoch']
         # Restoring the same older snapshot must not reuse a previous owner's epoch.
-        assert _restore_state_db_from_snapshot(home / 'state.db', home / 'state-snapshots' / snapshot / 'state.db')
+        assert _restore_state_db_from_snapshot(home / 'state.db', home / 'state-snapshots' / snapshot / 'state.db', home=home)
         with daemon(root, home, env, barrier=False) as (_, restored_again):
             assert restored_again['authority_epoch'] > later_epoch
             print(json.dumps({'offline_restore_restart_epochs': [old_epoch, later_epoch, restored_again['authority_epoch']],
@@ -143,7 +143,7 @@ def test_update_restore_excludes_startup_until_publication(tmp_path, monkeypatch
     owner.reserve([home])
     try:
         assert not (home / 'gateway.pid').exists()
-        assert not _restore_state_db_from_snapshot(destination, source)
+        assert not _restore_state_db_from_snapshot(destination, source, home=home)
         assert (destination.read_bytes(), source.read_bytes()) == before
     finally:
         owner.close()
@@ -158,7 +158,7 @@ def test_update_restore_excludes_startup_until_publication(tmp_path, monkeypatch
         return publish(*args)
     monkeypatch.setattr(backup_restore, '_restore_db_pages', barrier)
     results = []
-    thread = threading.Thread(target=lambda: results.append(_restore_state_db_from_snapshot(destination, source)))
+    thread = threading.Thread(target=lambda: results.append(_restore_state_db_from_snapshot(destination, source, home=home)))
     thread.start()
     try:
         assert arrived.wait(20)

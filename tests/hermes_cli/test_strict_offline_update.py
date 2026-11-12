@@ -22,6 +22,13 @@ def homes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(root))
     return root, sibling
 
+@pytest.fixture(autouse=True)
+def _pristine_sibling_snapshots(monkeypatch):
+    """Each migration test owns its snapshot context."""
+    from hermes_cli import update_cmd_config
+
+    monkeypatch.setattr(update_cmd_config, "_LAST_SIBLING_SNAPSHOTS", {})
+
 
 def _config(home, **fields):
     from hermes_cli.config import DEFAULT_CONFIG
@@ -2811,7 +2818,10 @@ def test_selected_site_listing_failure_refuses_instead_of_empty_inventory(
         real_scandir = os.scandir
 
         def listing(path):
-            if Path(path) == site:
+            # Fault-inject only the intended site listing; os.scandir also
+            # accepts integer directory fds (teardown scans them), which are
+            # not paths and must reach the real scandir unchanged.
+            if isinstance(path, (str, os.PathLike)) and Path(path) == site:
                 raise PermissionError("selected distributions listing denied")
             return real_scandir(path)
 

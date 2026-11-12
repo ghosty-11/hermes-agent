@@ -1593,6 +1593,46 @@ class TestQuickSnapshot:
             f"(expected 1); the extra row 's2' should have been reverted."
         )
 
+    def test_nested_sqlite_restore_keeps_inode_without_runtime_home_locks(self, hermes_home):
+        """A nested snapshot database restores under the home's authority only.
+
+        The quick-snapshot set includes ``cron/executions.db`` — a SQLite
+        database whose directory is data inside the home, not a runtime home.
+        Restoring it must page-restore into the live inode and must not leave a
+        ``gateway.lock`` beside the database: strict post-restore comparisons
+        treat such a lock as drift, which is how a rollback rehearsal failed
+        with ``gateway.lock`` files inside every snapshot directory.
+        """
+        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
+
+        executions = hermes_home / "cron" / "executions.db"
+        conn = sqlite3.connect(str(executions))
+        conn.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO runs (note) VALUES ('snapshot-era')")
+        conn.commit()
+        conn.close()
+        inode = executions.stat().st_ino
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        assert (hermes_home / "state-snapshots" / snap_id / "cron" / "executions.db").is_file()
+
+        live = sqlite3.connect(str(executions))
+        live.execute("INSERT INTO runs (note) VALUES ('post-snapshot')")
+        live.commit()
+        live.close()
+
+        assert restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+
+        assert executions.stat().st_ino == inode
+        after = sqlite3.connect(str(executions))
+        try:
+            assert after.execute("SELECT note FROM runs ORDER BY id").fetchall() == [
+                ("snapshot-era",)
+            ]
+        finally:
+            after.close()
+        assert not (hermes_home / "cron" / "gateway.lock").exists()
+
 
 
 
@@ -1983,6 +2023,9 @@ class TestRunPreUpdateBackup:
 
     @pytest.fixture
     def hermes_home(self, tmp_path, monkeypatch):
+        from hermes_cli import update_cmd_config
+
+        monkeypatch.setattr(update_cmd_config, "_LAST_SIBLING_SNAPSHOTS", {})
         root = tmp_path / ".hermes"
         root.mkdir()
         _make_hermes_tree(root)
@@ -2579,6 +2622,17 @@ class TestImportHonorsHermesHomeOverride:
 
         assert get_hermes_home() == profile
 
+        # Keep the post-import gateway-revival probe inside this test's root:
+        # it stats the platform default home for existing-install markers, and
+        # the sandbox guard correctly refuses reads of the real user home.
+        native_default = tmp_path / "native-default"
+        native_default.mkdir()
+        (native_default / "config.yaml").write_text("model:\n  provider: openai\n")
+        monkeypatch.setattr(
+            "hermes_cli.backup._get_platform_default_hermes_home",
+            lambda: native_default,
+        )
+
         zip_path = self._make_backup_zip(tmp_path)
 
         import argparse
@@ -2757,7 +2811,7 @@ class TestImportLiveSessionDatabase:
         import hermes_cli.backup_restore as backup_restore_mod
 
         _home, live_db, zip_path = self._prepare(tmp_path, monkeypatch)
-        monkeypatch.setattr(backup_restore_mod, "_safe_restore_db", lambda src, dst: False)
+        monkeypatch.setattr(backup_restore_mod, "_safe_restore_db", lambda src, dst, *, maintenance_homes: False)
 
         assert backup_mod.run_import(Namespace(zipfile=str(zip_path), force=True)) == 1
 

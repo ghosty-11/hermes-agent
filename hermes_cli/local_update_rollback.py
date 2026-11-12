@@ -1366,7 +1366,10 @@ def _restore_record(record: dict, capsule: Path, homes: list[Path], install: Pat
             src = capsule / record["id"] / item["object"]
             if item["kind"] == "db":
                 from hermes_cli.backup_restore import _safe_restore_db
-                if not _safe_restore_db(src, dest):
+                # The capsule's validated homes are the runtime authorities; a
+                # database's own directory is not, and reserving it would seed
+                # gateway.lock files the strict postimage comparison rejects.
+                if not _safe_restore_db(src, dest, maintenance_homes=homes):
                     raise RuntimeError(f"SQLite restore refused: {dest}")
             elif item.get("hardlink_group") not in (None, name):
                 aliases.append((name, item["hardlink_group"]))

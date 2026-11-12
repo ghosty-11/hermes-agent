@@ -63,7 +63,7 @@ def test_import_refuses_to_publish_over_a_deleted_but_held_database(tmp_path):
 
         with zipfile.ZipFile(archive) as zf:
             with pytest.raises(OSError) as excinfo:
-                backup_mod._import_db_member(zf, _MEMBER, target)
+                backup_mod._import_db_member(zf, _MEMBER, target, maintenance_homes=[tmp_path])
 
         assert str(holder.pid) in str(excinfo.value)
         assert not target.exists(), "a new inode was published under a live holder"
@@ -74,7 +74,7 @@ def test_import_refuses_to_publish_over_a_deleted_but_held_database(tmp_path):
 
     # No holder left: the ordinary atomic publish still applies.
     with zipfile.ZipFile(archive) as zf:
-        backup_mod._import_db_member(zf, _MEMBER, target)
+        backup_mod._import_db_member(zf, _MEMBER, target, maintenance_homes=[tmp_path])
     conn = sqlite3.connect(str(target))
     try:
         assert conn.execute("SELECT v FROM t").fetchone()[0] == "from-archive"

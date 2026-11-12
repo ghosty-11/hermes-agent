@@ -18,7 +18,7 @@ import tempfile
 import zipfile
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Collection, List, Optional, Tuple
 
 from hermes_state_holders import read_only_db_uri
 from hermes_cli.backup_sqlite import _safe_copy_db
@@ -157,8 +157,12 @@ def _restore_auth_json(src: Path, dst: Path) -> bool:
         return False
 
 
-def _safe_restore_db(src: Path, dst: Path) -> bool:
-    """Restore only while holding the destination authority's maintenance reservation.
+def _safe_restore_db(src: Path, dst: Path, *, maintenance_homes: Collection[Path]) -> bool:
+    """Restore pages under caller-identified runtime-home reservations.
+
+    Database location does not establish runtime ownership. Callers provide the
+    validated homes; native maintenance canonicalizes them and reuses nested
+    reservations. An empty authority collection raises ``ValueError``.
 
     Returns ``False``, without touching *dst*, when *src* fails the SQLite
     integrity check, when the runtime owns the profile, or when a canonical
@@ -166,6 +170,10 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     """
     from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
     from hermes_cli.backup import verify_sqlite_integrity
+
+    homes = list(maintenance_homes)
+    if not homes:
+        raise ValueError("_safe_restore_db requires a nonempty maintenance_homes collection")
 
     # backup() copies pages without validating their contents; its fallback
     # copies bytes even when SQLite rejected the source. Neither may touch the
@@ -175,7 +183,7 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
         logger.error("Refusing SQLite restore from %s: %s", src, source_check["message"])
         return False
     try:
-        with exclusive_maintenance([dst.absolute().parent, dst.resolve().parent]):
+        with exclusive_maintenance(homes):
             with _restore_epoch_source(src, dst) as prepared:
                 return _restore_db_pages(prepared, dst)
     except (OwnershipConflict, OSError, sqlite3.Error) as exc:
@@ -568,11 +576,18 @@ def _import_db_member(
     member: str,
     target: Path,
     new_file_mode: Optional[int] = None,
+    *,
+    maintenance_homes: Collection[Path],
 ) -> None:
     from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
+    homes = list(maintenance_homes)
+    if not homes:
+        # Missing-target publication below must stay inside a reservation too;
+        # an empty authority set would publish under no one's exclusion.
+        raise ValueError("_import_db_member requires a nonempty maintenance_homes collection")
     try:
-        with exclusive_maintenance([target.absolute().parent, target.resolve().parent]):
-            _import_db_member_exclusive(zf, member, target, new_file_mode)
+        with exclusive_maintenance(homes):
+            _import_db_member_exclusive(zf, member, target, new_file_mode, maintenance_homes=homes)
     except OwnershipConflict as exc:
         raise OSError(str(exc)) from exc
 
@@ -582,6 +597,8 @@ def _import_db_member_exclusive(
     member: str,
     target: Path,
     new_file_mode: Optional[int] = None,
+    *,
+    maintenance_homes: Collection[Path],
 ) -> None:
     """Publish a SQLite ``.db`` member onto *target* without replacing its inode.
 
@@ -634,7 +651,7 @@ def _import_db_member_exclusive(
                 shutil.copyfileobj(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
-        if not _safe_restore_db(Path(tmp_name), target):
+        if not _safe_restore_db(Path(tmp_name), target, maintenance_homes=maintenance_homes):
             from hermes_cli.backup import verify_sqlite_integrity
 
             # Re-check only on failure so the user gets the real cause; the

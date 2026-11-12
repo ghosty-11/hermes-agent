@@ -104,6 +104,24 @@ re-imaged before success. Capture probes links from the canonical parent into
 every member's parent. Exclusive private probe directories protect existing files,
 and cleanup restores directory metadata.
 
+## SQLite restore authority
+
+Guarded SQLite restoration reserves the operation's real runtime homes, supplied
+explicitly as `maintenance_homes`: the capsule's validated homes, the restoring
+home, or an import's invoking home and affected `profiles/<name>` homes.
+Import discovers those homes with the same archive-path normalization used for
+publication, including backslash separators, before writing any member.
+A database's containing directory does not establish runtime ownership.
+Nested snapshot, cron and memory databases are data inside those homes.
+Reserving their directories creates `gateway.lock` files beside user data;
+six such snapshot locks caused strict restored-home verification to fail in a
+local-update rollback rehearsal.
+
+Restoration preserves SQLite page-copy integrity checks, epoch floors, holder
+detection and database inodes. An empty authority collection raises `ValueError`
+before any reservation or destination mutation. External import members retain
+their separate publication route.
+
 ## Interrupted local completion
 
 Local completion keeps its receipt open until the parent proves quiescence and

@@ -1,11 +1,14 @@
 """Maintenance must not replace the database behind a live authority."""
 import asyncio
+from contextlib import closing
 from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import sqlite3
 import threading
+
+import pytest
 
 from tests.gateway.fixtures.local_recovery_probe import Model, daemon, rpc, websocket
 from tests.waiting import async_wait_until
@@ -168,9 +171,109 @@ def test_import_and_startup_exclude_each_other_before_publication(tmp_path, monk
     # Unrelated SQLite stores have no authority epoch; retain corruption restore.
     damaged = home / 'projects.db'
     damaged.write_bytes(b'not a SQLite database')
-    assert backup._safe_restore_db(tmp_path / 'donor.db', damaged)
+    assert backup._safe_restore_db(tmp_path / 'donor.db', damaged, maintenance_homes=[home])
     with sqlite3.connect(damaged) as db:
         assert db.execute('SELECT value FROM marker').fetchall() == [('restored',)]
+
+
+def test_import_of_nested_sqlite_publishes_without_stray_runtime_home_locks(tmp_path):
+    import zipfile
+    from hermes_cli import backup
+
+    home = tmp_path / 'state'
+    home.mkdir(mode=0o700)
+    archive = tmp_path / 'restore.zip'
+    donor = tmp_path / 'donor.db'
+    with sqlite3.connect(donor) as db:
+        db.execute('CREATE TABLE marker(value TEXT)')
+        db.execute("INSERT INTO marker VALUES('from-archive')")
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.writestr('config.yaml', 'gateway: {multiplex_profiles: false}\n')
+        zf.write(donor, 'cron/executions.db')
+    executions = home / 'cron' / 'executions.db'
+    executions.parent.mkdir(parents=True)
+    with sqlite3.connect(executions) as db:
+        db.execute('CREATE TABLE marker(value TEXT)')
+        db.execute("INSERT INTO marker VALUES('live')")
+    inode = executions.stat().st_ino
+
+    with zipfile.ZipFile(archive) as zf:
+        restored, restored_external, errors, skipped_runtime, db_shrunk = backup._import_members(
+            zf, zf.namelist(), '', home, 2)
+
+    assert (restored, restored_external, errors, skipped_runtime, db_shrunk) == (2, 0, [], [], [])
+    # The nested live database keeps its inode and converges on the archive rows.
+    assert executions.stat().st_ino == inode
+    with sqlite3.connect(executions) as db:
+        assert db.execute('SELECT value FROM marker').fetchall() == [('from-archive',)]
+    # A nested database's directory is data inside the home, not a runtime
+    # home: importing it must not mint a gateway.lock beside it.
+    assert not (home / 'cron' / 'gateway.lock').exists()
+
+
+@pytest.mark.parametrize("separator", ["/", "\\"])
+def test_running_sibling_profile_refuses_whole_import_before_publication(tmp_path, separator):
+    import zipfile
+    from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership
+    from hermes_cli import backup
+
+    home = tmp_path / 'state'
+    home.mkdir(mode=0o700)
+    sibling = home / 'profiles' / 'work'
+    sibling.mkdir(parents=True)
+    live_db = sibling / "state.db"
+    image_db = tmp_path / "profile-image.db"
+    for path, value in ((live_db, "live"), (image_db, "archived")):
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+            connection.execute("INSERT INTO marker VALUES (?)", (value,))
+    archive = tmp_path / 'restore.zip'
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.writestr('config.yaml', 'gateway: {multiplex_profiles: false}\n')
+        zf.writestr(separator.join(("profiles", "work", "config.yaml")),
+                    'gateway: {multiplex_profiles: false}\n')
+        zf.write(image_db, separator.join(("profiles", "work", "state.db")))
+
+    # The affected profile's real gateway.lock, held through a real flock —
+    # the same hold a running sibling gateway has on its home.
+    owner = ProfileOwnership()
+    owner.reserve([sibling])
+    refused = False
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            try:
+                backup._import_members(zf, zf.namelist(), '', home, 3)
+            except OwnershipConflict:
+                refused = True
+        with closing(sqlite3.connect(live_db)) as connection:
+            assert connection.execute("SELECT value FROM marker").fetchall() == [("live",)]
+        assert refused, "affected profile ownership must refuse before any publication"
+        # All-or-nothing: not even the untouched root files were published.
+        assert not (home / 'config.yaml').exists()
+        assert not (home / 'state.db').exists()
+        assert not (sibling / 'config.yaml').exists()
+    finally:
+        owner.close()
+
+
+def test_safe_restore_db_requires_explicit_maintenance_homes(tmp_path):
+    import pytest
+    from hermes_cli import backup
+
+    dst = tmp_path / 'projects.db'
+    src = tmp_path / 'snap.db'
+    for path, value in ((src, 'snapshot'), (dst, 'live')):
+        with sqlite3.connect(path) as db:
+            db.execute('CREATE TABLE marker(value TEXT)')
+            db.execute('INSERT INTO marker VALUES(?)', (value,))
+    before = dst.read_bytes()
+
+    # An empty authority set is a caller bug: refused before any reservation
+    # or destination mutation, without minting a lock anywhere.
+    with pytest.raises(ValueError):
+        backup._safe_restore_db(src, dst, maintenance_homes=[])
+    assert dst.read_bytes() == before
+    assert not (tmp_path / 'gateway.lock').exists()
 
 
 def test_recovery_output_exemption_excludes_canonical_activation(tmp_path):

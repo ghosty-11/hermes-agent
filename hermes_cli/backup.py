@@ -15,7 +15,7 @@ import zlib
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home,
@@ -915,8 +915,15 @@ def run_import(args) -> Optional[int]:
 
 def _import_members(
     zf: zipfile.ZipFile, members: list[str], prefix: str, hermes_root: Path, file_count: int
-) -> tuple[int, int, list[str], list[str], list[tuple[str, tuple[int, int], tuple[int, int]]]]:
-    """Reserve all affected profiles before publishing even the first config file."""
+) -> tuple[int, int, list[str], list[tuple[str, tuple[int, int], tuple[int, int]]]]:
+    """Reserve all affected profiles before publishing even the first config file.
+
+    The authority set is the invoking home plus every ``profiles/<name>`` home
+    the validated archive members actually address.  A ``.db`` member's parent
+    directory is deliberately absent: a nested database lives *inside* a home,
+    and reserving its directory would mint ``gateway.lock`` files beside user
+    data instead of at runtime homes.
+    """
     from gateway.runtime_ownership import exclusive_maintenance
     root_res = hermes_root.resolve()
     homes = {hermes_root}
@@ -924,16 +931,17 @@ def _import_members(
         if member.startswith(_EXTERNAL_PREFIX):
             continue  # restored under $HOME, outside every runtime authority
         rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
-        parts = Path(rel).parts
+        try:
+            parts = tuple(normalize_archive_parts(rel))
+        except ValueError:
+            continue  # publication reports the invalid member without writing it
         if len(parts) >= 3 and parts[0] == "profiles":
             home = hermes_root / parts[0] / parts[1]
             if home.resolve().is_relative_to(root_res):
                 homes.add(home)
-        target = hermes_root / rel
-        if target.suffix == ".db" and target.resolve().is_relative_to(root_res):
-            homes.update([target.absolute().parent, target.resolve().parent])
     with exclusive_maintenance(homes):
-        return _import_members_exclusive(zf, members, prefix, hermes_root, file_count)
+        return _import_members_exclusive(
+            zf, members, prefix, hermes_root, file_count, maintenance_homes=homes)
 
 
 def _import_external_member(
@@ -964,7 +972,8 @@ def _import_external_member(
 
 
 def _import_members_exclusive(
-    zf: zipfile.ZipFile, members: list[str], prefix: str, hermes_root: Path, file_count: int
+    zf: zipfile.ZipFile, members: list[str], prefix: str, hermes_root: Path, file_count: int,
+    *, maintenance_homes: Collection[Path],
 ) -> tuple[int, int, list[str], list[str], list[tuple[str, tuple[int, int], tuple[int, int]]]]:
     """Publish every member; return ``(restored, restored_external, errors, skipped_runtime, db_shrunk)``.
 
@@ -1051,7 +1060,7 @@ def _import_members_exclusive(
                 # Count before the write: afterwards the rows this import
                 # drops are gone and there is nothing left to compare.
                 before = _count_session_rows(target)
-                _import_db_member(zf, member, target, new_file_mode)
+                _import_db_member(zf, member, target, new_file_mode, maintenance_homes=maintenance_homes)
                 after = _count_session_rows(target)
                 if before and after and after[1] < before[1]:
                     db_shrunk.append((rel, before, after))
@@ -1566,15 +1575,20 @@ def _snapshot_epochs_restorable(files, entry_paths) -> bool:
     return True
 
 
-def _restore_snapshot_entry(rel: str, src: Path, dst: Path) -> bool:
-    """Publish one quick-snapshot file over ``dst``; False (logged) when refused or failed."""
+def _restore_snapshot_entry(rel: str, src: Path, dst: Path, *, home: Path) -> bool:
+    """Publish one quick-snapshot file over ``dst``; False (logged) when refused or failed.
+
+    *home* is the runtime home being restored; a database destination inside
+    it is published under that home's maintenance reservation, never under the
+    database's own directory.
+    """
     try:
         if dst.suffix == ".db":
             # Restore through SQLite backup API so live connections
             # (gateway, dashboard, another CLI session) see the
             # restored data instead of continuing to serve stale
             # cached pages from a replaced inode (issue #65942).
-            if not _safe_restore_db(src, dst):
+            if not _safe_restore_db(src, dst, maintenance_homes=[home]):
                 # Refused, failed, or source failed its integrity check:
                 # dst left as it was. Count as a failure, not a restore.
                 logger.error("Failed to restore %s: refused or source integrity check failed (see previous log)", rel)
@@ -1617,7 +1631,6 @@ def quick_snapshot_dir(snapshot_id: str, hermes_home: Optional[Path] = None) -> 
 
 def _restore_quick_snapshot_exclusive(snapshot_id: str, home: Path) -> bool:
     """Restore state from a quick snapshot while ``home`` is reserved."""
-    from gateway.runtime_ownership import exclusive_maintenance
     snap_dir = quick_snapshot_dir(snapshot_id, home)
     if snap_dir is None:
         return False
@@ -1639,38 +1652,36 @@ def _restore_quick_snapshot_exclusive(snapshot_id: str, home: Path) -> bool:
                 return None
         return src, dst
 
-    homes = {home}
+    # The caller holds exclusive_maintenance([home]); nested same-thread reuse
+    # carries that reservation into each _safe_restore_db below. Only the home
+    # is a runtime authority: a nested database's directory is not, and reserving
+    # it would leave gateway.lock files beside the user's data.
+    # Epoch safety is a whole-profile preflight: copying config first would
+    # both partially roll back the profile and report a refused DB as success.
+    if not _snapshot_epochs_restorable(meta.get("files", {}), _entry_paths):
+        return False
+
+    restored = 0
+    auth_restore_failed = False
     for rel in meta.get("files", {}):
         entry = _entry_paths(rel)
-        if entry and entry[1].suffix == ".db":
-            homes.update([entry[1].absolute().parent, entry[1].resolve().parent])
-    with exclusive_maintenance(homes):
-        # Epoch safety is a whole-profile preflight: copying config first would
-        # both partially roll back the profile and report a refused DB as success.
-        if not _snapshot_epochs_restorable(meta.get("files", {}), _entry_paths):
-            return False
-
-        restored = 0
-        auth_restore_failed = False
-        for rel in meta.get("files", {}):
-            entry = _entry_paths(rel)
-            if entry is None:
-                logger.error("Manifest path traversal blocked: %s", rel)
-                if rel == "auth.json":
-                    auth_restore_failed = True
-                continue
-            src, dst = entry
-            if not src.exists():
-                if rel == "auth.json":
-                    logger.error("Snapshot auth.json listed in manifest is missing: %s", src)
-                    auth_restore_failed = True
-                continue
-
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if _restore_snapshot_entry(rel, src, dst):
-                restored += 1
-            elif rel == "auth.json":
+        if entry is None:
+            logger.error("Manifest path traversal blocked: %s", rel)
+            if rel == "auth.json":
                 auth_restore_failed = True
+            continue
+        src, dst = entry
+        if not src.exists():
+            if rel == "auth.json":
+                logger.error("Snapshot auth.json listed in manifest is missing: %s", src)
+                auth_restore_failed = True
+            continue
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if _restore_snapshot_entry(rel, src, dst, home=home):
+            restored += 1
+        elif rel == "auth.json":
+            auth_restore_failed = True
 
     logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
     return restored > 0 and not auth_restore_failed

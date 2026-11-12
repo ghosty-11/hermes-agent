@@ -413,11 +413,13 @@ def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_up
     stop_for_relaunch()
 
 
-def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
+def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path, *, home: Path) -> bool:
     """Restore through backup's authority reservation and pre-publication epoch floor.
 
     Use the single-database primitive, not whole-profile restore: post-update config
-    and unrelated files must not roll back with a damaged transcript store.
+    and unrelated files must not roll back with a damaged transcript store. *home*
+    is the runtime home owning *state_path* — the authority reserved for the
+    restore, never the database's containing directory.
     """
     from hermes_cli.backup import verify_sqlite_integrity
     from hermes_cli.backup_restore import _safe_restore_db
@@ -425,7 +427,7 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     snap_state.stat()  # Preserve the caller's OSError reporting for missing snapshots.
     if not verify_sqlite_integrity(snap_state, check_header=True, run_pragma=True).get("valid"):
         return False
-    if not _safe_restore_db(snap_state, state_path):
+    if not _safe_restore_db(snap_state, state_path, maintenance_homes=[home]):
         print("  ✗ Auto-restore refused or failed; state.db was not restored.")
         print("    Stop the owning runtime and close database handles before retrying.")
         print("    If the canonical runtime epoch is unreadable, do not restore in place:")
@@ -482,7 +484,7 @@ def _verify_and_restore_one_state_db(home: Path, *, label: str, strict: bool = F
             if not verify_sqlite_integrity(snap_state, check_header=True, run_pragma=True).get("valid"):
                 continue
             try:
-                if _restore_state_db_from_snapshot(state_path, snap_state):
+                if _restore_state_db_from_snapshot(state_path, snap_state, home=home):
                     print(f"  ✓ Auto-restored from snapshot {snap_dir.name} ({label})")
                 else:
                     print("  ✗ Auto-restore did not complete; see the restore diagnostic above.")

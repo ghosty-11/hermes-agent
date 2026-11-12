@@ -123,7 +123,7 @@ def test_restore_helper_serves_snapshot_rows_over_a_hot_wal(
     has to hold the SNAPSHOT's rows even though the destination still owned a
     hot WAL from the corrupt database.
     """
-    assert _restore_state_db_from_snapshot(live_db_with_hot_wal, snapshot_db) is True
+    assert _restore_state_db_from_snapshot(live_db_with_hot_wal, snapshot_db, home=live_db_with_hot_wal.parent) is True
 
     assert _row_count(live_db_with_hot_wal) == SNAPSHOT_ROWS
     for suffix in ("-wal", "-shm", "-journal"):
@@ -138,7 +138,7 @@ def test_restore_helper_reports_failure_when_the_restored_copy_is_corrupt(tmp_pa
     bad_snapshot = tmp_path / "bad-snapshot.db"
     bad_snapshot.write_bytes(b"\x00" * 4096)
 
-    assert _restore_state_db_from_snapshot(state_path, bad_snapshot) is False
+    assert _restore_state_db_from_snapshot(state_path, bad_snapshot, home=state_path.parent) is False
 
 
 def test_restore_helper_propagates_copy_errors(tmp_path):
@@ -148,7 +148,7 @@ def test_restore_helper_propagates_copy_errors(tmp_path):
     state_path.write_bytes(b"whatever")
 
     with pytest.raises(OSError):
-        _restore_state_db_from_snapshot(state_path, tmp_path / "does-not-exist.db")
+        _restore_state_db_from_snapshot(state_path, tmp_path / "does-not-exist.db", home=state_path.parent)
 
 
 # ── Multi-profile coverage (#97994) ─────────────────────────────────────

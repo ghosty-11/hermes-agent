@@ -2489,6 +2489,36 @@ def test_durable_profile_trees_roundtrip_without_omitting_user_data(transaction)
         assert not (file.parent / "new-data.bin").exists()
 
 
+def test_nested_sqlite_roundtrip_keeps_database_inodes_without_creating_runtime_homes(transaction):
+    install, source, home, sibling, before, target = transaction
+    databases = [
+        home / "state-snapshots" / "pre-update" / "state.db",
+        sibling / "memory" / "provider" / "memory.db",
+    ]
+    for database in databases:
+        database.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("CREATE TABLE events (value TEXT)")
+            connection.execute("INSERT INTO events VALUES ('before')")
+    inodes = {path: path.stat().st_ino for path in databases}
+    manifest = capture_local_update_capsule(install, home, source, target)
+    advance(install, source, target)
+    for database in databases:
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("INSERT INTO events VALUES ('after')")
+    seal_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home)
+    restore_local_update_capsule(
+        manifest, expected_install_root=install, expected_hermes_home=home,
+        acknowledge_data_rollback=True)
+    assert git(install, "rev-parse", "HEAD") == before
+    for database in databases:
+        assert database.stat().st_ino == inodes[database]
+        with closing(sqlite3.connect(database)) as connection:
+            assert connection.execute("SELECT value FROM events").fetchall() == [("before",)]
+        assert not (database.parent / "gateway.lock").exists()
+
+
 @pytest.mark.parametrize("consumer", ["application", "copied-python", "pm-runtime", "node-package"])
 def test_selected_dependency_closure_survives_real_store_collection_or_refuses_capture(
         transaction, tmp_path, monkeypatch, consumer):
