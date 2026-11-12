@@ -256,6 +256,105 @@ def test_running_sibling_profile_refuses_whole_import_before_publication(tmp_pat
         owner.close()
 
 
+@pytest.mark.parametrize("layout", [
+    "nested-alias", "root-alias", "profile-home-alias", "profiles-directory-alias",
+])
+def test_import_reserves_profile_reached_through_nested_symlink(tmp_path, layout):
+    import zipfile
+    from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership
+    from hermes_cli import backup
+
+    home = tmp_path / "state"
+    home.mkdir(mode=0o700)
+    profiles = home / "profiles"
+    if layout == "profiles-directory-alias":
+        actual_profiles = home / "tenants"
+        actual_profiles.mkdir()
+        profiles.symlink_to(actual_profiles, target_is_directory=True)
+    else:
+        profiles.mkdir()
+    sibling = profiles / "live"
+    if layout == "profile-home-alias":
+        actual_home = home / "other-live"
+        actual_home.mkdir()
+        sibling.symlink_to(actual_home, target_is_directory=True)
+    else:
+        sibling.mkdir()
+    source_profile = profiles / "work"
+    source_profile.mkdir()
+    alias = home / "memory" if layout == "root-alias" else source_profile / "linked"
+    alias.symlink_to(sibling, target_is_directory=True)
+    live_db = sibling / "state.db"
+    image_db = tmp_path / "image.db"
+    for path, value in ((live_db, "live"), (image_db, "archived")):
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+            connection.execute("INSERT INTO marker VALUES (?)", (value,))
+    archive = tmp_path / "restore.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("config.yaml", "gateway: {multiplex_profiles: false}\n")
+        zf.write(image_db, (alias / "state.db").relative_to(home).as_posix())
+
+    owner = ProfileOwnership()
+    owner.reserve([sibling])
+    refused = False
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            try:
+                backup._import_members(zf, zf.namelist(), "", home, 2)
+            except OwnershipConflict:
+                refused = True
+        with closing(sqlite3.connect(live_db)) as connection:
+            assert connection.execute("SELECT value FROM marker").fetchall() == [("live",)]
+        assert refused, "the resolved destination's runtime owner must refuse the import"
+        assert not (home / "config.yaml").exists()
+    finally:
+        owner.close()
+
+
+def test_import_refuses_destination_retargeted_after_reservation(tmp_path, monkeypatch):
+    import zipfile
+    from gateway.runtime_ownership import ProfileOwnership
+    from hermes_cli import backup
+
+    home = tmp_path / "state"
+    source_profile = home / "profiles" / "work"
+    sibling = home / "profiles" / "live"
+    source_profile.mkdir(parents=True)
+    sibling.mkdir()
+    alias = source_profile / "linked"
+    alias.symlink_to(source_profile, target_is_directory=True)
+    live_db = sibling / "state.db"
+    image_db = tmp_path / "image.db"
+    for path, value in ((live_db, "live"), (image_db, "archived")):
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+            connection.execute("INSERT INTO marker VALUES (?)", (value,))
+    archive = tmp_path / "restore.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(image_db, "profiles/work/linked/state.db")
+
+    publish = backup._import_members_exclusive
+
+    def retarget_then_publish(*args, **kwargs):
+        alias.unlink()
+        alias.symlink_to(sibling, target_is_directory=True)
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(backup, "_import_members_exclusive", retarget_then_publish)
+    owner = ProfileOwnership()
+    owner.reserve([sibling])
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            restored, restored_external, errors, *_ = backup._import_members(
+                zf, zf.namelist(), "", home, 1)
+        with closing(sqlite3.connect(live_db)) as connection:
+            assert connection.execute("SELECT value FROM marker").fetchall() == [("live",)]
+        assert (restored, restored_external, len(errors)) == (0, 0, 1)
+    finally:
+        owner.close()
+
+
 def test_safe_restore_db_requires_explicit_maintenance_homes(tmp_path):
     import pytest
     from hermes_cli import backup

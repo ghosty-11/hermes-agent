@@ -927,21 +927,35 @@ def _import_members(
     from gateway.runtime_ownership import exclusive_maintenance
     root_res = hermes_root.resolve()
     homes = {hermes_root}
+    profile_homes = set()
+    profiles_dir = hermes_root / "profiles"
+    if profiles_dir.is_dir():
+        for profile in profiles_dir.iterdir():
+            if profile.is_dir():
+                canonical = profile.resolve()
+                if canonical.is_relative_to(root_res):
+                    profile_homes.add(canonical)
+    resolved_targets: dict[str, Path] = {}
     for member in members:
         if member.startswith(_EXTERNAL_PREFIX):
             continue  # restored under $HOME, outside every runtime authority
         rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
         try:
             parts = tuple(normalize_archive_parts(rel))
+            resolved = hermes_root.joinpath(*parts).resolve()
+            resolved.relative_to(root_res)
         except ValueError:
             continue  # publication reports the invalid member without writing it
+        resolved_targets[member] = resolved
+        homes.update(home for home in profile_homes if resolved.is_relative_to(home))
         if len(parts) >= 3 and parts[0] == "profiles":
             home = hermes_root / parts[0] / parts[1]
             if home.resolve().is_relative_to(root_res):
                 homes.add(home)
     with exclusive_maintenance(homes):
         return _import_members_exclusive(
-            zf, members, prefix, hermes_root, file_count, maintenance_homes=homes)
+            zf, members, prefix, hermes_root, file_count,
+            maintenance_homes=homes, resolved_targets=resolved_targets)
 
 
 def _import_external_member(
@@ -973,7 +987,7 @@ def _import_external_member(
 
 def _import_members_exclusive(
     zf: zipfile.ZipFile, members: list[str], prefix: str, hermes_root: Path, file_count: int,
-    *, maintenance_homes: Collection[Path],
+    *, maintenance_homes: Collection[Path], resolved_targets: dict[str, Path],
 ) -> tuple[int, int, list[str], list[str], list[tuple[str, tuple[int, int], tuple[int, int]]]]:
     """Publish every member; return ``(restored, restored_external, errors, skipped_runtime, db_shrunk)``.
 
@@ -1049,12 +1063,15 @@ def _import_members_exclusive(
 
         # Security: reject absolute paths and traversals
         try:
-            target.resolve().relative_to(hermes_root.resolve())
+            resolved = target.resolve()
+            resolved.relative_to(hermes_root.resolve())
         except ValueError:
             errors.append(f"  {rel}: path traversal blocked")
             continue
 
         try:
+            if resolved != resolved_targets.get(member):
+                raise OSError("archive destination changed after runtime ownership reservation")
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.suffix == ".db":
                 # Count before the write: afterwards the rows this import

@@ -110,7 +110,10 @@ Guarded SQLite restoration reserves the operation's real runtime homes, supplied
 explicitly as `maintenance_homes`: the capsule's validated homes, the restoring
 home, or an import's invoking home and affected `profiles/<name>` homes.
 Import discovers those homes with the same archive-path normalization used for
-publication, including backslash separators, before writing any member.
+publication, including backslash separators. It also reserves canonical profile
+homes containing the resolved destinations, including symlinked homes and profile
+directories. Each member's resolved destination is bound before reservation;
+retargeting it before publication produces an error without writing that member.
 A database's containing directory does not establish runtime ownership.
 Nested snapshot, cron and memory databases are data inside those homes.
 Reserving their directories creates `gateway.lock` files beside user data;
